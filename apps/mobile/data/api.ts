@@ -93,6 +93,7 @@ import {
   EMPTY_LIST_PROJECTS_RESPONSE,
   EMPTY_MEMBER_LIST,
   EMPTY_NOTIFICATION_PREFERENCES,
+  EMPTY_RECIPIENT_DEVICE,
   EMPTY_PIN_LIST,
   EMPTY_PROJECT,
   EMPTY_RUNTIME_LIST,
@@ -103,6 +104,7 @@ import {
   EMPTY_WORKSPACE_LIST,
   InboxListSchema,
   NotificationPreferenceResponseSchema,
+  RecipientDeviceResponseSchema,
   ListLabelsResponseSchema,
   ListProjectResourcesResponseSchema,
   ListProjectsResponseSchema,
@@ -119,6 +121,7 @@ import {
   EMPTY_TASK_MESSAGE_LIST,
   UserSchema,
   WorkspaceListSchema,
+  type RecipientDeviceResponse,
 } from "./schemas";
 import type { ZodType } from "zod";
 import { getCurrentSlug } from "./workspace-store";
@@ -429,6 +432,42 @@ class ApiClient {
         body: JSON.stringify({ preferences }),
       },
       { endpoint: "updateNotificationPreferences" },
+    );
+  }
+
+  async registerRecipientDevice(input: {
+    installationID: string;
+    platform: "ios";
+    bundleID: string;
+    pushEnvironment: "sandbox" | "production";
+    deviceToken: string;
+  }): Promise<RecipientDeviceResponse> {
+    return this.fetchValidatedWith(
+      `/api/recipient-devices/${input.installationID}`,
+      RecipientDeviceResponseSchema,
+      EMPTY_RECIPIENT_DEVICE,
+      {
+        method: "PUT",
+        body: JSON.stringify({
+          platform: input.platform,
+          bundle_id: input.bundleID,
+          push_environment: input.pushEnvironment,
+          device_token: input.deviceToken,
+        }),
+      },
+      { endpoint: "registerRecipientDevice" },
+    );
+  }
+
+  async revokeRecipientDevice(
+    installationID: string,
+  ): Promise<RecipientDeviceResponse> {
+    return this.fetchValidatedWith(
+      `/api/recipient-devices/${installationID}`,
+      RecipientDeviceResponseSchema,
+      EMPTY_RECIPIENT_DEVICE,
+      { method: "DELETE" },
+      { endpoint: "revokeRecipientDevice" },
     );
   }
 

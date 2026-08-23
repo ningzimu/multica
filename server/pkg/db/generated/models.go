@@ -1128,6 +1128,23 @@ type QuickAction struct {
 	UpdatedAt     pgtype.Timestamptz `json:"updated_at"`
 }
 
+type RecipientDevice struct {
+	ID              pgtype.UUID        `json:"id"`
+	InstallationID  pgtype.UUID        `json:"installation_id"`
+	UserID          pgtype.UUID        `json:"user_id"`
+	Platform        string             `json:"platform"`
+	BundleID        string             `json:"bundle_id"`
+	PushEnvironment string             `json:"push_environment"`
+	DeviceToken     string             `json:"device_token"`
+	Enabled         bool               `json:"enabled"`
+	BoundAt         pgtype.Timestamptz `json:"bound_at"`
+	RevokedAt       pgtype.Timestamptz `json:"revoked_at"`
+	InvalidatedAt   pgtype.Timestamptz `json:"invalidated_at"`
+	LastSeenAt      pgtype.Timestamptz `json:"last_seen_at"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
+}
+
 type RuntimeProfile struct {
 	ID             pgtype.UUID        `json:"id"`
 	WorkspaceID    pgtype.UUID        `json:"workspace_id"`

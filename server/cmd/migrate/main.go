@@ -254,6 +254,9 @@ var concurrentIndexCleanups = map[string]string{
 	"398_issue_workspace_status_position_index":                 "idx_issue_workspace_status_position",
 	"400_plugin_hook_schedule_installation_key_index":           "idx_plugin_hook_schedule_installation_key",
 	"401_plugin_hook_schedule_enabled_index":                    "idx_plugin_hook_schedule_enabled",
+	"404_recipient_device_installation_index":                   "idx_recipient_device_installation",
+	"405_recipient_device_active_user_index":                    "idx_recipient_device_active_user",
+	"406_recipient_device_token_index":                          "idx_recipient_device_token_active",
 }
 
 // concurrentDownIndexCleanups covers every migration whose down direction

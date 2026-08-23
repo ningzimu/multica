@@ -14,6 +14,7 @@ import type { User } from "@multica/core/types";
 import { api, ApiError } from "./api";
 import { clearToken, getToken, setToken } from "./secure-storage";
 import { useWorkspaceStore } from "./workspace-store";
+import { notificationRegistration } from "./native-notification-registration";
 
 interface AuthState {
   user: User | null;
@@ -46,6 +47,7 @@ export const useAuthStore = create<AuthState>((set) => ({
     try {
       const user = await api.getMe();
       set({ user, isLoading: false });
+      void notificationRegistration.onAuthenticated();
     } catch (err) {
       // Only clear token on a genuine 401. Network blips / 5xx keep the
       // token so the next launch (or a manual refresh) can retry.
@@ -66,10 +68,12 @@ export const useAuthStore = create<AuthState>((set) => ({
     await setToken(token);
     api.setToken(token);
     set({ user });
+    void notificationRegistration.onAuthenticated();
     return user;
   },
 
   logout: async () => {
+    await notificationRegistration.onLogout();
     await clearToken();
     api.setToken(null);
     set({ user: null });

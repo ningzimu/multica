@@ -57,10 +57,14 @@ export default ({ config }: ConfigContext): ExpoConfig => {
         : isStaging
           ? "ai.multica.mobile.staging"
           : (process.env.EXPO_BUNDLE_IDENTIFIER_DEV ?? "ai.multica.mobile.dev"),
+      entitlements: {
+        "aps-environment": isProd ? "production" : "development",
+      },
     },
     plugins: [
       "expo-router",
       "expo-secure-store",
+      "expo-notifications",
       "@react-native-community/datetimepicker",
       "react-native-enriched-markdown",
       [
@@ -85,6 +89,9 @@ export default ({ config }: ConfigContext): ExpoConfig => {
         },
       ],
     ],
-    extra: { APP_ENV: env },
+    extra: {
+      APP_ENV: env,
+      APNS_ENVIRONMENT: isProd ? "production" : "sandbox",
+    },
   };
 };

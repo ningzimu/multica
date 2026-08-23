@@ -126,6 +126,42 @@ export const EMPTY_NOTIFICATION_PREFERENCES = {
   preferences: {},
 } as const;
 
+export const RecipientDeviceResponseSchema = z.object({
+  id: z.string(),
+  installation_id: z.string(),
+  user_id: z.string(),
+  platform: z.literal("ios"),
+  bundle_id: z.string(),
+  push_environment: z.enum(["sandbox", "production"]),
+  enabled: z.boolean(),
+  bound_at: z.string(),
+  revoked_at: z.string().nullable().default(null),
+  invalidated_at: z.string().nullable().default(null),
+  last_seen_at: z.string(),
+  created_at: z.string(),
+  updated_at: z.string(),
+}).loose();
+
+export type RecipientDeviceResponse = z.infer<
+  typeof RecipientDeviceResponseSchema
+>;
+
+export const EMPTY_RECIPIENT_DEVICE: RecipientDeviceResponse = {
+  id: "",
+  installation_id: "",
+  user_id: "",
+  platform: "ios",
+  bundle_id: "",
+  push_environment: "sandbox",
+  enabled: false,
+  bound_at: "",
+  revoked_at: null,
+  invalidated_at: null,
+  last_seen_at: "",
+  created_at: "",
+  updated_at: "",
+};
+
 const LabelSchema = z.object({
   id: z.string(),
   workspace_id: z.string(),

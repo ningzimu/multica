@@ -195,6 +195,55 @@ func readJSON(t *testing.T, resp *http.Response, v any) {
 	}
 }
 
+type recipientDeviceJSON struct {
+	ID              string     `json:"id"`
+	InstallationID  string     `json:"installation_id"`
+	UserID          string     `json:"user_id"`
+	Platform        string     `json:"platform"`
+	BundleID        string     `json:"bundle_id"`
+	PushEnvironment string     `json:"push_environment"`
+	Enabled         bool       `json:"enabled"`
+	RevokedAt       *time.Time `json:"revoked_at"`
+	DeviceToken     *string    `json:"device_token"`
+}
+
+func recipientDeviceRequest(
+	t *testing.T,
+	token string,
+	method string,
+	installationID string,
+	body any,
+) *http.Response {
+	t.Helper()
+
+	var bodyReader io.Reader
+	if body != nil {
+		encoded, err := json.Marshal(body)
+		if err != nil {
+			t.Fatalf("encode recipient device request: %v", err)
+		}
+		bodyReader = bytes.NewReader(encoded)
+	}
+	req, err := http.NewRequest(
+		method,
+		testServer.URL+"/api/recipient-devices/"+installationID,
+		bodyReader,
+	)
+	if err != nil {
+		t.Fatalf("create recipient device request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("recipient device request failed: %v", err)
+	}
+	return resp
+}
+
 func generateTestJWT(userID, email, name string) (string, error) {
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
 		"sub":   userID,
@@ -204,6 +253,203 @@ func generateTestJWT(userID, email, name string) (string, error) {
 		"iat":   time.Now().Unix(),
 	})
 	return token.SignedString(auth.JWTSecret())
+}
+
+func TestRecipientDeviceRegistrationLifecycleThroughRouter(t *testing.T) {
+	installationID := "018f6f4f-2dd0-7f47-9f71-2af8d5a8a821"
+	t.Cleanup(func() {
+		_, _ = testPool.Exec(context.Background(),
+			`DELETE FROM recipient_device WHERE installation_id = $1`, installationID)
+	})
+	registration := map[string]any{
+		"platform":         "ios",
+		"bundle_id":        "vip.example.multica",
+		"push_environment": "sandbox",
+		"device_token":     "token-first",
+	}
+
+	unauthenticated := recipientDeviceRequest(
+		t,
+		"",
+		http.MethodPut,
+		installationID,
+		registration,
+	)
+	defer unauthenticated.Body.Close()
+	if unauthenticated.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated registration status = %d, want 401", unauthenticated.StatusCode)
+	}
+
+	registeredResponse := recipientDeviceRequest(
+		t,
+		testToken,
+		http.MethodPut,
+		installationID,
+		registration,
+	)
+	if registeredResponse.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(registeredResponse.Body)
+		registeredResponse.Body.Close()
+		t.Fatalf("register status = %d body=%s", registeredResponse.StatusCode, body)
+	}
+	var registered recipientDeviceJSON
+	readJSON(t, registeredResponse, &registered)
+	if registered.ID == "" || registered.InstallationID != installationID ||
+		registered.UserID != testUserID || !registered.Enabled {
+		t.Fatalf("unexpected registered device: %+v", registered)
+	}
+	if registered.DeviceToken != nil {
+		t.Fatal("recipient device response exposed the native token")
+	}
+
+	registration["device_token"] = "token-rotated"
+	refreshedResponse := recipientDeviceRequest(
+		t,
+		testToken,
+		http.MethodPut,
+		installationID,
+		registration,
+	)
+	if refreshedResponse.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(refreshedResponse.Body)
+		refreshedResponse.Body.Close()
+		t.Fatalf("refresh status = %d body=%s", refreshedResponse.StatusCode, body)
+	}
+	var refreshed recipientDeviceJSON
+	readJSON(t, refreshedResponse, &refreshed)
+	if refreshed.ID != registered.ID || !refreshed.Enabled {
+		t.Fatalf("refresh created a conflicting device: first=%+v refreshed=%+v", registered, refreshed)
+	}
+	var storedToken string
+	var installationRows int
+	if err := testPool.QueryRow(context.Background(), `
+		SELECT max(device_token), count(*)
+		FROM recipient_device
+		WHERE installation_id = $1
+	`, installationID).Scan(&storedToken, &installationRows); err != nil {
+		t.Fatalf("load refreshed device: %v", err)
+	}
+	if storedToken != "token-rotated" || installationRows != 1 {
+		t.Fatalf("refresh persistence token=%q rows=%d", storedToken, installationRows)
+	}
+
+	secondUserEmail := "recipient-device-second-" + installationID + "@example.com"
+	var secondUserID string
+	if err := testPool.QueryRow(context.Background(), `
+		INSERT INTO "user" (name, email)
+		VALUES ('Recipient Device Second User', $1)
+		RETURNING id
+	`, secondUserEmail).Scan(&secondUserID); err != nil {
+		t.Fatalf("create second user: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = testPool.Exec(context.Background(),
+			`DELETE FROM "user" WHERE id = $1`, secondUserID)
+	})
+	secondToken, err := generateTestJWT(
+		secondUserID,
+		secondUserEmail,
+		"Recipient Device Second User",
+	)
+	if err != nil {
+		t.Fatalf("generate second user token: %v", err)
+	}
+
+	registration["device_token"] = "token-second-account"
+	reboundResponse := recipientDeviceRequest(
+		t,
+		secondToken,
+		http.MethodPut,
+		installationID,
+		registration,
+	)
+	if reboundResponse.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(reboundResponse.Body)
+		reboundResponse.Body.Close()
+		t.Fatalf("rebind status = %d body=%s", reboundResponse.StatusCode, body)
+	}
+	var rebound recipientDeviceJSON
+	readJSON(t, reboundResponse, &rebound)
+	if rebound.ID != registered.ID || rebound.UserID != secondUserID || !rebound.Enabled {
+		t.Fatalf("unexpected rebound device: first=%+v rebound=%+v", registered, rebound)
+	}
+
+	staleOwnerResponse := recipientDeviceRequest(
+		t,
+		testToken,
+		http.MethodDelete,
+		installationID,
+		nil,
+	)
+	defer staleOwnerResponse.Body.Close()
+	if staleOwnerResponse.StatusCode != http.StatusNotFound {
+		t.Fatalf("previous user revoked rebound device: status=%d, want 404", staleOwnerResponse.StatusCode)
+	}
+
+	revokedResponse := recipientDeviceRequest(
+		t,
+		secondToken,
+		http.MethodDelete,
+		installationID,
+		nil,
+	)
+	if revokedResponse.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(revokedResponse.Body)
+		revokedResponse.Body.Close()
+		t.Fatalf("revoke status = %d body=%s", revokedResponse.StatusCode, body)
+	}
+	var revoked recipientDeviceJSON
+	readJSON(t, revokedResponse, &revoked)
+	if revoked.ID != registered.ID || revoked.Enabled || revoked.RevokedAt == nil {
+		t.Fatalf("unexpected revoked device: %+v", revoked)
+	}
+}
+
+func TestRecipientDeviceReinstallDisplacesActiveTokenOwner(t *testing.T) {
+	firstInstallationID := "018f6f4f-2dd0-7f47-9f71-2af8d5a8a831"
+	secondInstallationID := "018f6f4f-2dd0-7f47-9f71-2af8d5a8a832"
+	for _, installationID := range []string{firstInstallationID, secondInstallationID} {
+		installationID := installationID
+		t.Cleanup(func() {
+			_, _ = testPool.Exec(context.Background(),
+				`DELETE FROM recipient_device WHERE installation_id = $1`, installationID)
+		})
+	}
+	registration := map[string]any{
+		"platform":         "ios",
+		"bundle_id":        "vip.example.multica",
+		"push_environment": "sandbox",
+		"device_token":     "token-survived-reinstall",
+	}
+
+	for _, installationID := range []string{firstInstallationID, secondInstallationID} {
+		resp := recipientDeviceRequest(t, testToken, http.MethodPut, installationID, registration)
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			t.Fatalf("register installation %s status=%d body=%s", installationID, resp.StatusCode, body)
+		}
+		resp.Body.Close()
+	}
+
+	var activeInstallationID string
+	var activeCount int
+	if err := testPool.QueryRow(context.Background(), `
+		SELECT max(installation_id::text), count(*)
+		FROM recipient_device
+		WHERE device_token = $1
+		  AND bundle_id = $2
+		  AND push_environment = $3
+		  AND enabled
+	`, registration["device_token"], registration["bundle_id"], registration["push_environment"]).Scan(
+		&activeInstallationID,
+		&activeCount,
+	); err != nil {
+		t.Fatalf("load active reinstalled device: %v", err)
+	}
+	if activeCount != 1 || activeInstallationID != secondInstallationID {
+		t.Fatalf("active reinstalled device=%s count=%d", activeInstallationID, activeCount)
+	}
 }
 
 // ---- Health ----
