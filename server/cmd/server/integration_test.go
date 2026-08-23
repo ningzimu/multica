@@ -21,10 +21,13 @@ import (
 	"github.com/multica-ai/multica/server/internal/auth"
 	"github.com/multica-ai/multica/server/internal/events"
 	"github.com/multica-ai/multica/server/internal/realtime"
+	"github.com/multica-ai/multica/server/internal/testutil"
 )
 
 var (
 	testServer      *httptest.Server
+	testRouter      http.Handler
+	testFixture     *testutil.Fixture
 	testPool        *pgxpool.Pool
 	testToken       string
 	testUserID      string
@@ -72,6 +75,8 @@ func TestMain(m *testing.M) {
 	bus := events.New()
 	registerListeners(bus, hub)
 	router := NewRouter(pool, hub, bus, analytics.NoopClient{}, nil)
+	testRouter = router
+	testFixture = testutil.New(pool, testWorkspaceID, testUserID)
 	testServer = httptest.NewServer(router)
 
 	// Generate a JWT token directly for the test user
@@ -213,35 +218,17 @@ func recipientDeviceRequest(
 	method string,
 	installationID string,
 	body any,
-) *http.Response {
+) *testutil.Response {
 	t.Helper()
-
-	var bodyReader io.Reader
-	if body != nil {
-		encoded, err := json.Marshal(body)
-		if err != nil {
-			t.Fatalf("encode recipient device request: %v", err)
-		}
-		bodyReader = bytes.NewReader(encoded)
-	}
-	req, err := http.NewRequest(
+	req := testutil.JSONRequest(
 		method,
-		testServer.URL+"/api/recipient-devices/"+installationID,
-		bodyReader,
+		"/api/recipient-devices/"+installationID,
+		body,
 	)
-	if err != nil {
-		t.Fatalf("create recipient device request: %v", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("recipient device request failed: %v", err)
-	}
-	return resp
+	return testutil.Call(t, testRouter.ServeHTTP, req)
 }
 
 func generateTestJWT(userID, email, name string) (string, error) {
@@ -257,10 +244,8 @@ func generateTestJWT(userID, email, name string) (string, error) {
 
 func TestRecipientDeviceRegistrationLifecycleThroughRouter(t *testing.T) {
 	installationID := "018f6f4f-2dd0-7f47-9f71-2af8d5a8a821"
-	t.Cleanup(func() {
-		_, _ = testPool.Exec(context.Background(),
-			`DELETE FROM recipient_device WHERE installation_id = $1`, installationID)
-	})
+	testFixture.Cleanup(t,
+		`DELETE FROM recipient_device WHERE installation_id = $1`, installationID)
 	registration := map[string]any{
 		"platform":         "ios",
 		"bundle_id":        "vip.example.multica",
@@ -268,17 +253,13 @@ func TestRecipientDeviceRegistrationLifecycleThroughRouter(t *testing.T) {
 		"device_token":     "token-first",
 	}
 
-	unauthenticated := recipientDeviceRequest(
+	recipientDeviceRequest(
 		t,
 		"",
 		http.MethodPut,
 		installationID,
 		registration,
-	)
-	defer unauthenticated.Body.Close()
-	if unauthenticated.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("unauthenticated registration status = %d, want 401", unauthenticated.StatusCode)
-	}
+	).Want(http.StatusUnauthorized)
 
 	registeredResponse := recipientDeviceRequest(
 		t,
@@ -286,14 +267,9 @@ func TestRecipientDeviceRegistrationLifecycleThroughRouter(t *testing.T) {
 		http.MethodPut,
 		installationID,
 		registration,
-	)
-	if registeredResponse.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(registeredResponse.Body)
-		registeredResponse.Body.Close()
-		t.Fatalf("register status = %d body=%s", registeredResponse.StatusCode, body)
-	}
+	).Want(http.StatusOK)
 	var registered recipientDeviceJSON
-	readJSON(t, registeredResponse, &registered)
+	registeredResponse.JSON(&registered)
 	if registered.ID == "" || registered.InstallationID != installationID ||
 		registered.UserID != testUserID || !registered.Enabled {
 		t.Fatalf("unexpected registered device: %+v", registered)
@@ -309,43 +285,29 @@ func TestRecipientDeviceRegistrationLifecycleThroughRouter(t *testing.T) {
 		http.MethodPut,
 		installationID,
 		registration,
-	)
-	if refreshedResponse.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(refreshedResponse.Body)
-		refreshedResponse.Body.Close()
-		t.Fatalf("refresh status = %d body=%s", refreshedResponse.StatusCode, body)
-	}
+	).Want(http.StatusOK)
 	var refreshed recipientDeviceJSON
-	readJSON(t, refreshedResponse, &refreshed)
+	refreshedResponse.JSON(&refreshed)
 	if refreshed.ID != registered.ID || !refreshed.Enabled {
 		t.Fatalf("refresh created a conflicting device: first=%+v refreshed=%+v", registered, refreshed)
 	}
 	var storedToken string
 	var installationRows int
-	if err := testPool.QueryRow(context.Background(), `
+	testFixture.QueryRow(t, `
 		SELECT max(device_token), count(*)
 		FROM recipient_device
 		WHERE installation_id = $1
-	`, installationID).Scan(&storedToken, &installationRows); err != nil {
-		t.Fatalf("load refreshed device: %v", err)
-	}
+	`, installationID).Scan(&storedToken, &installationRows)
 	if storedToken != "token-rotated" || installationRows != 1 {
 		t.Fatalf("refresh persistence token=%q rows=%d", storedToken, installationRows)
 	}
 
 	secondUserEmail := "recipient-device-second-" + installationID + "@example.com"
-	var secondUserID string
-	if err := testPool.QueryRow(context.Background(), `
-		INSERT INTO "user" (name, email)
-		VALUES ('Recipient Device Second User', $1)
-		RETURNING id
-	`, secondUserEmail).Scan(&secondUserID); err != nil {
-		t.Fatalf("create second user: %v", err)
-	}
-	t.Cleanup(func() {
-		_, _ = testPool.Exec(context.Background(),
-			`DELETE FROM "user" WHERE id = $1`, secondUserID)
-	})
+	secondUserID := testFixture.User(
+		t,
+		"Recipient Device Second User",
+		secondUserEmail,
+	)
 	secondToken, err := generateTestJWT(
 		secondUserID,
 		secondUserEmail,
@@ -362,29 +324,20 @@ func TestRecipientDeviceRegistrationLifecycleThroughRouter(t *testing.T) {
 		http.MethodPut,
 		installationID,
 		registration,
-	)
-	if reboundResponse.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(reboundResponse.Body)
-		reboundResponse.Body.Close()
-		t.Fatalf("rebind status = %d body=%s", reboundResponse.StatusCode, body)
-	}
+	).Want(http.StatusOK)
 	var rebound recipientDeviceJSON
-	readJSON(t, reboundResponse, &rebound)
+	reboundResponse.JSON(&rebound)
 	if rebound.ID != registered.ID || rebound.UserID != secondUserID || !rebound.Enabled {
 		t.Fatalf("unexpected rebound device: first=%+v rebound=%+v", registered, rebound)
 	}
 
-	staleOwnerResponse := recipientDeviceRequest(
+	recipientDeviceRequest(
 		t,
 		testToken,
 		http.MethodDelete,
 		installationID,
 		nil,
-	)
-	defer staleOwnerResponse.Body.Close()
-	if staleOwnerResponse.StatusCode != http.StatusNotFound {
-		t.Fatalf("previous user revoked rebound device: status=%d, want 404", staleOwnerResponse.StatusCode)
-	}
+	).Want(http.StatusNotFound)
 
 	revokedResponse := recipientDeviceRequest(
 		t,
@@ -392,14 +345,9 @@ func TestRecipientDeviceRegistrationLifecycleThroughRouter(t *testing.T) {
 		http.MethodDelete,
 		installationID,
 		nil,
-	)
-	if revokedResponse.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(revokedResponse.Body)
-		revokedResponse.Body.Close()
-		t.Fatalf("revoke status = %d body=%s", revokedResponse.StatusCode, body)
-	}
+	).Want(http.StatusOK)
 	var revoked recipientDeviceJSON
-	readJSON(t, revokedResponse, &revoked)
+	revokedResponse.JSON(&revoked)
 	if revoked.ID != registered.ID || revoked.Enabled || revoked.RevokedAt == nil {
 		t.Fatalf("unexpected revoked device: %+v", revoked)
 	}
@@ -409,11 +357,8 @@ func TestRecipientDeviceReinstallDisplacesActiveTokenOwner(t *testing.T) {
 	firstInstallationID := "018f6f4f-2dd0-7f47-9f71-2af8d5a8a831"
 	secondInstallationID := "018f6f4f-2dd0-7f47-9f71-2af8d5a8a832"
 	for _, installationID := range []string{firstInstallationID, secondInstallationID} {
-		installationID := installationID
-		t.Cleanup(func() {
-			_, _ = testPool.Exec(context.Background(),
-				`DELETE FROM recipient_device WHERE installation_id = $1`, installationID)
-		})
+		testFixture.Cleanup(t,
+			`DELETE FROM recipient_device WHERE installation_id = $1`, installationID)
 	}
 	registration := map[string]any{
 		"platform":         "ios",
@@ -423,18 +368,13 @@ func TestRecipientDeviceReinstallDisplacesActiveTokenOwner(t *testing.T) {
 	}
 
 	for _, installationID := range []string{firstInstallationID, secondInstallationID} {
-		resp := recipientDeviceRequest(t, testToken, http.MethodPut, installationID, registration)
-		if resp.StatusCode != http.StatusOK {
-			body, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			t.Fatalf("register installation %s status=%d body=%s", installationID, resp.StatusCode, body)
-		}
-		resp.Body.Close()
+		recipientDeviceRequest(t, testToken, http.MethodPut, installationID, registration).
+			Want(http.StatusOK)
 	}
 
 	var activeInstallationID string
 	var activeCount int
-	if err := testPool.QueryRow(context.Background(), `
+	testFixture.QueryRow(t, `
 		SELECT max(installation_id::text), count(*)
 		FROM recipient_device
 		WHERE device_token = $1
@@ -444,9 +384,7 @@ func TestRecipientDeviceReinstallDisplacesActiveTokenOwner(t *testing.T) {
 	`, registration["device_token"], registration["bundle_id"], registration["push_environment"]).Scan(
 		&activeInstallationID,
 		&activeCount,
-	); err != nil {
-		t.Fatalf("load active reinstalled device: %v", err)
-	}
+	)
 	if activeCount != 1 || activeInstallationID != secondInstallationID {
 		t.Fatalf("active reinstalled device=%s count=%d", activeInstallationID, activeCount)
 	}

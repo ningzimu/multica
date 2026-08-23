@@ -140,7 +140,21 @@ export const RecipientDeviceResponseSchema = z.object({
   last_seen_at: z.string(),
   created_at: z.string(),
   updated_at: z.string(),
-}).loose();
+}).loose().transform((device) => ({
+  id: device.id,
+  installationID: device.installation_id,
+  userID: device.user_id,
+  platform: device.platform,
+  bundleID: device.bundle_id,
+  pushEnvironment: device.push_environment,
+  enabled: device.enabled,
+  boundAt: device.bound_at,
+  revokedAt: device.revoked_at,
+  invalidatedAt: device.invalidated_at,
+  lastSeenAt: device.last_seen_at,
+  createdAt: device.created_at,
+  updatedAt: device.updated_at,
+}));
 
 export type RecipientDeviceResponse = z.infer<
   typeof RecipientDeviceResponseSchema
@@ -148,18 +162,18 @@ export type RecipientDeviceResponse = z.infer<
 
 export const EMPTY_RECIPIENT_DEVICE: RecipientDeviceResponse = {
   id: "",
-  installation_id: "",
-  user_id: "",
+  installationID: "",
+  userID: "",
   platform: "ios",
-  bundle_id: "",
-  push_environment: "sandbox",
+  bundleID: "",
+  pushEnvironment: "sandbox",
   enabled: false,
-  bound_at: "",
-  revoked_at: null,
-  invalidated_at: null,
-  last_seen_at: "",
-  created_at: "",
-  updated_at: "",
+  boundAt: "",
+  revokedAt: null,
+  invalidatedAt: null,
+  lastSeenAt: "",
+  createdAt: "",
+  updatedAt: "",
 };
 
 const LabelSchema = z.object({

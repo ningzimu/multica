@@ -1,3 +1,5 @@
+// @vitest-environment node
+
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
@@ -49,6 +51,15 @@ const user = {
   id: "018f6f4f-2dd0-7f47-9f71-2af8d5a8a841",
   email: "mobile@example.com",
   name: "Mobile User",
+  avatar_url: null,
+  onboarded_at: null,
+  onboarding_questionnaire: {},
+  starter_content_state: null,
+  language: null,
+  profile_description: "",
+  timezone: null,
+  created_at: "2026-08-24T00:00:00Z",
+  updated_at: "2026-08-24T00:00:00Z",
 };
 
 describe("mobile auth notification registration", () => {
@@ -97,5 +108,16 @@ describe("mobile auth notification registration", () => {
     expect(order).toEqual(["revoke", "clear"]);
     expect(mocks.api.setToken).toHaveBeenCalledWith(null);
     expect(useAuthStore.getState().user).toBeNull();
+  });
+
+  it("keeps the session when device revocation fails", async () => {
+    useAuthStore.setState({ user, isLoading: false });
+    mocks.onLogout.mockRejectedValue(new Error("offline"));
+
+    await expect(useAuthStore.getState().logout()).rejects.toThrow("offline");
+
+    expect(mocks.clearToken).not.toHaveBeenCalled();
+    expect(mocks.api.setToken).not.toHaveBeenCalledWith(null);
+    expect(useAuthStore.getState().user).toEqual(user);
   });
 });

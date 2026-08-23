@@ -1,3 +1,5 @@
+// @vitest-environment node
+
 import { describe, expect, it, vi } from "vitest";
 import {
   createNotificationRegistrationCoordinator,
@@ -142,6 +144,17 @@ describe("Notification Registration coordinator", () => {
     await expect(authentication).resolves.toBe("unavailable");
     expect(deps.recipientDevices.register).not.toHaveBeenCalled();
     expect(deps.recipientDevices.revoke).toHaveBeenCalledOnce();
+  });
+
+  it("fails logout closed when the server cannot revoke the binding", async () => {
+    const deps = createDependencies("granted");
+    vi.mocked(deps.recipientDevices.revoke).mockRejectedValue(
+      new Error("offline"),
+    );
+    const coordinator = createNotificationRegistrationCoordinator(deps);
+    await coordinator.onAuthenticated();
+
+    await expect(coordinator.onLogout()).rejects.toThrow("offline");
   });
 
   it("allows an explicit settings action to request permission and register", async () => {

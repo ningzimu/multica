@@ -1,7 +1,10 @@
 import { Alert, Linking } from "react-native";
 import Constants from "expo-constants";
 import * as Notifications from "expo-notifications";
-import { api } from "./api";
+import {
+  registerRecipientDevice,
+  revokeRecipientDevice,
+} from "./mutations/recipient-devices";
 import {
   createNotificationRegistrationCoordinator,
   type NotificationPermissionStatus,
@@ -82,12 +85,8 @@ export const notificationRegistration =
       },
     },
     recipientDevices: {
-      register: async (registration) => {
-        await api.registerRecipientDevice(registration);
-      },
-      revoke: async (installationID) => {
-        await api.revokeRecipientDevice(installationID);
-      },
+      register: registerRecipientDevice,
+      revoke: revokeRecipientDevice,
     },
     settings: {
       open: () => Linking.openSettings(),

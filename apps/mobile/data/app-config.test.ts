@@ -1,3 +1,5 @@
+// @vitest-environment node
+
 import { afterEach, describe, expect, it } from "vitest";
 import type { ConfigContext } from "expo/config";
 import createConfig from "../app.config";

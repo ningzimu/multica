@@ -101,6 +101,21 @@ export function createNotificationRegistrationCoordinator(
     });
   };
 
+  const syncGrantedToken = async (
+    generation: number,
+  ): Promise<NotificationRegistrationResult> => {
+    try {
+      const token = await dependencies.notifications.getDeviceToken();
+      if (!authenticated || generation !== authenticationGeneration) {
+        return "unavailable";
+      }
+      await registerToken(token, generation);
+      return "registered";
+    } catch {
+      return "unavailable";
+    }
+  };
+
   const authenticate = async (): Promise<NotificationRegistrationResult> => {
     authenticated = true;
     const generation = ++authenticationGeneration;
@@ -123,16 +138,7 @@ export function createNotificationRegistrationCoordinator(
       if (permission !== "granted") return "deferred";
     }
 
-    try {
-      const token = await dependencies.notifications.getDeviceToken();
-      if (!authenticated || generation !== authenticationGeneration) {
-        return "unavailable";
-      }
-      await registerToken(token, generation);
-      return "registered";
-    } catch {
-      return "unavailable";
-    }
+    return syncGrantedToken(generation);
   };
 
   return {
@@ -159,30 +165,15 @@ export function createNotificationRegistrationCoordinator(
       if (permission === "denied") return "denied";
       if (permission !== "granted") return "deferred";
 
-      try {
-        const token = await dependencies.notifications.getDeviceToken();
-        if (!authenticated || generation !== authenticationGeneration) {
-          return "unavailable";
-        }
-        await registerToken(token, generation);
-        return "registered";
-      } catch {
-        return "unavailable";
-      }
+      return syncGrantedToken(generation);
     },
 
     onLogout: async () => {
       authenticated = false;
       authenticationGeneration += 1;
-      try {
-        await deviceMutationWork.catch(() => undefined);
-        const installationID = await dependencies.installation.getOrCreateID();
-        await dependencies.recipientDevices.revoke(installationID);
-      } catch {
-        // Local logout must continue even when the server is unreachable or
-        // the session has already expired. A future login safely rebinds the
-        // installation before it becomes eligible again.
-      }
+      await deviceMutationWork.catch(() => undefined);
+      const installationID = await dependencies.installation.getOrCreateID();
+      await dependencies.recipientDevices.revoke(installationID);
     },
 
     getPermissionStatus: () =>
