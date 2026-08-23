@@ -16,6 +16,7 @@ import { useWorkspaceStore } from "@/data/workspace-store";
 import { LightboxProvider, prewarmHighlighter } from "@/lib/markdown";
 import { NAV_THEME } from "@/lib/theme";
 import { useColorScheme } from "@/lib/use-color-scheme";
+import { installNativeNotificationEventBridge } from "@/data/native-notification-events";
 
 // Kick off Shiki highlighter init at module load — fires once per process,
 // finishes before the user navigates to any screen with a code block. If
@@ -25,6 +26,7 @@ prewarmHighlighter();
 
 function AuthInitializer({ children }: { children: React.ReactNode }) {
   const initialize = useAuthStore((s) => s.initialize);
+  const isAuthLoading = useAuthStore((s) => s.isLoading);
   const qc = useQueryClient();
   // Idempotent guard: 401 on multiple in-flight requests would otherwise
   // logout/navigate repeatedly during the same session-expire moment.
@@ -53,6 +55,14 @@ function AuthInitializer({ children }: { children: React.ReactNode }) {
     });
     initialize();
   }, [initialize, qc]);
+
+  // Wait until persisted auth has been restored before consuming a cold-start
+  // notification response. Otherwise a valid signed-in tap can be mistaken
+  // for a logged-out one and cleared before navigation becomes possible.
+  useEffect(() => {
+    if (isAuthLoading) return;
+    return installNativeNotificationEventBridge();
+  }, [isAuthLoading]);
 
   return <>{children}</>;
 }

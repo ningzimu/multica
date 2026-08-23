@@ -59,3 +59,20 @@ SET
 WHERE installation_id = $1
   AND user_id = $2
 RETURNING *;
+
+-- name: ListActiveRecipientDevicesForPush :many
+SELECT *
+FROM recipient_device
+WHERE user_id = $1
+  AND bundle_id = $2
+  AND push_environment = $3
+  AND enabled
+ORDER BY last_seen_at DESC;
+
+-- name: InvalidateRecipientDevice :exec
+UPDATE recipient_device
+SET
+    enabled = FALSE,
+    invalidated_at = now(),
+    updated_at = now()
+WHERE id = $1;

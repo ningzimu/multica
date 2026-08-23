@@ -41,6 +41,71 @@ func (q *Queries) DisplaceRecipientDeviceToken(ctx context.Context, arg Displace
 	return err
 }
 
+const invalidateRecipientDevice = `-- name: InvalidateRecipientDevice :exec
+UPDATE recipient_device
+SET
+    enabled = FALSE,
+    invalidated_at = now(),
+    updated_at = now()
+WHERE id = $1
+`
+
+func (q *Queries) InvalidateRecipientDevice(ctx context.Context, id pgtype.UUID) error {
+	_, err := q.db.Exec(ctx, invalidateRecipientDevice, id)
+	return err
+}
+
+const listActiveRecipientDevicesForPush = `-- name: ListActiveRecipientDevicesForPush :many
+SELECT id, installation_id, user_id, platform, bundle_id, push_environment, device_token, enabled, bound_at, revoked_at, invalidated_at, last_seen_at, created_at, updated_at
+FROM recipient_device
+WHERE user_id = $1
+  AND bundle_id = $2
+  AND push_environment = $3
+  AND enabled
+ORDER BY last_seen_at DESC
+`
+
+type ListActiveRecipientDevicesForPushParams struct {
+	UserID          pgtype.UUID `json:"user_id"`
+	BundleID        string      `json:"bundle_id"`
+	PushEnvironment string      `json:"push_environment"`
+}
+
+func (q *Queries) ListActiveRecipientDevicesForPush(ctx context.Context, arg ListActiveRecipientDevicesForPushParams) ([]RecipientDevice, error) {
+	rows, err := q.db.Query(ctx, listActiveRecipientDevicesForPush, arg.UserID, arg.BundleID, arg.PushEnvironment)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []RecipientDevice{}
+	for rows.Next() {
+		var i RecipientDevice
+		if err := rows.Scan(
+			&i.ID,
+			&i.InstallationID,
+			&i.UserID,
+			&i.Platform,
+			&i.BundleID,
+			&i.PushEnvironment,
+			&i.DeviceToken,
+			&i.Enabled,
+			&i.BoundAt,
+			&i.RevokedAt,
+			&i.InvalidatedAt,
+			&i.LastSeenAt,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const lockRecipientDeviceToken = `-- name: LockRecipientDeviceToken :exec
 SELECT pg_advisory_xact_lock(
     hashtextextended(

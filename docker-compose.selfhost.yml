@@ -101,6 +101,14 @@ services:
       MULTICA_SHUTDOWN_HOLD_DURATION: ${MULTICA_SHUTDOWN_HOLD_DURATION:-}
       MULTICA_RUNTIME_RECONNECT_GRACE: ${MULTICA_RUNTIME_RECONNECT_GRACE:-}
       MULTICA_TASK_QUEUED_TTL: ${MULTICA_TASK_QUEUED_TTL:-}
+      # Optional direct Apple Push Notification service integration for the
+      # self-hosted iOS app. The private-key path must exist inside the
+      # container; mount the .p8 file with a local Compose override.
+      MULTICA_APNS_TEAM_ID: ${MULTICA_APNS_TEAM_ID:-}
+      MULTICA_APNS_KEY_ID: ${MULTICA_APNS_KEY_ID:-}
+      MULTICA_APNS_TOPIC: ${MULTICA_APNS_TOPIC:-}
+      MULTICA_APNS_ENVIRONMENT: ${MULTICA_APNS_ENVIRONMENT:-production}
+      MULTICA_APNS_PRIVATE_KEY_PATH: ${MULTICA_APNS_PRIVATE_KEY_PATH:-}
       ALLOW_SIGNUP: ${ALLOW_SIGNUP:-true}
       ALLOWED_EMAILS: ${ALLOWED_EMAILS:-}
       ALLOWED_EMAIL_DOMAINS: ${ALLOWED_EMAIL_DOMAINS:-}

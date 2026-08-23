@@ -36,6 +36,7 @@ import (
 	"github.com/multica-ai/multica/server/internal/integrations/wecom"
 	obsmetrics "github.com/multica-ai/multica/server/internal/metrics"
 	"github.com/multica-ai/multica/server/internal/middleware"
+	"github.com/multica-ai/multica/server/internal/push"
 	"github.com/multica-ai/multica/server/internal/realtime"
 	"github.com/multica-ai/multica/server/internal/service"
 	"github.com/multica-ai/multica/server/internal/storage"
@@ -392,6 +393,19 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 		ServerVersion:            normalizeServerVersion(version),
 	}
 	h := handler.New(queries, pool, hub, bus, emailSvc, store, cfSigner, analyticsClient, signupConfig, daemonHub)
+	if apnsConfig, enabled, err := push.ConfigFromEnv(); err != nil {
+		slog.Error("APNs system notifications disabled by invalid configuration", "error", err)
+	} else if enabled {
+		transport, err := push.NewHTTPTransport(apnsConfig, nil)
+		if err != nil {
+			slog.Error("APNs system notifications disabled", "error", err)
+		} else {
+			push.NewDispatcher(queries, transport, apnsConfig, slog.Default()).Register(bus)
+			slog.Info("APNs system notifications enabled", "topic", apnsConfig.Topic, "environment", apnsConfig.Environment)
+		}
+	} else {
+		slog.Info("APNs system notifications disabled (configuration not set)")
+	}
 	invitationRateLimits := handler.DefaultInvitationRateLimits()
 	invitationRateLimits.Actor.Limit = envNonNegativeInt("RATE_LIMIT_INVITATION_ACTOR_10M", invitationRateLimits.Actor.Limit)
 	invitationRateLimits.Workspace.Limit = envNonNegativeInt("RATE_LIMIT_INVITATION_WORKSPACE_24H", invitationRateLimits.Workspace.Limit)
