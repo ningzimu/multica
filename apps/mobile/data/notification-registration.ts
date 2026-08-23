@@ -173,7 +173,13 @@ export function createNotificationRegistrationCoordinator(
       authenticationGeneration += 1;
       await deviceMutationWork.catch(() => undefined);
       const installationID = await dependencies.installation.getOrCreateID();
-      await dependencies.recipientDevices.revoke(installationID);
+      try {
+        await dependencies.recipientDevices.revoke(installationID);
+      } catch (error) {
+        authenticated = true;
+        authenticationGeneration += 1;
+        throw error;
+      }
     },
 
     getPermissionStatus: () =>

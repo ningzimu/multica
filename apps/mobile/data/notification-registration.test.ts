@@ -155,6 +155,13 @@ describe("Notification Registration coordinator", () => {
     await coordinator.onAuthenticated();
 
     await expect(coordinator.onLogout()).rejects.toThrow("offline");
+
+    await deps.emitToken("native-token-after-failed-logout");
+    expect(deps.recipientDevices.register).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        deviceToken: "native-token-after-failed-logout",
+      }),
+    );
   });
 
   it("allows an explicit settings action to request permission and register", async () => {
