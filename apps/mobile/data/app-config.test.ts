@@ -6,6 +6,7 @@ import createConfig from "../app.config";
 
 const originalAppEnv = process.env.APP_ENV;
 const originalProductionBundleID = process.env.EXPO_BUNDLE_IDENTIFIER_PROD;
+const originalAPNSEnvironment = process.env.EXPO_APNS_ENVIRONMENT;
 
 afterEach(() => {
   if (originalAppEnv === undefined) delete process.env.APP_ENV;
@@ -15,6 +16,12 @@ afterEach(() => {
     delete process.env.EXPO_BUNDLE_IDENTIFIER_PROD;
   } else {
     process.env.EXPO_BUNDLE_IDENTIFIER_PROD = originalProductionBundleID;
+  }
+
+  if (originalAPNSEnvironment === undefined) {
+    delete process.env.EXPO_APNS_ENVIRONMENT;
+  } else {
+    process.env.EXPO_APNS_ENVIRONMENT = originalAPNSEnvironment;
   }
 });
 
@@ -41,5 +48,15 @@ describe("iOS notification build configuration", () => {
     expect(config.ios?.bundleIdentifier).toBe("vip.example.multica");
     expect(config.ios?.entitlements?.["aps-environment"]).toBe("production");
     expect(config.extra?.APNS_ENVIRONMENT).toBe("production");
+  });
+
+  it("allows a self-hosted Release build to use the APNs sandbox", () => {
+    process.env.EXPO_APNS_ENVIRONMENT = "sandbox";
+
+    const config = configFor("production");
+
+    expect(config.ios?.bundleIdentifier).toBe("vip.example.multica");
+    expect(config.ios?.entitlements?.["aps-environment"]).toBe("development");
+    expect(config.extra?.APNS_ENVIRONMENT).toBe("sandbox");
   });
 });

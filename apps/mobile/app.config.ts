@@ -13,6 +13,15 @@ export default ({ config }: ConfigContext): ExpoConfig => {
   const env = process.env.APP_ENV ?? "development";
   const isProd = env === "production";
   const isStaging = env === "staging";
+  const apnsEnvironment =
+    process.env.EXPO_APNS_ENVIRONMENT ??
+    (isProd ? "production" : "sandbox");
+
+  if (apnsEnvironment !== "production" && apnsEnvironment !== "sandbox") {
+    throw new Error(
+      "EXPO_APNS_ENVIRONMENT must be either production or sandbox",
+    );
+  }
 
   return {
     ...config,
@@ -58,7 +67,8 @@ export default ({ config }: ConfigContext): ExpoConfig => {
           ? "ai.multica.mobile.staging"
           : (process.env.EXPO_BUNDLE_IDENTIFIER_DEV ?? "ai.multica.mobile.dev"),
       entitlements: {
-        "aps-environment": isProd ? "production" : "development",
+        "aps-environment":
+          apnsEnvironment === "production" ? "production" : "development",
       },
     },
     plugins: [
@@ -91,7 +101,7 @@ export default ({ config }: ConfigContext): ExpoConfig => {
     ],
     extra: {
       APP_ENV: env,
-      APNS_ENVIRONMENT: isProd ? "production" : "sandbox",
+      APNS_ENVIRONMENT: apnsEnvironment,
     },
   };
 };
