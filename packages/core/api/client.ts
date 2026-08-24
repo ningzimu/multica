@@ -4165,6 +4165,7 @@ export class ApiClient {
           destination: data.destination,
           events: data.events,
           scope_mode: data.scopeMode,
+          project_ids: data.projectIds,
         }),
       },
     );
@@ -4205,6 +4206,7 @@ export class ApiClient {
           destination: data.destination,
           events: data.events,
           scope_mode: data.scopeMode,
+          project_ids: data.projectIds,
         }),
       },
     );
@@ -4268,6 +4270,24 @@ export class ApiClient {
       RotateOutboundWebhookSecretResponseSchema,
       EMPTY_CREATE_OUTBOUND_WEBHOOK_SUBSCRIPTION,
       { endpoint: "POST /api/workspaces/:id/outbound-webhooks/:subscriptionId/rotate-secret" },
+    );
+  }
+
+  async updateOutboundWebhookScope(
+    workspaceId: string,
+    subscriptionId: string,
+    scopeMode: "workspace" | "project",
+    projectIds: string[],
+  ): Promise<OutboundWebhookSubscription> {
+    const raw = await this.fetch<unknown>(
+      `/api/workspaces/${workspaceId}/outbound-webhooks/${subscriptionId}/scope`,
+      { method: "PATCH", body: JSON.stringify({ scope_mode: scopeMode, project_ids: projectIds }) },
+    );
+    return parseWithFallback(
+      raw,
+      OutboundWebhookSubscriptionSchema,
+      EMPTY_OUTBOUND_WEBHOOK_SUBSCRIPTION,
+      { endpoint: "PATCH /api/workspaces/:id/outbound-webhooks/:subscriptionId/scope" },
     );
   }
 

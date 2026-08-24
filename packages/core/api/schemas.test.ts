@@ -87,6 +87,7 @@ describe("outbound webhook schemas", () => {
     events: ["issue.created"],
     event_catalog_version: 1,
     scope_mode: "workspace",
+    project_ids: [],
     created_at: "2026-08-25T00:00:00Z",
     updated_at: "2026-08-25T00:00:00Z",
   };
@@ -115,6 +116,36 @@ describe("outbound webhook schemas", () => {
       subscriptions: [{ ...subscription, status: "future_lifecycle_state" }],
     });
     expect(parsed.subscriptions[0]?.status).toBe("paused");
+  });
+
+  it("preserves an explicit multi-project scope", () => {
+    const parsed = ListOutboundWebhookSubscriptionsResponseSchema.parse({
+      subscriptions: [{ ...subscription, scope_mode: "project", project_ids: ["project-1", "project-2"] }],
+    });
+    expect(parsed.subscriptions[0]).toMatchObject({
+      scopeMode: "project",
+      projectIds: ["project-1", "project-2"],
+    });
+  });
+
+  it("fails closed when scope mode and selected projects contradict each other", () => {
+    const parsed = parseWithFallback(
+      { subscriptions: [{ ...subscription, scope_mode: "project", project_ids: [] }] },
+      ListOutboundWebhookSubscriptionsResponseSchema,
+      EMPTY_LIST_OUTBOUND_WEBHOOK_SUBSCRIPTIONS,
+      { endpoint: "GET /api/workspaces/:id/outbound-webhooks" },
+    );
+    expect(parsed).toEqual(EMPTY_LIST_OUTBOUND_WEBHOOK_SUBSCRIPTIONS);
+  });
+
+  it("fails closed when the server returns an unknown scope mode", () => {
+    const parsed = parseWithFallback(
+      { subscriptions: [{ ...subscription, scope_mode: "future_restricted_scope" }] },
+      ListOutboundWebhookSubscriptionsResponseSchema,
+      EMPTY_LIST_OUTBOUND_WEBHOOK_SUBSCRIPTIONS,
+      { endpoint: "GET /api/workspaces/:id/outbound-webhooks" },
+    );
+    expect(parsed).toEqual(EMPTY_LIST_OUTBOUND_WEBHOOK_SUBSCRIPTIONS);
   });
 
   it("fails closed to an empty list when a subscription response is malformed", () => {

@@ -1,3 +1,16 @@
+export const outboundWebhookEventTypes = [
+  "issue.created",
+  "issue.status_changed",
+  "issue.assignee_changed",
+  "issue.priority_changed",
+  "issue.project_changed",
+  "comment.created",
+  "comment.updated",
+  "comment.deleted",
+] as const;
+
+export type OutboundWebhookEventType = (typeof outboundWebhookEventTypes)[number];
+export type OutboundWebhookScopeMode = "workspace" | "project";
 export interface OutboundWebhookSubscription {
   id: string;
   workspaceId: string;
@@ -5,7 +18,8 @@ export interface OutboundWebhookSubscription {
   destinationHint: string;
   events: string[];
   eventCatalogVersion: number;
-  scopeMode: "workspace" | "projects";
+  scopeMode: OutboundWebhookScopeMode;
+  projectIds: string[];
   status: "active" | "paused";
   pauseReason: "manual" | "scope_empty" | "failure_threshold" | null;
   consecutiveTerminalFailures: number;
@@ -33,8 +47,9 @@ export type OutboundWebhookEvent =
 export interface CreateOutboundWebhookSubscriptionRequest {
   name: string;
   destination: string;
-  events: OutboundWebhookEvent[];
-  scopeMode: "workspace";
+  events: OutboundWebhookEventType[];
+  scopeMode: OutboundWebhookScopeMode;
+  projectIds: string[];
 }
 
 export interface CreateOutboundWebhookSubscriptionResponse {
@@ -46,7 +61,8 @@ export interface UpdateOutboundWebhookSubscriptionRequest {
   name: string;
   destination?: string;
   events: string[];
-  scopeMode: "workspace" | "projects";
+  scopeMode: OutboundWebhookScopeMode;
+  projectIds: string[];
 }
 
 export interface RotateOutboundWebhookSecretResponse {

@@ -176,6 +176,9 @@ func TestUpdateAndDeleteCommentBumpIssueActivity(t *testing.T) {
 	if noOp.IssueRevision != 0 {
 		t.Fatalf("no-op comment edit issue revision = %d, want 0", noOp.IssueRevision)
 	}
+	if noOp.IssueTitle != "comment mutations bump activity" || noOp.IssueStatus == "" || noOp.IssuePriority == "" {
+		t.Fatalf("no-op comment edit lost locked issue snapshot: %+v", noOp)
+	}
 	if got := readActivity(); !got.Equal(base) {
 		t.Fatalf("no-op comment edit changed activity: base=%s got=%s", base, got)
 	}
@@ -200,7 +203,8 @@ func TestCommentMutationEventsCarryIssueRevision(t *testing.T) {
 	if testHandler == nil || testPool == nil {
 		t.Skip("database not available")
 	}
-	issueID := dbfx.Issue(t, "comment mutation event revision")
+	projectID := dbfx.Project(t, "comment mutation snapshot")
+	issueID := dbfx.Issue(t, "comment mutation event revision", testutil.Cols{"project_id": projectID, "priority": "high"})
 	commentID := dbfx.Comment(t, issueID, "before")
 
 	h := *testHandler
@@ -231,6 +235,9 @@ func TestCommentMutationEventsCarryIssueRevision(t *testing.T) {
 	if !ok || updatedPayload["issue_revision"] != int64(2) {
 		t.Fatalf("update event issue_revision = %#v, want 2", updatedEvent.Payload)
 	}
+	if project, _ := updatedPayload["issue_project_id"].(*string); project == nil || *project != projectID || updatedPayload["issue_priority"] != "high" {
+		t.Fatalf("update event issue snapshot = %#v", updatedEvent.Payload)
+	}
 
 	deleted := httptest.NewRecorder()
 	h.DeleteComment(deleted, withURLParam(newRequest(http.MethodDelete, "/api/comments/"+commentID, nil), "commentId", commentID))
@@ -240,6 +247,9 @@ func TestCommentMutationEventsCarryIssueRevision(t *testing.T) {
 	deletedPayload, ok := deletedEvent.Payload.(map[string]any)
 	if !ok || deletedPayload["issue_revision"] != int64(3) {
 		t.Fatalf("delete event issue_revision = %#v, want 3", deletedEvent.Payload)
+	}
+	if project, _ := deletedPayload["issue_project_id"].(*string); project == nil || *project != projectID || deletedPayload["issue_priority"] != "high" {
+		t.Fatalf("delete event issue snapshot = %#v", deletedEvent.Payload)
 	}
 }
 

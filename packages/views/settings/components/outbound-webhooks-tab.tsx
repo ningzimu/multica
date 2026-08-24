@@ -6,7 +6,8 @@ import { Trash2 } from "lucide-react";
 import { toast } from "sonner";
 import { useCurrentWorkspace } from "@multica/core/paths";
 import { useCurrentMember } from "@multica/core/permissions";
-import type { OutboundWebhookEvent, OutboundWebhookSubscription } from "@multica/core/types";
+import { projectListOptions } from "@multica/core/projects/queries";
+import type { OutboundWebhookEvent, OutboundWebhookScopeMode, OutboundWebhookSubscription } from "@multica/core/types";
 import {
   outboundWebhookSubscriptionOptions,
   outboundWebhookSubscriptionsOptions,
@@ -55,6 +56,32 @@ function EventSelection({ selected, onChange }: {
   );
 }
 
+function ProjectSelection({ projects, selected, onChange, requiredLabel }: {
+  projects: Array<{ id: string; title: string }>;
+  selected: string[];
+  onChange: (projectIds: string[]) => void;
+  requiredLabel: string;
+}) {
+  return (
+    <div className="space-y-2">
+      {projects.map((project) => (
+        <Label key={project.id} className="flex items-center gap-2 font-normal">
+          <Checkbox
+            checked={selected.includes(project.id)}
+            onCheckedChange={(checked) => onChange(
+              checked === true
+                ? [...new Set([...selected, project.id])]
+                : selected.filter((id) => id !== project.id),
+            )}
+          />
+          {project.title}
+        </Label>
+      ))}
+      {selected.length === 0 && <p className="text-caption text-destructive">{requiredLabel}</p>}
+    </div>
+  );
+}
+
 export function OutboundWebhooksTab() {
   const { t } = useT("settings");
   const workspace = useCurrentWorkspace();
@@ -62,15 +89,20 @@ export function OutboundWebhooksTab() {
   const member = useCurrentMember(wsId);
   const canManage = member.role === "owner" || member.role === "admin";
   const subscriptions = useQuery(outboundWebhookSubscriptionsOptions(wsId));
+  const projects = useQuery(projectListOptions(wsId));
   const [name, setName] = useState("");
   const [destination, setDestination] = useState("");
   const [events, setEvents] = useState<string[]>(DEFAULT_EVENTS);
+  const [scopeMode, setScopeMode] = useState<OutboundWebhookScopeMode>("workspace");
+  const [selectedProjectIds, setSelectedProjectIds] = useState<string[]>([]);
   const [disclosedSecret, setDisclosedSecret] = useState<string | null>(null);
   const [selectedSubscriptionId, setSelectedSubscriptionId] = useState("");
   const [editing, setEditing] = useState<OutboundWebhookSubscription | null>(null);
   const [editName, setEditName] = useState("");
   const [editDestination, setEditDestination] = useState("");
   const [editEvents, setEditEvents] = useState<string[]>([]);
+  const [editScopeMode, setEditScopeMode] = useState<OutboundWebhookScopeMode>("workspace");
+  const [editProjectIds, setEditProjectIds] = useState<string[]>([]);
   const selectedSubscription = useQuery(
     outboundWebhookSubscriptionOptions(wsId, selectedSubscriptionId),
   );
@@ -102,8 +134,14 @@ export function OutboundWebhooksTab() {
         <SettingsCard>
           <form className="space-y-4 p-4" onSubmit={(event) => {
             event.preventDefault();
-            if (!name.trim() || !destination.trim() || events.length === 0) return;
-            createSubscription.mutate({ name, destination, events: events as OutboundWebhookEvent[], scopeMode: "workspace" }, {
+            if (!name.trim() || !destination.trim() || events.length === 0 || (scopeMode === "project" && selectedProjectIds.length === 0)) return;
+            createSubscription.mutate({
+              name,
+              destination,
+              events: events as OutboundWebhookEvent[],
+              scopeMode,
+              projectIds: scopeMode === "project" ? selectedProjectIds : [],
+            }, {
               onSuccess: (result) => {
                 if (!result.subscription.id || !result.signingSecret) {
                   toast.error(t(($) => $.outbound_webhooks.create_partial_failure));
@@ -113,6 +151,8 @@ export function OutboundWebhooksTab() {
                 setName("");
                 setDestination("");
                 setEvents(DEFAULT_EVENTS);
+                setScopeMode("workspace");
+                setSelectedProjectIds([]);
                 toast.success(t(($) => $.outbound_webhooks.created));
               },
               onError: (error) => showMutationError(error, t(($) => $.outbound_webhooks.create_failed)),
@@ -130,8 +170,19 @@ export function OutboundWebhooksTab() {
               <p className="text-body font-medium">{t(($) => $.outbound_webhooks.event_selection)}</p>
               <EventSelection selected={events} onChange={setEvents} />
             </div>
-            <p className="text-caption text-muted-foreground">{t(($) => $.outbound_webhooks.workspace_scope)}</p>
-            <Button type="submit" disabled={events.length === 0 || createSubscription.isPending}>{t(($) => $.outbound_webhooks.create)}</Button>
+            <div className="space-y-2">
+              <Label htmlFor="outbound-webhook-scope">{t(($) => $.outbound_webhooks.scope)}</Label>
+              <select id="outbound-webhook-scope" className="flex h-9 w-full rounded-md border border-input bg-background px-3 text-body" value={scopeMode} onChange={(event) => setScopeMode(event.target.value as OutboundWebhookScopeMode)}>
+                <option value="workspace">{t(($) => $.outbound_webhooks.workspace_scope_short)}</option>
+                <option value="project">{t(($) => $.outbound_webhooks.project_scope)}</option>
+              </select>
+              {scopeMode === "workspace" ? (
+                <p className="text-caption text-muted-foreground">{t(($) => $.outbound_webhooks.workspace_scope)}</p>
+              ) : (
+                <ProjectSelection projects={projects.data ?? []} selected={selectedProjectIds} onChange={setSelectedProjectIds} requiredLabel={t(($) => $.outbound_webhooks.project_required)} />
+              )}
+            </div>
+            <Button type="submit" disabled={events.length === 0 || (scopeMode === "project" && selectedProjectIds.length === 0) || createSubscription.isPending}>{t(($) => $.outbound_webhooks.create)}</Button>
           </form>
         </SettingsCard>
       )}
@@ -174,6 +225,8 @@ export function OutboundWebhooksTab() {
                           setEditName(subscription.name);
                           setEditDestination("");
                           setEditEvents(subscription.events);
+                          setEditScopeMode(subscription.scopeMode);
+                          setEditProjectIds(subscription.projectIds);
                         }}>{t(($) => $.outbound_webhooks.edit)}</Button>
                         <Button variant="outline" size="sm" onClick={() => {
                           const mutation = paused ? resumeSubscription : pauseSubscription;
@@ -217,12 +270,13 @@ export function OutboundWebhooksTab() {
                   {editing?.id === subscription.id && (
                     <form className="space-y-3 border-t border-border p-4" onSubmit={(event) => {
                       event.preventDefault();
-                      if (!editName.trim() || editEvents.length === 0) return;
+                      if (!editName.trim() || editEvents.length === 0 || (editScopeMode === "project" && editProjectIds.length === 0)) return;
                       updateSubscription.mutate({ subscriptionId: subscription.id, input: {
                         name: editName,
                         destination: editDestination.trim() || undefined,
                         events: editEvents,
-                        scopeMode: subscription.scopeMode,
+                        scopeMode: editScopeMode,
+                        projectIds: editScopeMode === "project" ? editProjectIds : [],
                       } }, {
                         onSuccess: () => { setEditing(null); toast.success(t(($) => $.outbound_webhooks.updated)); },
                         onError: (error) => showMutationError(error, t(($) => $.outbound_webhooks.update_failed)),
@@ -231,7 +285,15 @@ export function OutboundWebhooksTab() {
                       <div className="space-y-1.5"><Label htmlFor={`outbound-webhook-edit-name-${subscription.id}`}>{t(($) => $.outbound_webhooks.name)}</Label><Input id={`outbound-webhook-edit-name-${subscription.id}`} value={editName} onChange={(event) => setEditName(event.target.value)} maxLength={100} required /></div>
                       <div className="space-y-1.5"><Label htmlFor={`outbound-webhook-edit-destination-${subscription.id}`}>{t(($) => $.outbound_webhooks.destination)}</Label><Input id={`outbound-webhook-edit-destination-${subscription.id}`} type="url" value={editDestination} onChange={(event) => setEditDestination(event.target.value)} placeholder={t(($) => $.outbound_webhooks.destination_unchanged)} /></div>
                       <EventSelection selected={editEvents} onChange={setEditEvents} />
-                      <div className="flex gap-2"><Button type="submit" disabled={editEvents.length === 0 || updateSubscription.isPending}>{t(($) => $.outbound_webhooks.save)}</Button><Button type="button" variant="outline" onClick={() => setEditing(null)}>{t(($) => $.outbound_webhooks.cancel)}</Button></div>
+                      <div className="space-y-2">
+                        <Label htmlFor={`outbound-webhook-edit-scope-${subscription.id}`}>{t(($) => $.outbound_webhooks.scope)}</Label>
+                        <select id={`outbound-webhook-edit-scope-${subscription.id}`} className="flex h-9 w-full rounded-md border border-input bg-background px-3 text-body" value={editScopeMode} onChange={(event) => setEditScopeMode(event.target.value as OutboundWebhookScopeMode)}>
+                          <option value="workspace">{t(($) => $.outbound_webhooks.workspace_scope_short)}</option>
+                          <option value="project">{t(($) => $.outbound_webhooks.project_scope)}</option>
+                        </select>
+                        {editScopeMode === "project" && <ProjectSelection projects={projects.data ?? []} selected={editProjectIds} onChange={setEditProjectIds} requiredLabel={t(($) => $.outbound_webhooks.project_required)} />}
+                      </div>
+                      <div className="flex gap-2"><Button type="submit" disabled={editEvents.length === 0 || (editScopeMode === "project" && editProjectIds.length === 0) || updateSubscription.isPending}>{t(($) => $.outbound_webhooks.save)}</Button><Button type="button" variant="outline" onClick={() => setEditing(null)}>{t(($) => $.outbound_webhooks.cancel)}</Button></div>
                     </form>
                   )}
                   {selectedSubscriptionId === subscription.id && selectedSubscription.data && (
@@ -240,7 +302,7 @@ export function OutboundWebhooksTab() {
                       <div><dt className="text-muted-foreground">{t(($) => $.outbound_webhooks.secret_hint)}</dt><dd>{selectedSubscription.data.signingSecretHint || "—"}</dd></div>
                       <div><dt className="text-muted-foreground">{t(($) => $.outbound_webhooks.event_catalog_version)}</dt><dd>{selectedSubscription.data.eventCatalogVersion}</dd></div>
                       <div><dt className="text-muted-foreground">{t(($) => $.outbound_webhooks.event_selection)}</dt><dd>{selectedSubscription.data.events.join(", ")}</dd></div>
-                      <div><dt className="text-muted-foreground">{t(($) => $.outbound_webhooks.scope)}</dt><dd>{selectedSubscription.data.scopeMode === "workspace" ? t(($) => $.outbound_webhooks.workspace_scope_short) : selectedSubscription.data.scopeMode}</dd></div>
+                      <div><dt className="text-muted-foreground">{t(($) => $.outbound_webhooks.scope)}</dt><dd>{selectedSubscription.data.scopeMode === "workspace" ? t(($) => $.outbound_webhooks.workspace_scope_short) : t(($) => $.outbound_webhooks.project_scope)}</dd></div>
                     </dl>
                   )}
                 </div>

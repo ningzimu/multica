@@ -1,9 +1,16 @@
 -- name: CreateOutboundWebhookSubscription :one
 INSERT INTO outbound_webhook_subscription (
     workspace_id, name, destination_ciphertext, secret_ciphertext,
-    destination_hint, events, created_by, signing_secret_hint
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+    destination_hint, events, scope_mode, project_ids, created_by,
+    signing_secret_hint
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 RETURNING *;
+
+-- name: LockOutboundWebhookScopeProjects :many
+SELECT id FROM project
+WHERE workspace_id = sqlc.arg('workspace_id')
+  AND id = ANY(sqlc.arg('project_ids')::uuid[])
+FOR KEY SHARE;
 
 -- name: ListOutboundWebhookSubscriptions :many
 SELECT * FROM outbound_webhook_subscription
@@ -39,6 +46,7 @@ SET name = $3,
     destination_hint = $5,
     events = $6,
     scope_mode = $7,
+    project_ids = $8,
     updated_at = now()
 WHERE workspace_id = $1 AND id = $2
 RETURNING *;
@@ -64,6 +72,30 @@ SET secret_ciphertext = $3,
     updated_at = now()
 WHERE workspace_id = $1 AND id = $2
 RETURNING *;
+
+-- name: UpdateOutboundWebhookSubscriptionScope :one
+UPDATE outbound_webhook_subscription
+SET scope_mode = sqlc.arg('scope_mode'),
+    project_ids = sqlc.arg('project_ids')::uuid[],
+    updated_at = now()
+WHERE workspace_id = sqlc.arg('workspace_id') AND id = sqlc.arg('id')
+RETURNING *;
+
+-- name: RemoveProjectFromOutboundWebhookScopes :execrows
+UPDATE outbound_webhook_subscription
+SET project_ids = array_remove(project_ids, sqlc.arg('project_id')::uuid),
+    status = CASE
+        WHEN cardinality(array_remove(project_ids, sqlc.arg('project_id')::uuid)) = 0 THEN 'paused'
+        ELSE status
+    END,
+    pause_reason = CASE
+        WHEN cardinality(array_remove(project_ids, sqlc.arg('project_id')::uuid)) = 0 THEN 'scope_empty'
+        ELSE pause_reason
+    END,
+    updated_at = now()
+WHERE workspace_id = sqlc.arg('workspace_id')
+  AND scope_mode = 'project'
+  AND project_ids @> ARRAY[sqlc.arg('project_id')::uuid];
 
 -- name: DeleteOutboundWebhookDeliveriesBySubscription :exec
 DELETE FROM outbound_webhook_delivery

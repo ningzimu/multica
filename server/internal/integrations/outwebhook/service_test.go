@@ -31,6 +31,48 @@ func TestIssueEventCatalogRequiresAnExplicitKnownSelection(t *testing.T) {
 	}
 }
 
+func TestProjectScopeRequiresDistinctProjectsAndMatchesEventSnapshot(t *testing.T) {
+	projectA := pgtype.UUID{Bytes: uuid.New(), Valid: true}
+	projectB := pgtype.UUID{Bytes: uuid.New(), Valid: true}
+	if err := validateScopeShape(ScopeWorkspace, nil); err != nil {
+		t.Fatalf("workspace scope rejected: %v", err)
+	}
+	for _, invalid := range []struct {
+		mode string
+		ids  []pgtype.UUID
+	}{
+		{mode: ScopeProject},
+		{mode: ScopeWorkspace, ids: []pgtype.UUID{projectA}},
+		{mode: ScopeProject, ids: []pgtype.UUID{projectA, projectA}},
+		{mode: "future", ids: []pgtype.UUID{projectA}},
+	} {
+		if err := validateScopeShape(invalid.mode, invalid.ids); err == nil {
+			t.Fatalf("invalid scope accepted: mode=%q ids=%v", invalid.mode, invalid.ids)
+		}
+	}
+
+	workspace := db.OutboundWebhookSubscription{ScopeMode: ScopeWorkspace}
+	project := db.OutboundWebhookSubscription{ScopeMode: ScopeProject, ProjectIds: []pgtype.UUID{projectA, projectB}}
+	unprojected := []byte(`{"data":{"issue":{"project_id":null}}}`)
+	projectAString := uuid.UUID(projectA.Bytes).String()
+	projectBString := uuid.UUID(projectB.Bytes).String()
+	projected := []byte(`{"data":{"issue":{"project_id":"` + projectAString + `"}}}`)
+	other := []byte(`{"data":{"issue":{"project_id":"` + uuid.NewString() + `"}}}`)
+	moveOut := []byte(`{"data":{"issue":{"project_id":null},"change":{"previous":"` + projectBString + `","current":null}}}`)
+	moveIn := []byte(`{"data":{"issue":{"project_id":"` + projectAString + `"},"change":{"previous":null,"current":"` + projectAString + `"}}}`)
+	assigneeChange := []byte(`{"data":{"issue":{"project_id":"` + projectAString + `"},"change":{"previous":null,"current":{"type":"agent","id":"` + uuid.NewString() + `"}}}}`)
+
+	if !subscriptionMatchesProjectScope(workspace, unprojected, EventIssueCreated) {
+		t.Fatal("Workspace Scope excluded an unprojected Issue")
+	}
+	if subscriptionMatchesProjectScope(project, unprojected, EventIssueCreated) || subscriptionMatchesProjectScope(project, other, EventIssueCreated) {
+		t.Fatal("Project Scope matched an unprojected or unrelated Issue")
+	}
+	if !subscriptionMatchesProjectScope(project, projected, EventIssueCreated) || !subscriptionMatchesProjectScope(project, moveOut, EventIssueProjectChanged) || !subscriptionMatchesProjectScope(project, moveIn, EventIssueProjectChanged) || !subscriptionMatchesProjectScope(project, assigneeChange, EventIssueAssigneeChanged) {
+		t.Fatal("Project Scope lost selected current/previous event-time context")
+	}
+}
+
 func TestIssueUpdateDerivesIndependentProductEventsOrFailsClosed(t *testing.T) {
 	payload := map[string]any{
 		"status_changed":   true,
@@ -199,12 +241,12 @@ func TestCommentEnvelopeGoldenContracts(t *testing.T) {
 	service := &Service{now: func() time.Time { return now }}
 	issueID := uuid.New()
 	projectID := uuid.New()
-	issue := db.Issue{
-		ID:        pgtype.UUID{Bytes: issueID, Valid: true},
+	issue := publicParentIssueSnapshot{
+		ID:        issueID.String(),
 		Title:     "Parent issue",
 		Status:    "in_progress",
 		Priority:  "high",
-		ProjectID: pgtype.UUID{Bytes: projectID, Valid: true},
+		ProjectID: stringPointer(projectID.String()),
 	}
 	commentID := uuid.NewString()
 	parentID := uuid.NewString()
@@ -309,7 +351,7 @@ func commentProtocolType(eventType string) string {
 func TestCommentUpdatedRequiresExplicitBodyChange(t *testing.T) {
 	service := &Service{now: time.Now}
 	issueID := uuid.New()
-	issue := db.Issue{ID: pgtype.UUID{Bytes: issueID, Valid: true}, Title: "Parent", Status: "todo", Priority: "none"}
+	issue := publicParentIssueSnapshot{ID: issueID.String(), Title: "Parent", Status: "todo", Priority: "none"}
 	for _, payload := range []map[string]any{
 		{"comment": map[string]any{"id": uuid.NewString(), "issue_id": issueID.String(), "content": "unchanged"}},
 		{"body_changed": false, "comment": map[string]any{"id": uuid.NewString(), "issue_id": issueID.String(), "content": "unchanged"}},
@@ -323,9 +365,7 @@ func TestCommentUpdatedRequiresExplicitBodyChange(t *testing.T) {
 func TestCommentCreatedAuthorAndParentVariants(t *testing.T) {
 	service := &Service{now: time.Now}
 	issueID := uuid.New()
-	issue := db.Issue{
-		ID: pgtype.UUID{Bytes: issueID, Valid: true}, Title: "Parent", Status: "todo", Priority: "none",
-	}
+	issue := publicParentIssueSnapshot{ID: issueID.String(), Title: "Parent", Status: "todo", Priority: "none"}
 	for _, authorType := range []string{"member", "agent", "system"} {
 		for _, parentID := range []*string{nil, stringPointer(uuid.NewString())} {
 			name := authorType + "/top-level"

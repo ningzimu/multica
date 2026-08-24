@@ -17,6 +17,7 @@ type createOutboundWebhookRequest struct {
 	Destination string   `json:"destination"`
 	Events      []string `json:"events"`
 	ScopeMode   string   `json:"scope_mode"`
+	ProjectIDs  []string `json:"project_ids"`
 }
 
 type updateOutboundWebhookRequest struct {
@@ -24,6 +25,27 @@ type updateOutboundWebhookRequest struct {
 	Destination *string  `json:"destination"`
 	Events      []string `json:"events"`
 	ScopeMode   string   `json:"scope_mode"`
+	ProjectIDs  []string `json:"project_ids"`
+}
+
+type updateOutboundWebhookScopeRequest struct {
+	ScopeMode  string   `json:"scope_mode"`
+	ProjectIDs []string `json:"project_ids"`
+}
+
+func parseOutboundWebhookProjectIDs(w http.ResponseWriter, values []string) ([]pgtype.UUID, bool) {
+	if values == nil {
+		return nil, true
+	}
+	projectIDs := make([]pgtype.UUID, 0, len(values))
+	for _, value := range values {
+		projectID, ok := parseUUIDOrBadRequest(w, value, "project_id")
+		if !ok {
+			return nil, false
+		}
+		projectIDs = append(projectIDs, projectID)
+	}
+	return projectIDs, true
 }
 
 func (h *Handler) outboundWebhooksAvailable(w http.ResponseWriter) bool {
@@ -105,11 +127,11 @@ func (h *Handler) CreateOutboundWebhook(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if request.ScopeMode != outwebhook.ScopeWorkspace {
-		writeError(w, http.StatusBadRequest, "scope_mode must be workspace")
+	projectIDs, ok := parseOutboundWebhookProjectIDs(w, request.ProjectIDs)
+	if !ok {
 		return
 	}
-	result, err := h.OutboundWebhooks.Create(r.Context(), outwebhook.CreateInput{WorkspaceID: workspaceID, CreatedBy: createdBy, Name: request.Name, Destination: request.Destination, Events: request.Events})
+	result, err := h.OutboundWebhooks.Create(r.Context(), outwebhook.CreateInput{WorkspaceID: workspaceID, CreatedBy: createdBy, Name: request.Name, Destination: request.Destination, Events: request.Events, ScopeMode: request.ScopeMode, ProjectIDs: projectIDs})
 	if errors.Is(err, outwebhook.ErrInvalidInput) {
 		writeError(w, http.StatusBadRequest, "invalid outbound webhook subscription")
 		return
@@ -124,6 +146,48 @@ func (h *Handler) CreateOutboundWebhook(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	writeJSON(w, http.StatusCreated, result)
+}
+
+func (h *Handler) UpdateOutboundWebhookScope(w http.ResponseWriter, r *http.Request) {
+	if !h.outboundWebhooksAvailable(w) {
+		return
+	}
+	workspaceID, ok := parseUUIDOrBadRequest(w, chi.URLParam(r, "id"), "workspace_id")
+	if !ok {
+		return
+	}
+	if _, ok := h.requireWorkspaceRole(w, r, chi.URLParam(r, "id"), "workspace not found", "owner", "admin"); !ok {
+		return
+	}
+	subscriptionID, ok := parseUUIDOrBadRequest(w, chi.URLParam(r, "subscriptionId"), "subscription_id")
+	if !ok {
+		return
+	}
+	var request updateOutboundWebhookScopeRequest
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	projectIDs, ok := parseOutboundWebhookProjectIDs(w, request.ProjectIDs)
+	if !ok {
+		return
+	}
+	item, err := h.OutboundWebhooks.UpdateScope(r.Context(), outwebhook.UpdateScopeInput{
+		WorkspaceID: workspaceID, SubscriptionID: subscriptionID, ScopeMode: request.ScopeMode, ProjectIDs: projectIDs,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "outbound webhook not found")
+		return
+	}
+	if errors.Is(err, outwebhook.ErrInvalidInput) {
+		writeError(w, http.StatusBadRequest, "invalid outbound webhook scope")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to update outbound webhook scope")
+		return
+	}
+	writeJSON(w, http.StatusOK, item)
 }
 
 func (h *Handler) DeleteOutboundWebhook(w http.ResponseWriter, r *http.Request) {
@@ -163,9 +227,14 @@ func (h *Handler) UpdateOutboundWebhook(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
+	projectIDs, ok := parseOutboundWebhookProjectIDs(w, request.ProjectIDs)
+	if !ok {
+		return
+	}
 	item, err := h.OutboundWebhooks.Update(r.Context(), outwebhook.UpdateInput{
 		WorkspaceID: workspaceID, ID: subscriptionID, Name: request.Name,
 		Destination: request.Destination, Events: request.Events, ScopeMode: request.ScopeMode,
+		ProjectIDs: projectIDs,
 	})
 	h.writeOutboundWebhookMutationResult(w, item, err, "update")
 }

@@ -999,6 +999,7 @@ type OutboundWebhookSubscription struct {
 	ConsecutiveTerminalFailures int32              `json:"consecutive_terminal_failures"`
 	SigningSecretHint           string             `json:"signing_secret_hint"`
 	SecretVersion               int32              `json:"secret_version"`
+	ProjectIds                  []pgtype.UUID      `json:"project_ids"`
 }
 
 type PersonalAccessToken struct {

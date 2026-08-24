@@ -43,6 +43,7 @@ const (
 	EventCommentDeleted       = "comment.deleted"
 	EventWebhookTest          = "webhook.test"
 	ScopeWorkspace            = "workspace"
+	ScopeProject              = "project"
 	CatalogVersion            = 1
 
 	maxCommentExcerptCodePoints = 500
@@ -150,6 +151,8 @@ type CreateInput struct {
 	Name        string
 	Destination string
 	Events      []string
+	ScopeMode   string
+	ProjectIDs  []pgtype.UUID
 }
 
 type UpdateInput struct {
@@ -159,6 +162,7 @@ type UpdateInput struct {
 	Destination *string
 	Events      []string
 	ScopeMode   string
+	ProjectIDs  []pgtype.UUID
 }
 
 type TestInput struct {
@@ -175,6 +179,7 @@ type Subscription struct {
 	Events                      []string  `json:"events"`
 	EventCatalogVersion         int32     `json:"event_catalog_version"`
 	ScopeMode                   string    `json:"scope_mode"`
+	ProjectIDs                  []string  `json:"project_ids"`
 	Status                      string    `json:"status"`
 	PauseReason                 *string   `json:"pause_reason"`
 	ConsecutiveTerminalFailures int32     `json:"consecutive_terminal_failures"`
@@ -193,6 +198,13 @@ type TestResult struct {
 	DeliveryID string `json:"delivery_id"`
 	EventID    string `json:"event_id"`
 	State      string `json:"state"`
+}
+
+type UpdateScopeInput struct {
+	WorkspaceID    pgtype.UUID
+	SubscriptionID pgtype.UUID
+	ScopeMode      string
+	ProjectIDs     []pgtype.UUID
 }
 
 func New(queries *db.Queries, txStarter interface {
@@ -403,6 +415,15 @@ func (s *Service) Create(ctx context.Context, input CreateInput) (CreateResult, 
 	if err := validateEventSelection(input.Events); err != nil {
 		return CreateResult{}, err
 	}
+	if input.ScopeMode == "" {
+		input.ScopeMode = ScopeWorkspace
+	}
+	if err := validateScopeShape(input.ScopeMode, input.ProjectIDs); err != nil {
+		return CreateResult{}, err
+	}
+	if input.ProjectIDs == nil {
+		input.ProjectIDs = []pgtype.UUID{}
+	}
 	endpoint, _, err := s.validateDestination(ctx, input.Destination)
 	if err != nil {
 		return CreateResult{}, fmt.Errorf("%w: destination is not allowed", ErrInvalidInput)
@@ -420,13 +441,29 @@ func (s *Service) Create(ctx context.Context, input CreateInput) (CreateResult, 
 		return CreateResult{}, fmt.Errorf("encrypt signing secret: %w", err)
 	}
 	eventsJSON, _ := json.Marshal(input.Events)
-	row, err := s.queries.CreateOutboundWebhookSubscription(ctx, db.CreateOutboundWebhookSubscriptionParams{
+	if s.txStarter == nil {
+		return CreateResult{}, errors.New("outbound webhook transaction store is unavailable")
+	}
+	tx, err := s.txStarter.Begin(ctx)
+	if err != nil {
+		return CreateResult{}, err
+	}
+	defer tx.Rollback(ctx)
+	queries := s.queries.WithTx(tx)
+	if err := lockScopeProjects(ctx, queries, input.WorkspaceID, input.ProjectIDs); err != nil {
+		return CreateResult{}, err
+	}
+	row, err := queries.CreateOutboundWebhookSubscription(ctx, db.CreateOutboundWebhookSubscriptionParams{
 		WorkspaceID: input.WorkspaceID, Name: input.Name,
 		DestinationCiphertext: destinationCiphertext, SecretCiphertext: secretCiphertext,
-		DestinationHint: safeDestinationHint(endpoint), Events: eventsJSON, CreatedBy: input.CreatedBy,
+		DestinationHint: safeDestinationHint(endpoint), Events: eventsJSON, ScopeMode: input.ScopeMode,
+		ProjectIds: input.ProjectIDs, CreatedBy: input.CreatedBy,
 		SigningSecretHint: signingSecretHint(secret),
 	})
 	if err != nil {
+		return CreateResult{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
 		return CreateResult{}, err
 	}
 	return CreateResult{Subscription: subscriptionResponse(row), SigningSecret: secret}, nil
@@ -438,6 +475,80 @@ func generateSigningSecret() (string, error) {
 		return "", fmt.Errorf("generate signing secret: %w", err)
 	}
 	return "whsec_" + base64.RawURLEncoding.EncodeToString(secretBytes), nil
+}
+
+func (s *Service) UpdateScope(ctx context.Context, input UpdateScopeInput) (Subscription, error) {
+	if !s.Available() {
+		return Subscription{}, ErrUnavailable
+	}
+	if err := validateScopeShape(input.ScopeMode, input.ProjectIDs); err != nil {
+		return Subscription{}, err
+	}
+	if input.ProjectIDs == nil {
+		input.ProjectIDs = []pgtype.UUID{}
+	}
+	if s.txStarter == nil {
+		return Subscription{}, errors.New("outbound webhook transaction store is unavailable")
+	}
+	tx, err := s.txStarter.Begin(ctx)
+	if err != nil {
+		return Subscription{}, err
+	}
+	defer tx.Rollback(ctx)
+	queries := s.queries.WithTx(tx)
+	if err := lockScopeProjects(ctx, queries, input.WorkspaceID, input.ProjectIDs); err != nil {
+		return Subscription{}, err
+	}
+	if _, err := queries.GetOutboundWebhookSubscriptionForUpdate(ctx, db.GetOutboundWebhookSubscriptionForUpdateParams{WorkspaceID: input.WorkspaceID, ID: input.SubscriptionID}); err != nil {
+		return Subscription{}, err
+	}
+	row, err := queries.UpdateOutboundWebhookSubscriptionScope(ctx, db.UpdateOutboundWebhookSubscriptionScopeParams{
+		WorkspaceID: input.WorkspaceID, ID: input.SubscriptionID, ScopeMode: input.ScopeMode, ProjectIds: input.ProjectIDs,
+	})
+	if err != nil {
+		return Subscription{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Subscription{}, err
+	}
+	return subscriptionResponse(row), nil
+}
+
+func validateScopeShape(scopeMode string, projectIDs []pgtype.UUID) error {
+	if scopeMode == ScopeWorkspace {
+		if len(projectIDs) != 0 {
+			return fmt.Errorf("%w: workspace scope cannot select projects", ErrInvalidInput)
+		}
+		return nil
+	}
+	if scopeMode != ScopeProject || len(projectIDs) == 0 {
+		return fmt.Errorf("%w: project scope requires at least one project", ErrInvalidInput)
+	}
+	seen := make(map[uuid.UUID]struct{}, len(projectIDs))
+	for _, id := range projectIDs {
+		if !id.Valid {
+			return fmt.Errorf("%w: invalid project id", ErrInvalidInput)
+		}
+		if _, duplicate := seen[id.Bytes]; duplicate {
+			return fmt.Errorf("%w: duplicate project id", ErrInvalidInput)
+		}
+		seen[id.Bytes] = struct{}{}
+	}
+	return nil
+}
+
+func lockScopeProjects(ctx context.Context, queries *db.Queries, workspaceID pgtype.UUID, projectIDs []pgtype.UUID) error {
+	if len(projectIDs) == 0 {
+		return nil
+	}
+	rows, err := queries.LockOutboundWebhookScopeProjects(ctx, db.LockOutboundWebhookScopeProjectsParams{WorkspaceID: workspaceID, ProjectIds: projectIDs})
+	if err != nil {
+		return err
+	}
+	if len(rows) != len(projectIDs) {
+		return fmt.Errorf("%w: project does not belong to workspace", ErrInvalidInput)
+	}
+	return nil
 }
 
 func signingSecretHint(secret string) string {
@@ -505,16 +616,28 @@ func (s *Service) Update(ctx context.Context, input UpdateInput) (Subscription, 
 	}
 	defer tx.Rollback(context.Background())
 	queries := s.queries.WithTx(tx)
+	if input.ProjectIDs != nil {
+		if err := validateScopeShape(input.ScopeMode, input.ProjectIDs); err != nil {
+			return Subscription{}, err
+		}
+		// Project deletion takes the project row before shrinking subscription
+		// scopes. Use the same lock order for explicit scope changes.
+		if err := lockScopeProjects(ctx, queries, input.WorkspaceID, input.ProjectIDs); err != nil {
+			return Subscription{}, err
+		}
+	}
 	existing, err := queries.GetOutboundWebhookSubscriptionForUpdate(ctx, db.GetOutboundWebhookSubscriptionForUpdateParams{
 		WorkspaceID: input.WorkspaceID, ID: input.ID,
 	})
 	if err != nil {
 		return Subscription{}, err
 	}
-	// Project Scope is implemented by its own ticket. Editing lifecycle fields
-	// must preserve the stored scope and can never widen disclosure.
-	if input.ScopeMode != existing.ScopeMode {
-		return Subscription{}, fmt.Errorf("%w: scope mode cannot be changed by this operation", ErrInvalidInput)
+	// Older clients built before Project Scope omit project_ids and send their
+	// only known scope value. Preserve the stored scope in that case so editing
+	// lifecycle fields can never widen an existing Project Scope.
+	if input.ProjectIDs == nil {
+		input.ScopeMode = existing.ScopeMode
+		input.ProjectIDs = existing.ProjectIds
 	}
 	destinationCiphertext := existing.DestinationCiphertext
 	destinationHint := existing.DestinationHint
@@ -536,7 +659,7 @@ func (s *Service) Update(ctx context.Context, input UpdateInput) (Subscription, 
 	updated, err := queries.UpdateOutboundWebhookSubscription(ctx, db.UpdateOutboundWebhookSubscriptionParams{
 		WorkspaceID: input.WorkspaceID, ID: input.ID, Name: name,
 		DestinationCiphertext: destinationCiphertext, DestinationHint: destinationHint,
-		Events: eventsJSON, ScopeMode: existing.ScopeMode,
+		Events: eventsJSON, ScopeMode: input.ScopeMode, ProjectIds: input.ProjectIDs,
 	})
 	if err != nil {
 		return Subscription{}, err
@@ -785,7 +908,7 @@ func (s *Service) captureProductEvents(event events.Event, productEvents []produ
 			continue
 		}
 		eventID := uuid.New()
-		body, err := s.productEventBody(ctx, queries, workspaceID, event, eventID, product)
+		body, err := s.productEventBody(ctx, event, eventID, product)
 		if err != nil {
 			if !errors.Is(err, errCommentBodyUnchanged) {
 				slog.Error("outbound webhook canonicalization failed", "event_type", product.eventType, "error", err)
@@ -793,6 +916,9 @@ func (s *Service) captureProductEvents(event events.Event, productEvents []produ
 			return
 		}
 		for _, subscription := range rows {
+			if !subscriptionMatchesProjectScope(subscription, body, product.eventType) {
+				continue
+			}
 			_, err := queries.CreateOutboundWebhookDelivery(ctx, db.CreateOutboundWebhookDeliveryParams{
 				EventID: pgtype.UUID{Bytes: eventID, Valid: true}, SubscriptionID: subscription.ID,
 				WorkspaceID: subscription.WorkspaceID, EventType: product.eventType, RequestBody: body,
@@ -823,24 +949,64 @@ func (s *Service) captureProductEvents(event events.Event, productEvents []produ
 	s.wakeDispatcher()
 }
 
+func subscriptionMatchesProjectScope(subscription db.OutboundWebhookSubscription, body []byte, eventType string) bool {
+	if subscription.ScopeMode == ScopeWorkspace {
+		return true
+	}
+	if subscription.ScopeMode != ScopeProject || len(subscription.ProjectIds) == 0 {
+		return false
+	}
+	var envelope struct {
+		Data struct {
+			Issue struct {
+				ProjectID *string `json:"project_id"`
+			} `json:"issue"`
+			Change *struct {
+				Previous json.RawMessage `json:"previous"`
+				Current  json.RawMessage `json:"current"`
+			} `json:"change"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return false
+	}
+	candidates := make(map[string]struct{}, 2)
+	if envelope.Data.Issue.ProjectID != nil {
+		candidates[*envelope.Data.Issue.ProjectID] = struct{}{}
+	}
+	if eventType == EventIssueProjectChanged && envelope.Data.Change != nil {
+		for _, raw := range []json.RawMessage{envelope.Data.Change.Previous, envelope.Data.Change.Current} {
+			var projectID *string
+			if len(raw) > 0 && json.Unmarshal(raw, &projectID) == nil && projectID != nil {
+				candidates[*projectID] = struct{}{}
+			}
+		}
+	}
+	for _, selected := range subscription.ProjectIds {
+		if _, ok := candidates[util.UUIDToString(selected)]; ok {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Service) captureComment(event events.Event, eventType string) {
 	s.captureProductEvents(event, []productEvent{{eventType: eventType}})
 }
 
-func (s *Service) productEventBody(ctx context.Context, queries *db.Queries, workspaceID pgtype.UUID, event events.Event, eventID uuid.UUID, product productEvent) ([]byte, error) {
+func (s *Service) productEventBody(ctx context.Context, event events.Event, eventID uuid.UUID, product productEvent) ([]byte, error) {
 	switch product.eventType {
 	case EventCommentCreated, EventCommentUpdated, EventCommentDeleted:
-		issueID, err := commentEventIssueID(event.Payload, product.eventType)
+		if product.eventType == EventCommentUpdated {
+			payload, _ := event.Payload.(map[string]any)
+			bodyChanged, _ := payload["body_changed"].(bool)
+			if !bodyChanged {
+				return nil, errCommentBodyUnchanged
+			}
+		}
+		issue, err := commentEventIssueSnapshot(event.Payload, product.eventType)
 		if err != nil {
 			return nil, err
-		}
-		parsedIssueID, err := util.ParseUUID(issueID)
-		if err != nil {
-			return nil, errors.New("comment payload has an invalid issue id")
-		}
-		issue, err := queries.GetIssueInWorkspace(ctx, db.GetIssueInWorkspaceParams{ID: parsedIssueID, WorkspaceID: workspaceID})
-		if err != nil {
-			return nil, fmt.Errorf("load parent issue: %w", err)
 		}
 		return s.commentBody(event, eventID, issue, product.eventType)
 	default:
@@ -1071,6 +1237,51 @@ func commentEventIssueID(payload any, eventType string) (string, error) {
 	return comment.IssueID, nil
 }
 
+func commentEventIssueSnapshot(payload any, eventType string) (publicParentIssueSnapshot, error) {
+	object, ok := payload.(map[string]any)
+	if !ok {
+		return publicParentIssueSnapshot{}, errors.New("comment payload is not an object")
+	}
+	issueID, err := commentEventIssueID(payload, eventType)
+	if err != nil {
+		return publicParentIssueSnapshot{}, err
+	}
+	if _, err := util.ParseUUID(issueID); err != nil {
+		return publicParentIssueSnapshot{}, errors.New("comment payload has an invalid issue id")
+	}
+	title, _ := object["issue_title"].(string)
+	status, _ := object["issue_status"].(string)
+	priority, _ := object["issue_priority"].(string)
+	if title == "" || status == "" || priority == "" {
+		return publicParentIssueSnapshot{}, errors.New("comment payload has an incomplete parent issue snapshot")
+	}
+	raw, ok := object["issue_project_id"]
+	if !ok {
+		return publicParentIssueSnapshot{}, errors.New("comment payload has no event-time project snapshot")
+	}
+	var value string
+	switch typed := raw.(type) {
+	case nil:
+		return publicParentIssueSnapshot{ID: issueID, Title: title, Status: status, Priority: priority}, nil
+	case string:
+		value = typed
+	case *string:
+		if typed == nil {
+			return publicParentIssueSnapshot{ID: issueID, Title: title, Status: status, Priority: priority}, nil
+		}
+		value = *typed
+	default:
+		return publicParentIssueSnapshot{}, errors.New("comment payload has an invalid event-time project snapshot")
+	}
+	if value == "" {
+		return publicParentIssueSnapshot{}, errors.New("comment payload has an invalid event-time project snapshot")
+	}
+	if _, err := util.ParseUUID(value); err != nil {
+		return publicParentIssueSnapshot{}, errors.New("comment payload has an invalid event-time project snapshot")
+	}
+	return publicParentIssueSnapshot{ID: issueID, Title: title, Status: status, Priority: priority, ProjectID: &value}, nil
+}
+
 type publicCommentSnapshot struct {
 	ID       string  `json:"id"`
 	IssueID  string  `json:"issue_id"`
@@ -1095,7 +1306,7 @@ type publicParentIssueSnapshot struct {
 	ProjectID *string `json:"project_id"`
 }
 
-func (s *Service) commentBody(event events.Event, eventID uuid.UUID, issue db.Issue, eventType string) ([]byte, error) {
+func (s *Service) commentBody(event events.Event, eventID uuid.UUID, issue publicParentIssueSnapshot, eventType string) ([]byte, error) {
 	payload, ok := event.Payload.(map[string]any)
 	if !ok {
 		return nil, errors.New("comment payload is not an object")
@@ -1150,7 +1361,7 @@ func (s *Service) commentBody(event events.Event, eventID uuid.UUID, issue db.Is
 		comment.Excerpt = string(excerptRunes)
 		comment.Truncated = &truncated
 	}
-	if comment.ID == "" || comment.IssueID == "" || comment.IssueID != util.UUIDToString(issue.ID) || comment.Author.Type == "" || comment.Type == "" {
+	if comment.ID == "" || comment.IssueID == "" || comment.IssueID != issue.ID || comment.Author.Type == "" || comment.Type == "" {
 		return nil, errors.New("comment payload is incomplete")
 	}
 
@@ -1174,10 +1385,7 @@ func (s *Service) commentBody(event events.Event, eventID uuid.UUID, issue db.Is
 	envelope.Workspace.ID = event.WorkspaceID
 	envelope.Actor.Type, envelope.Actor.ID = event.ActorType, event.ActorID
 	envelope.Data.Comment = comment
-	envelope.Data.Issue = publicParentIssueSnapshot{
-		ID: util.UUIDToString(issue.ID), Title: issue.Title, Status: issue.Status,
-		Priority: issue.Priority, ProjectID: util.UUIDToPtr(issue.ProjectID),
-	}
+	envelope.Data.Issue = issue
 	return json.Marshal(envelope)
 }
 
@@ -1372,10 +1580,14 @@ func subscriptionResponse(row db.OutboundWebhookSubscription) Subscription {
 	if row.PauseReason.Valid {
 		pauseReason = &row.PauseReason.String
 	}
+	projectIDs := make([]string, 0, len(row.ProjectIds))
+	for _, id := range row.ProjectIds {
+		projectIDs = append(projectIDs, util.UUIDToString(id))
+	}
 	return Subscription{
 		ID: util.UUIDToString(row.ID), WorkspaceID: util.UUIDToString(row.WorkspaceID), Name: row.Name,
 		DestinationHint: row.DestinationHint, Events: events, EventCatalogVersion: row.EventCatalogVersion,
-		ScopeMode: row.ScopeMode, Status: row.Status, PauseReason: pauseReason,
+		ScopeMode: row.ScopeMode, ProjectIDs: projectIDs, Status: row.Status, PauseReason: pauseReason,
 		ConsecutiveTerminalFailures: row.ConsecutiveTerminalFailures,
 		SigningSecretHint:           row.SigningSecretHint,
 		SecretVersion:               row.SecretVersion,

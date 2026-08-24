@@ -1610,6 +1610,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					r.Post("/outbound-webhooks/{subscriptionId}/resume", h.ResumeOutboundWebhook)
 					r.Post("/outbound-webhooks/{subscriptionId}/test", h.TestOutboundWebhook)
 					r.Post("/outbound-webhooks/{subscriptionId}/rotate-secret", h.RotateOutboundWebhookSecret)
+					r.Patch("/outbound-webhooks/{subscriptionId}/scope", h.UpdateOutboundWebhookScope)
 					r.Delete("/outbound-webhooks/{subscriptionId}", h.DeleteOutboundWebhook)
 				})
 				// Owner-only access

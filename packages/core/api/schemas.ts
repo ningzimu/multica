@@ -368,7 +368,8 @@ export const OutboundWebhookSubscriptionSchema = z
     destination_hint: z.string(),
     events: z.array(z.string()).default([]),
     event_catalog_version: z.number().default(1),
-    scope_mode: z.enum(["workspace", "projects"]).catch("workspace"),
+    scope_mode: z.enum(["workspace", "project"]).default("workspace"),
+    project_ids: z.array(z.string()).default([]),
     status: z.enum(["active", "paused"]).default("active").catch("paused"),
     pause_reason: z
       .enum(["manual", "scope_empty", "failure_threshold"])
@@ -381,6 +382,12 @@ export const OutboundWebhookSubscriptionSchema = z
     updated_at: z.string(),
   })
   .loose()
+  .superRefine((value, ctx) => {
+    const safeEmptyProjectScope = value.scope_mode === "project" && value.project_ids.length === 0 && value.status === "paused" && value.pause_reason === "scope_empty";
+    if ((value.scope_mode === "workspace" && value.project_ids.length > 0) || (value.scope_mode === "project" && value.project_ids.length === 0 && !safeEmptyProjectScope)) {
+      ctx.addIssue({ code: "custom", message: "invalid outbound webhook scope shape" });
+    }
+  })
   .transform(
     (value): OutboundWebhookSubscription => ({
       id: value.id,
@@ -390,6 +397,7 @@ export const OutboundWebhookSubscriptionSchema = z
       events: value.events,
       eventCatalogVersion: value.event_catalog_version,
       scopeMode: value.scope_mode,
+      projectIds: value.project_ids,
       status: value.status,
       pauseReason: value.pause_reason,
       consecutiveTerminalFailures: value.consecutive_terminal_failures,
@@ -443,8 +451,8 @@ export const TestOutboundWebhookSubscriptionResponseSchema = z
 
 export const EMPTY_OUTBOUND_WEBHOOK_SUBSCRIPTION: OutboundWebhookSubscription = {
   id: "", workspaceId: "", name: "", destinationHint: "", events: [],
-  eventCatalogVersion: 1, scopeMode: "workspace", createdAt: "", updatedAt: "",
-  status: "paused", pauseReason: null, consecutiveTerminalFailures: 0,
+  eventCatalogVersion: 1, scopeMode: "workspace", projectIds: [], status: "paused", pauseReason: null,
+  consecutiveTerminalFailures: 0, createdAt: "", updatedAt: "",
   signingSecretHint: "", secretVersion: 1,
 };
 

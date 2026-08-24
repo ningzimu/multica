@@ -5368,6 +5368,7 @@ type delegatedFailureRecoveryTarget struct {
 	issue   db.Issue
 	agent   db.Agent
 	comment db.Comment
+	created db.CreateCommentRow
 }
 
 // IsDelegatedFailureRecoveryComment identifies the durable platform signal
@@ -5493,6 +5494,7 @@ func (s *TaskService) ensureDelegatedFailureRecoveryComment(ctx context.Context,
 			return fmt.Errorf("create recovery comment: %w", err)
 		}
 		target.comment = createdComment.Comment()
+		target.created = createdComment
 		created = true
 		return nil
 	}); err != nil {
@@ -5519,8 +5521,10 @@ func (s *TaskService) ensureDelegatedFailureRecoveryComment(ctx context.Context,
 					"source_task_id": util.UUIDToPtr(target.comment.SourceTaskID),
 					"created_at":     target.comment.CreatedAt.Time.Format("2006-01-02T15:04:05Z"),
 				},
-				"issue_title":  target.issue.Title,
-				"issue_status": target.issue.Status,
+				"issue_title":      target.created.IssueTitle,
+				"issue_status":     target.created.IssueStatus,
+				"issue_priority":   target.created.IssuePriority,
+				"issue_project_id": util.UUIDToPtr(target.created.IssueProjectID),
 			},
 		})
 	}
@@ -5560,6 +5564,7 @@ func delegatedFailureRecoveryAttribution(target *delegatedFailureRecoveryTarget)
 // by the first and does not report another exhaustion.
 func (s *TaskService) exhaustDelegatedFailureRecovery(ctx context.Context, target *delegatedFailureRecoveryTarget) (bool, error) {
 	var exhaustedComment db.Comment
+	var exhaustedCreated db.CreateCommentRow
 	var exhaustedInbox db.InboxItem
 	created := false
 	inboxCreated := false
@@ -5599,6 +5604,7 @@ func (s *TaskService) exhaustDelegatedFailureRecovery(ctx context.Context, targe
 			return fmt.Errorf("create delegated failure exhaustion comment: %w", err)
 		}
 		exhaustedComment = createdComment.Comment()
+		exhaustedCreated = createdComment
 		created = true
 
 		// Exhaustion deliberately does not @mention the coordinator agent: doing
@@ -5669,8 +5675,10 @@ func (s *TaskService) exhaustDelegatedFailureRecovery(ctx context.Context, targe
 					"source_task_id": util.UUIDToPtr(exhaustedComment.SourceTaskID),
 					"created_at":     exhaustedComment.CreatedAt.Time.Format("2006-01-02T15:04:05Z"),
 				},
-				"issue_title":  target.issue.Title,
-				"issue_status": target.issue.Status,
+				"issue_title":      exhaustedCreated.IssueTitle,
+				"issue_status":     exhaustedCreated.IssueStatus,
+				"issue_priority":   exhaustedCreated.IssuePriority,
+				"issue_project_id": util.UUIDToPtr(exhaustedCreated.IssueProjectID),
 			},
 		})
 	}
@@ -6465,9 +6473,11 @@ func (s *TaskService) createAgentComment(ctx context.Context, issueID, agentID p
 				"created_at":     comment.CreatedAt.Time.Format("2006-01-02T15:04:05Z"),
 				"revision":       comment.Revision,
 			},
-			"issue_title":    issue.Title,
-			"issue_status":   issue.Status,
-			"issue_revision": created.IssueRevision,
+			"issue_title":      created.IssueTitle,
+			"issue_status":     created.IssueStatus,
+			"issue_priority":   created.IssuePriority,
+			"issue_project_id": util.UUIDToPtr(created.IssueProjectID),
+			"issue_revision":   created.IssueRevision,
 		},
 	})
 	s.AutoUnresolveThreadOnReply(ctx, rootComment, util.UUIDToString(issue.WorkspaceID), "agent", util.UUIDToString(agentID))

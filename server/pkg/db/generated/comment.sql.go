@@ -204,14 +204,19 @@ WITH touched_issue AS (
         revision = revision + 1,
         last_activity_at = GREATEST(COALESCE(last_activity_at, updated_at), now())
     WHERE issue.id = $1 AND issue.workspace_id = $2
-    RETURNING issue.id, issue.workspace_id, issue.revision
+    RETURNING issue.id, issue.workspace_id, issue.revision,
+              issue.title, issue.status, issue.priority, issue.project_id
 ), inserted_comment AS (
     INSERT INTO comment (issue_id, workspace_id, author_type, author_id, content, type, parent_id, source_task_id, quick_action_id, via_plugin_id, id)
     SELECT ti.id, ti.workspace_id, $3, $4, $5, $6, $7, $8, $9, $10, COALESCE($11::uuid, gen_random_uuid())
     FROM touched_issue ti
     RETURNING id, issue_id, author_type, author_id, content, type, created_at, updated_at, parent_id, workspace_id, resolved_at, resolved_by_type, resolved_by_id, source_task_id, quick_action_id, via_plugin_id, revision
 )
-SELECT inserted_comment.id, inserted_comment.issue_id, inserted_comment.author_type, inserted_comment.author_id, inserted_comment.content, inserted_comment.type, inserted_comment.created_at, inserted_comment.updated_at, inserted_comment.parent_id, inserted_comment.workspace_id, inserted_comment.resolved_at, inserted_comment.resolved_by_type, inserted_comment.resolved_by_id, inserted_comment.source_task_id, inserted_comment.quick_action_id, inserted_comment.via_plugin_id, inserted_comment.revision, touched_issue.revision AS issue_revision
+SELECT inserted_comment.id, inserted_comment.issue_id, inserted_comment.author_type, inserted_comment.author_id, inserted_comment.content, inserted_comment.type, inserted_comment.created_at, inserted_comment.updated_at, inserted_comment.parent_id, inserted_comment.workspace_id, inserted_comment.resolved_at, inserted_comment.resolved_by_type, inserted_comment.resolved_by_id, inserted_comment.source_task_id, inserted_comment.quick_action_id, inserted_comment.via_plugin_id, inserted_comment.revision, touched_issue.revision AS issue_revision,
+       touched_issue.title AS issue_title,
+       touched_issue.status AS issue_status,
+       touched_issue.priority AS issue_priority,
+       touched_issue.project_id AS issue_project_id
 FROM inserted_comment
 JOIN touched_issue ON touched_issue.id = inserted_comment.issue_id
 `
@@ -249,6 +254,10 @@ type CreateCommentRow struct {
 	ViaPluginID    pgtype.UUID        `json:"via_plugin_id"`
 	Revision       int64              `json:"revision"`
 	IssueRevision  int64              `json:"issue_revision"`
+	IssueTitle     string             `json:"issue_title"`
+	IssueStatus    string             `json:"issue_status"`
+	IssuePriority  string             `json:"issue_priority"`
+	IssueProjectID pgtype.UUID        `json:"issue_project_id"`
 }
 
 // A new comment counts as activity on its issue, so the same statement bumps
@@ -301,6 +310,10 @@ func (q *Queries) CreateComment(ctx context.Context, arg CreateCommentParams) (C
 		&i.ViaPluginID,
 		&i.Revision,
 		&i.IssueRevision,
+		&i.IssueTitle,
+		&i.IssueStatus,
+		&i.IssuePriority,
+		&i.IssueProjectID,
 	)
 	return i, err
 }
@@ -309,7 +322,7 @@ const deleteComment = `-- name: DeleteComment :one
 WITH locked_issue AS MATERIALIZED (
     -- Lock the aggregate owner before its child so this cannot deadlock with
     -- issue teardown (which takes the same issue -> comment order).
-    SELECT issue.id
+    SELECT issue.id, issue.title, issue.status, issue.priority, issue.project_id
     FROM issue
     JOIN comment ON comment.issue_id = issue.id
                 AND comment.workspace_id = issue.workspace_id
@@ -333,10 +346,15 @@ WITH locked_issue AS MATERIALIZED (
     FROM deleted_comment
     WHERE issue.id = deleted_comment.issue_id
       AND issue.workspace_id = deleted_comment.workspace_id
-    RETURNING issue.id, issue.revision
+    RETURNING issue.id, issue.revision, issue.title, issue.status,
+              issue.priority, issue.project_id
 )
 SELECT EXISTS(SELECT 1 FROM deleted_comment) AS changed,
-       COALESCE((SELECT revision FROM touched_issue), 0)::bigint AS issue_revision
+       COALESCE((SELECT revision FROM touched_issue), 0)::bigint AS issue_revision,
+       COALESCE((SELECT title FROM locked_issue), '')::text AS issue_title,
+       COALESCE((SELECT status FROM locked_issue), '')::text AS issue_status,
+       COALESCE((SELECT priority FROM locked_issue), '')::text AS issue_priority,
+       (SELECT project_id FROM locked_issue) AS issue_project_id
 `
 
 type DeleteCommentParams struct {
@@ -345,15 +363,26 @@ type DeleteCommentParams struct {
 }
 
 type DeleteCommentRow struct {
-	Changed       bool  `json:"changed"`
-	IssueRevision int64 `json:"issue_revision"`
+	Changed        bool        `json:"changed"`
+	IssueRevision  int64       `json:"issue_revision"`
+	IssueTitle     string      `json:"issue_title"`
+	IssueStatus    string      `json:"issue_status"`
+	IssuePriority  string      `json:"issue_priority"`
+	IssueProjectID pgtype.UUID `json:"issue_project_id"`
 }
 
 // Defense-in-depth: workspace_id is a SQL-layer tenant guard. See DeleteIssue.
 func (q *Queries) DeleteComment(ctx context.Context, arg DeleteCommentParams) (DeleteCommentRow, error) {
 	row := q.db.QueryRow(ctx, deleteComment, arg.ID, arg.WorkspaceID)
 	var i DeleteCommentRow
-	err := row.Scan(&i.Changed, &i.IssueRevision)
+	err := row.Scan(
+		&i.Changed,
+		&i.IssueRevision,
+		&i.IssueTitle,
+		&i.IssueStatus,
+		&i.IssuePriority,
+		&i.IssueProjectID,
+	)
 	return i, err
 }
 
@@ -1635,7 +1664,7 @@ WITH locked_issue AS MATERIALIZED (
     -- Keep the global issue -> child lock order used by issue teardown. The
     -- aggregate below still yields one row when the parent was concurrently
     -- deleted, preserving best-effort edits of an orphaned comment.
-    SELECT issue.id
+    SELECT issue.id, issue.title, issue.status, issue.priority, issue.project_id
     FROM issue
     JOIN comment ON comment.issue_id = issue.id
                 AND comment.workspace_id = issue.workspace_id
@@ -1684,7 +1713,8 @@ WITH locked_issue AS MATERIALIZED (
     WHERE updated_comment.did_change
       AND issue.id = updated_comment.issue_id
       AND issue.workspace_id = updated_comment.workspace_id
-    RETURNING issue.id, issue.revision
+    RETURNING issue.id, issue.revision, issue.title, issue.status,
+              issue.priority, issue.project_id
 )
 SELECT updated_comment.id, updated_comment.issue_id, updated_comment.author_type,
        updated_comment.author_id, updated_comment.content, updated_comment.type,
@@ -1693,7 +1723,11 @@ SELECT updated_comment.id, updated_comment.issue_id, updated_comment.author_type
        updated_comment.resolved_by_type, updated_comment.resolved_by_id,
        updated_comment.source_task_id, updated_comment.quick_action_id,
        updated_comment.via_plugin_id, updated_comment.revision,
-       COALESCE((SELECT revision FROM touched_issue), 0)::bigint AS issue_revision
+       COALESCE((SELECT revision FROM touched_issue), 0)::bigint AS issue_revision,
+       COALESCE((SELECT title FROM locked_issue), '')::text AS issue_title,
+       COALESCE((SELECT status FROM locked_issue), '')::text AS issue_status,
+       COALESCE((SELECT priority FROM locked_issue), '')::text AS issue_priority,
+       (SELECT project_id FROM locked_issue) AS issue_project_id
 FROM updated_comment
 `
 
@@ -1724,6 +1758,10 @@ type UpdateCommentRow struct {
 	ViaPluginID    pgtype.UUID        `json:"via_plugin_id"`
 	Revision       int64              `json:"revision"`
 	IssueRevision  int64              `json:"issue_revision"`
+	IssueTitle     string             `json:"issue_title"`
+	IssueStatus    string             `json:"issue_status"`
+	IssuePriority  string             `json:"issue_priority"`
+	IssueProjectID pgtype.UUID        `json:"issue_project_id"`
 }
 
 func (q *Queries) UpdateComment(ctx context.Context, arg UpdateCommentParams) (UpdateCommentRow, error) {
@@ -1754,6 +1792,10 @@ func (q *Queries) UpdateComment(ctx context.Context, arg UpdateCommentParams) (U
 		&i.ViaPluginID,
 		&i.Revision,
 		&i.IssueRevision,
+		&i.IssueTitle,
+		&i.IssueStatus,
+		&i.IssuePriority,
+		&i.IssueProjectID,
 	)
 	return i, err
 }

@@ -911,10 +911,12 @@ func (h *Handler) RunQuickAction(w http.ResponseWriter, r *http.Request) {
 	resp.IssueRevision = created.IssueRevision
 	h.publish(protocol.EventCommentCreated, workspaceID, actorType, actorID, map[string]any{
 		"comment":             resp,
-		"issue_title":         issue.Title,
+		"issue_title":         created.IssueTitle,
 		"issue_assignee_type": textToPtr(issue.AssigneeType),
 		"issue_assignee_id":   uuidToPtr(issue.AssigneeID),
-		"issue_status":        issue.Status,
+		"issue_status":        created.IssueStatus,
+		"issue_priority":      created.IssuePriority,
+		"issue_project_id":    uuidToPtr(created.IssueProjectID),
 		"issue_revision":      created.IssueRevision,
 	})
 

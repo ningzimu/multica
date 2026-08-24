@@ -18,6 +18,7 @@ const mockPause = vi.hoisted(() => vi.fn());
 const mockResume = vi.hoisted(() => vi.fn());
 const mockTest = vi.hoisted(() => vi.fn());
 const mockRotate = vi.hoisted(() => vi.fn());
+const mockListProjects = vi.hoisted(() => vi.fn());
 const mockToastError = vi.hoisted(() => vi.fn());
 
 vi.mock("@multica/core/api", () => ({
@@ -31,6 +32,7 @@ vi.mock("@multica/core/api", () => ({
     resumeOutboundWebhookSubscription: mockResume,
     testOutboundWebhookSubscription: mockTest,
     rotateOutboundWebhookSecret: mockRotate,
+    listProjects: mockListProjects,
   },
 }));
 
@@ -61,11 +63,15 @@ describe("OutboundWebhooksTab", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockList.mockResolvedValue({ subscriptions: [], capabilityAvailable: true });
+    mockListProjects.mockResolvedValue({ projects: [
+      { id: "project-1", title: "Alpha" },
+      { id: "project-2", title: "Beta" },
+    ] });
     mockCreate.mockResolvedValue({
-      subscription: { id: "sub-1", workspaceId: "workspace-1", name: "Receiver", destinationHint: "https://example.com", events: ["issue.created"], eventCatalogVersion: 1, scopeMode: "workspace", status: "active", pauseReason: null, consecutiveTerminalFailures: 0, signingSecretHint: "whsec_...once", secretVersion: 1, createdAt: "now", updatedAt: "now" },
+      subscription: { id: "sub-1", workspaceId: "workspace-1", name: "Receiver", destinationHint: "https://example.com", events: ["issue.created"], eventCatalogVersion: 1, scopeMode: "workspace", projectIds: [], status: "active", pauseReason: null, consecutiveTerminalFailures: 0, signingSecretHint: "whsec_...once", secretVersion: 1, createdAt: "now", updatedAt: "now" },
       signingSecret: "whsec_once",
     });
-    mockGet.mockResolvedValue({ id: "sub-1", workspaceId: "workspace-1", name: "Receiver", destinationHint: "https://example.com", events: ["issue.created"], eventCatalogVersion: 1, scopeMode: "workspace", status: "active", pauseReason: null, consecutiveTerminalFailures: 0, signingSecretHint: "whsec_...once", secretVersion: 1, createdAt: "now", updatedAt: "now" });
+    mockGet.mockResolvedValue({ id: "sub-1", workspaceId: "workspace-1", name: "Receiver", destinationHint: "https://example.com", events: ["issue.created"], eventCatalogVersion: 1, scopeMode: "workspace", projectIds: [], status: "active", pauseReason: null, consecutiveTerminalFailures: 0, signingSecretHint: "whsec_...once", secretVersion: 1, createdAt: "now", updatedAt: "now" });
     mockUpdate.mockResolvedValue({ id: "sub-1" });
     mockPause.mockResolvedValue({ id: "sub-1", status: "paused" });
     mockResume.mockResolvedValue({ id: "sub-1", status: "active" });
@@ -87,6 +93,7 @@ describe("OutboundWebhooksTab", () => {
       destination: "https://example.com/events",
       events: ["issue.created", "issue.status_changed", "issue.assignee_changed", "comment.created"],
       scopeMode: "workspace",
+      projectIds: [],
     }));
     expect(await screen.findByText("whsec_once")).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "I saved it" }));
@@ -170,20 +177,25 @@ describe("OutboundWebhooksTab", () => {
       destination: undefined,
       events: ["issue.created", "comment.deleted"],
       scopeMode: "workspace",
+      projectIds: [],
     }));
   });
 
-  it("preserves a project-scoped subscription until the project-scope editor is integrated", async () => {
+  it("edits a subscription to select multiple projects explicitly", async () => {
     mockList.mockResolvedValue({ capabilityAvailable: true, subscriptions: [
-      { id: "sub-1", workspaceId: "workspace-1", name: "Receiver", destinationHint: "https://example.com", events: ["issue.created"], eventCatalogVersion: 1, scopeMode: "projects", status: "active", pauseReason: null, consecutiveTerminalFailures: 0, signingSecretHint: "whsec_...once", secretVersion: 1, createdAt: "now", updatedAt: "now" },
+      { id: "sub-1", workspaceId: "workspace-1", name: "Receiver", destinationHint: "https://example.com", events: ["issue.created"], eventCatalogVersion: 1, scopeMode: "workspace", projectIds: [], status: "active", pauseReason: null, consecutiveTerminalFailures: 0, signingSecretHint: "whsec_...once", secretVersion: 1, createdAt: "now", updatedAt: "now" },
     ] });
     const user = userEvent.setup();
     render(<OutboundWebhooksTab />, { wrapper: Wrapper });
 
     await user.click(await screen.findByRole("button", { name: "Edit" }));
+    await user.selectOptions(screen.getAllByLabelText("Scope").at(1)!, "project");
+    await user.click(await screen.findByRole("checkbox", { name: "Alpha" }));
+    await user.click(screen.getByRole("checkbox", { name: "Beta" }));
     await user.click(screen.getByRole("button", { name: "Save changes" }));
     await waitFor(() => expect(mockUpdate).toHaveBeenCalledWith("workspace-1", "sub-1", expect.objectContaining({
-      scopeMode: "projects",
+      scopeMode: "project",
+      projectIds: ["project-1", "project-2"],
     })));
   });
 

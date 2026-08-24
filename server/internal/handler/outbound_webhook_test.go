@@ -509,7 +509,7 @@ func TestOutboundWebhookTerminalFailuresPauseAndSuccessResets(t *testing.T) {
 	for _, status := range []int{http.StatusBadRequest, http.StatusNoContent, http.StatusBadRequest, http.StatusBadRequest} {
 		responses <- status
 	}
-	received := make(chan string, 4)
+	received := make(chan string, 6)
 	receiver := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		received <- r.Header.Get("X-Multica-Delivery-ID")
 		w.WriteHeader(<-responses)
@@ -1128,7 +1128,7 @@ func TestCommentLifecyclePersistsAndDeliversSelectedWorkspaceWebhooks(t *testing
 
 	bus.Publish(events.Event{
 		Type: protocol.EventCommentUpdated, WorkspaceID: testWorkspaceID, ActorType: "member", ActorID: testUserID,
-		Payload: map[string]any{"body_changed": false, "comment": map[string]any{
+		Payload: map[string]any{"body_changed": false, "issue_project_id": nil, "comment": map[string]any{
 			"id": reply.ID, "issue_id": issueID, "author_type": "member", "author_id": testUserID,
 			"type": "comment", "content": "edited reply",
 		}},
@@ -1168,11 +1168,14 @@ func TestCommentLifecyclePersistsAndDeliversSelectedWorkspaceWebhooks(t *testing
 		bus.Publish(events.Event{
 			Type: protocol.EventCommentCreated, WorkspaceID: testWorkspaceID,
 			ActorType: variant.authorType, ActorID: authorID,
-			Payload: map[string]any{"comment": map[string]any{
-				"id": uuid.NewString(), "issue_id": issueID, "parent_id": variant.parentID,
-				"author_type": variant.authorType, "author_id": authorID,
-				"type": "comment", "content": variant.authorType + " body",
-			}},
+			Payload: map[string]any{
+				"issue_title": "Comment contract", "issue_status": "todo", "issue_priority": "none", "issue_project_id": nil,
+				"comment": map[string]any{
+					"id": uuid.NewString(), "issue_id": issueID, "parent_id": variant.parentID,
+					"author_type": variant.authorType, "author_id": authorID,
+					"type": "comment", "content": variant.authorType + " body",
+				},
+			},
 		})
 		envelope := receive("comment.created")
 		comment := envelope["data"].(map[string]any)["comment"].(map[string]any)
@@ -1261,6 +1264,184 @@ func TestOutboundWebhookMutationPermissionsAndWorkspaceBoundary(t *testing.T) {
 	pause := withURLParams(newRequest(http.MethodPost, "/api/workspaces/"+testWorkspaceID+"/outbound-webhooks/"+created.Subscription.ID+"/pause", nil),
 		"id", testWorkspaceID, "subscriptionId", created.Subscription.ID)
 	testutil.Call(t, h.PauseOutboundWebhook, pause).Want(http.StatusNotFound)
+}
+
+func TestOutboundWebhookProjectScopeValidationUpdateAndDeletion(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database unavailable")
+	}
+	box, err := secretbox.New([]byte("0123456789abcdef0123456789abcdef"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	outbound := outwebhook.New(db.New(testPool), testPool, box, []string{"https://127.0.0.1:9443"})
+	h := *testHandler
+	h.OutboundWebhooks = outbound
+	projectA := dbfx.Project(t, "Webhook scope A")
+	projectB := dbfx.Project(t, "Webhook scope B")
+	foreignWorkspaceID := dbfx.Workspace(t, "Webhook scope foreign", "webhook-scope-foreign-"+uuid.NewString())
+	foreignProject := createChatProjectTestProject(t, foreignWorkspaceID, "Foreign webhook scope", "")
+
+	create := func(scopeMode string, projectIDs []string) *testutil.Response {
+		t.Helper()
+		return testutil.Call(t, h.CreateOutboundWebhook,
+			withURLParam(newRequest(http.MethodPost, "/api/workspaces/"+testWorkspaceID+"/outbound-webhooks", map[string]any{
+				"name": "Scoped receiver", "destination": "https://127.0.0.1:9443/events",
+				"events": []string{"issue.created"}, "scope_mode": scopeMode, "project_ids": projectIDs,
+			}), "id", testWorkspaceID))
+	}
+	create(outwebhook.ScopeProject, nil).Want(http.StatusBadRequest)
+	create(outwebhook.ScopeWorkspace, []string{projectA}).Want(http.StatusBadRequest)
+	create(outwebhook.ScopeProject, []string{foreignProject}).Want(http.StatusBadRequest)
+
+	var created struct {
+		Subscription outwebhook.Subscription `json:"subscription"`
+	}
+	create(outwebhook.ScopeWorkspace, nil).Want(http.StatusCreated).JSON(&created)
+	t.Cleanup(func() {
+		_, _ = testPool.Exec(context.Background(), `DELETE FROM outbound_webhook_delivery WHERE subscription_id = $1`, created.Subscription.ID)
+		_, _ = testPool.Exec(context.Background(), `DELETE FROM outbound_webhook_subscription WHERE id = $1`, created.Subscription.ID)
+	})
+
+	update := withURLParams(newRequest(http.MethodPatch, "/api/workspaces/"+testWorkspaceID+"/outbound-webhooks/"+created.Subscription.ID+"/scope", map[string]any{
+		"scope_mode": outwebhook.ScopeProject, "project_ids": []string{projectA, projectB},
+	}), "id", testWorkspaceID, "subscriptionId", created.Subscription.ID)
+	var scoped outwebhook.Subscription
+	testutil.Call(t, h.UpdateOutboundWebhookScope, update).Want(http.StatusOK).JSON(&scoped)
+	if scoped.ScopeMode != outwebhook.ScopeProject || len(scoped.ProjectIDs) != 2 {
+		t.Fatalf("multi-project scope not returned: %+v", scoped)
+	}
+
+	testutil.Call(t, h.DeleteProject,
+		withURLParam(newRequest(http.MethodDelete, "/api/projects/"+projectA, nil), "id", projectA)).Want(http.StatusNoContent)
+	var status, pauseReason string
+	var projectIDs []string
+	if err := testPool.QueryRow(context.Background(), `SELECT status, COALESCE(pause_reason, ''), project_ids::text[] FROM outbound_webhook_subscription WHERE id = $1`, created.Subscription.ID).Scan(&status, &pauseReason, &projectIDs); err != nil {
+		t.Fatal(err)
+	}
+	if status != "active" || pauseReason != "" || len(projectIDs) != 1 || projectIDs[0] != projectB {
+		t.Fatalf("first deletion did not narrow scope safely: status=%s reason=%s projects=%v", status, pauseReason, projectIDs)
+	}
+
+	testutil.Call(t, h.DeleteProject,
+		withURLParam(newRequest(http.MethodDelete, "/api/projects/"+projectB, nil), "id", projectB)).Want(http.StatusNoContent)
+	if err := testPool.QueryRow(context.Background(), `SELECT status, pause_reason, project_ids::text[] FROM outbound_webhook_subscription WHERE id = $1`, created.Subscription.ID).Scan(&status, &pauseReason, &projectIDs); err != nil {
+		t.Fatal(err)
+	}
+	if status != "paused" || pauseReason != "scope_empty" || len(projectIDs) != 0 {
+		t.Fatalf("empty scope widened or stayed active: status=%s reason=%s projects=%v", status, pauseReason, projectIDs)
+	}
+}
+
+func TestProjectScopedWebhookUsesIssueAndCommentEventTimeProjectSnapshots(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database unavailable")
+	}
+	received := make(chan string, 6)
+	receiver := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		received <- r.Header.Get("X-Multica-Event")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer receiver.Close()
+	box, err := secretbox.New([]byte("0123456789abcdef0123456789abcdef"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	queries := db.New(testPool)
+	bus := events.New()
+	moveIssueID := ""
+	moveToProjectID := ""
+	bus.Subscribe(protocol.EventCommentCreated, func(events.Event) {
+		if moveIssueID != "" && moveToProjectID != "" {
+			if _, err := testPool.Exec(context.Background(), `UPDATE issue SET project_id = $1 WHERE id = $2`, moveToProjectID, moveIssueID); err != nil {
+				t.Errorf("move issue before outbound capture: %v", err)
+			}
+			moveIssueID = ""
+		}
+	})
+	outbound := outwebhook.New(queries, testPool, box, []string{receiver.URL}, outwebhook.WithHTTPClient(receiver.Client()))
+	outbound.Register(bus)
+	t.Cleanup(func() {
+		outbound.Close()
+		if !outbound.WaitWithTimeout(time.Second) {
+			t.Error("outbound webhook dispatcher did not stop")
+		}
+	})
+	h := New(queries, testPool, testHandler.Hub, bus, service.NewEmailService(), nil, nil, analytics.NoopClient{}, Config{AllowSignup: true})
+	h.OutboundWebhooks = outbound
+	projectA := dbfx.Project(t, "Webhook event scope A")
+	projectB := dbfx.Project(t, "Webhook event scope B")
+
+	var created struct {
+		Subscription outwebhook.Subscription `json:"subscription"`
+	}
+	testutil.Call(t, h.CreateOutboundWebhook,
+		withURLParam(newRequest(http.MethodPost, "/api/workspaces/"+testWorkspaceID+"/outbound-webhooks", map[string]any{
+			"name": "Project events", "destination": receiver.URL + "/events",
+			"events":     []string{outwebhook.EventIssueCreated, outwebhook.EventIssueProjectChanged, outwebhook.EventCommentCreated},
+			"scope_mode": outwebhook.ScopeProject, "project_ids": []string{projectA},
+		}), "id", testWorkspaceID)).Want(http.StatusCreated).JSON(&created)
+	t.Cleanup(func() {
+		_, _ = testPool.Exec(context.Background(), `DELETE FROM outbound_webhook_delivery WHERE subscription_id = $1`, created.Subscription.ID)
+		_, _ = testPool.Exec(context.Background(), `DELETE FROM outbound_webhook_subscription WHERE id = $1`, created.Subscription.ID)
+	})
+
+	var issue struct {
+		ID string `json:"id"`
+	}
+	testutil.Call(t, h.CreateIssue,
+		newRequest(http.MethodPost, "/api/issues", map[string]any{"title": "Initially unprojected"})).Want(http.StatusCreated).JSON(&issue)
+	t.Cleanup(func() { _, _ = testPool.Exec(context.Background(), `DELETE FROM issue WHERE id = $1`, issue.ID) })
+	if count := dbfx.Count(t, `SELECT count(*) FROM outbound_webhook_delivery WHERE subscription_id = $1`, created.Subscription.ID); count != 0 {
+		t.Fatalf("unprojected Issue matched Project Scope: %d deliveries", count)
+	}
+
+	receive := func(want string) {
+		t.Helper()
+		select {
+		case got := <-received:
+			if got != want {
+				t.Fatalf("received event %q, want %q", got, want)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("controlled receiver did not observe %s", want)
+		}
+	}
+	testutil.Call(t, h.UpdateIssue,
+		withURLParam(newRequest(http.MethodPatch, "/api/issues/"+issue.ID, map[string]any{"project_id": projectA, "suppress_run": true}), "id", issue.ID)).Want(http.StatusOK)
+	receive(outwebhook.EventIssueProjectChanged)
+
+	testutil.Call(t, h.CreateComment,
+		withURLParam(newRequest(http.MethodPost, "/api/issues/"+issue.ID+"/comments", map[string]any{"content": "Project snapshot comment"}), "id", issue.ID)).Want(http.StatusCreated)
+	receive(outwebhook.EventCommentCreated)
+
+	// A listener registered before Outbound moves storage to project B after
+	// the comment commits. Outbound must still use the SQL-returned project A
+	// snapshot carried by the event.
+	moveIssueID, moveToProjectID = issue.ID, projectB
+	testutil.Call(t, h.CreateComment,
+		withURLParam(newRequest(http.MethodPost, "/api/issues/"+issue.ID+"/comments", map[string]any{"content": "Race-safe project snapshot"}), "id", issue.ID)).Want(http.StatusCreated)
+	receive(outwebhook.EventCommentCreated)
+
+	testutil.Call(t, h.UpdateIssue,
+		withURLParam(newRequest(http.MethodPatch, "/api/issues/"+issue.ID, map[string]any{"project_id": projectA, "suppress_run": true}), "id", issue.ID)).Want(http.StatusOK)
+	receive(outwebhook.EventIssueProjectChanged)
+
+	testutil.Call(t, h.UpdateIssue,
+		withURLParam(newRequest(http.MethodPatch, "/api/issues/"+issue.ID, map[string]any{"project_id": nil, "suppress_run": true}), "id", issue.ID)).Want(http.StatusOK)
+	receive(outwebhook.EventIssueProjectChanged)
+
+	var projectBIssue struct {
+		ID string `json:"id"`
+	}
+	testutil.Call(t, h.CreateIssue,
+		newRequest(http.MethodPost, "/api/issues", map[string]any{"title": "Second selected project", "project_id": projectB})).Want(http.StatusCreated).JSON(&projectBIssue)
+	t.Cleanup(func() {
+		_, _ = testPool.Exec(context.Background(), `DELETE FROM issue WHERE id = $1`, projectBIssue.ID)
+	})
+	if count := dbfx.Count(t, `SELECT count(*) FROM outbound_webhook_delivery WHERE subscription_id = $1 AND event_type = 'issue.created'`, created.Subscription.ID); count != 0 {
+		t.Fatalf("single-project scope matched another project: %d deliveries", count)
+	}
 }
 
 func TestOutboundWebhookDeleteWaitsForCaptureAndSweepsItsDelivery(t *testing.T) {
