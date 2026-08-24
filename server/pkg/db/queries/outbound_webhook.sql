@@ -10,9 +10,9 @@ SELECT * FROM outbound_webhook_subscription
 WHERE workspace_id = $1
 ORDER BY created_at ASC;
 
--- name: ListActiveIssueCreatedOutboundWebhookSubscriptions :many
+-- name: ListActiveOutboundWebhookSubscriptionsForEvent :many
 SELECT * FROM outbound_webhook_subscription
-WHERE workspace_id = $1 AND events ? 'issue.created'
+WHERE workspace_id = $1 AND events ? sqlc.arg('event_type')::text
 ORDER BY created_at ASC
 FOR SHARE;
 
@@ -29,6 +29,12 @@ WHERE workspace_id = $1 AND id = $2;
 SELECT * FROM outbound_webhook_subscription
 WHERE workspace_id = $1 AND id = $2
 FOR UPDATE;
+
+-- name: UpdateOutboundWebhookSubscriptionEvents :one
+UPDATE outbound_webhook_subscription
+SET events = $3, updated_at = now()
+WHERE workspace_id = $1 AND id = $2
+RETURNING *;
 
 -- name: DeleteOutboundWebhookDeliveriesBySubscription :exec
 DELETE FROM outbound_webhook_delivery

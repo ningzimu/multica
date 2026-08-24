@@ -13,6 +13,7 @@ const mockList = vi.hoisted(() => vi.fn());
 const mockGet = vi.hoisted(() => vi.fn());
 const mockCreate = vi.hoisted(() => vi.fn());
 const mockDelete = vi.hoisted(() => vi.fn());
+const mockUpdateEvents = vi.hoisted(() => vi.fn());
 const mockToastError = vi.hoisted(() => vi.fn());
 
 vi.mock("@multica/core/api", () => ({
@@ -21,6 +22,7 @@ vi.mock("@multica/core/api", () => ({
     getOutboundWebhookSubscription: mockGet,
     createOutboundWebhookSubscription: mockCreate,
     deleteOutboundWebhookSubscription: mockDelete,
+    updateOutboundWebhookEvents: mockUpdateEvents,
   },
 }));
 
@@ -78,6 +80,24 @@ describe("OutboundWebhooksTab", () => {
     expect(screen.queryByText("whsec_once")).not.toBeInTheDocument();
   });
 
+  it("creates only the Issue events the administrator explicitly selects", async () => {
+    const user = userEvent.setup();
+    render(<OutboundWebhooksTab />, { wrapper: Wrapper });
+
+    await user.type(screen.getByLabelText("Name"), "Issue changes");
+    await user.type(screen.getByLabelText("Destination URL"), "https://example.com/events");
+    await user.click(screen.getByRole("checkbox", { name: "issue.priority_changed" }));
+    await user.click(screen.getByRole("checkbox", { name: "issue.project_changed" }));
+    await user.click(screen.getByRole("button", { name: "Create webhook" }));
+
+    await waitFor(() => expect(mockCreate).toHaveBeenCalledWith("workspace-1", {
+      name: "Issue changes",
+      destination: "https://example.com/events",
+      events: ["issue.created", "issue.priority_changed", "issue.project_changed"],
+      scopeMode: "workspace",
+    }));
+  });
+
   it("loads a safe detail view for inspection", async () => {
     mockList.mockResolvedValue({ subscriptions: [
       { id: "sub-1", workspaceId: "workspace-1", name: "Receiver", destinationHint: "https://example.com", events: ["issue.created"], eventCatalogVersion: 1, scopeMode: "workspace", createdAt: "now", updatedAt: "now" },
@@ -89,6 +109,28 @@ describe("OutboundWebhooksTab", () => {
     await waitFor(() => expect(mockGet).toHaveBeenCalledWith("workspace-1", "sub-1"));
     expect(await screen.findByText("Event catalog version")).toBeInTheDocument();
     expect(screen.queryByText("whsec_once")).not.toBeInTheDocument();
+  });
+
+  it("edits explicit selections without dropping a future catalog event", async () => {
+    const futureEvent = "issue.future_changed";
+    mockList.mockResolvedValue({ subscriptions: [
+      { id: "sub-1", workspaceId: "workspace-1", name: "Receiver", destinationHint: "https://example.com", events: ["issue.created", futureEvent], eventCatalogVersion: 2, scopeMode: "workspace", createdAt: "now", updatedAt: "now" },
+    ] });
+    mockGet.mockResolvedValue({ id: "sub-1", workspaceId: "workspace-1", name: "Receiver", destinationHint: "https://example.com", events: ["issue.created", futureEvent], eventCatalogVersion: 2, scopeMode: "workspace", createdAt: "now", updatedAt: "now" });
+    mockUpdateEvents.mockResolvedValue({ id: "sub-1", events: ["issue.created", "issue.status_changed", futureEvent] });
+    const user = userEvent.setup();
+    render(<OutboundWebhooksTab />, { wrapper: Wrapper });
+
+    await user.click(await screen.findByRole("button", { name: "Inspect" }));
+    const statusCheckboxes = await screen.findAllByRole("checkbox", { name: "issue.status_changed" });
+    await user.click(statusCheckboxes.at(-1)!);
+    await user.click(screen.getByRole("button", { name: "Save events" }));
+
+    await waitFor(() => expect(mockUpdateEvents).toHaveBeenCalledWith(
+      "workspace-1",
+      "sub-1",
+      ["issue.created", futureEvent, "issue.status_changed"],
+    ));
   });
 
   it("keeps the form and reports when the one-time secret is missing", async () => {

@@ -3628,7 +3628,7 @@ func (h *Handler) UpdateIssue(w http.ResponseWriter, r *http.Request) {
 	slog.Info("issue updated", append(logger.RequestAttrs(r), "issue_id", id, "workspace_id", workspaceID)...)
 
 	h.fillStatusCategory(r.Context(), issue.WorkspaceID, &resp)
-	assigneeChanged := (req.AssigneeType != nil || req.AssigneeID != nil) &&
+	assigneeChanged := (touchedType || touchedID) &&
 		(prevIssue.AssigneeType.String != issue.AssigneeType.String || uuidToString(prevIssue.AssigneeID) != uuidToString(issue.AssigneeID))
 	statusChanged := req.Status != nil && prevIssue.Status != issue.Status
 	priorityChanged := req.Priority != nil && prevIssue.Priority != issue.Priority
@@ -3636,7 +3636,8 @@ func (h *Handler) UpdateIssue(w http.ResponseWriter, r *http.Request) {
 	// status/assignee flags gate theirs. Without it the client must diff
 	// project_id against its own cache, which breaks once an optimistic local
 	// move has overwritten the cached value (MUL-3669 / #4548).
-	projectChanged := req.ProjectID != nil && uuidToString(prevIssue.ProjectID) != uuidToString(issue.ProjectID)
+	_, projectTouched := rawFields["project_id"]
+	projectChanged := projectTouched && uuidToString(prevIssue.ProjectID) != uuidToString(issue.ProjectID)
 	descriptionChanged := req.Description != nil && textToPtr(prevIssue.Description) != resp.Description
 	titleChanged := req.Title != nil && prevIssue.Title != issue.Title
 	prevStartDate := dateToPtr(prevIssue.StartDate)
@@ -3661,6 +3662,7 @@ func (h *Handler) UpdateIssue(w http.ResponseWriter, r *http.Request) {
 		"prev_assignee_id":    uuidToPtr(prevIssue.AssigneeID),
 		"prev_status":         prevIssue.Status,
 		"prev_priority":       prevIssue.Priority,
+		"prev_project_id":     uuidToPtr(prevIssue.ProjectID),
 		"prev_start_date":     prevStartDate,
 		"prev_due_date":       prevDueDate,
 		"prev_description":    textToPtr(prevIssue.Description),
@@ -4279,18 +4281,24 @@ func (h *Handler) BatchUpdateIssues(w http.ResponseWriter, r *http.Request) {
 		actorType, actorID := h.resolveActor(r, userID, workspaceID)
 
 		fillBatch(&resp)
-		assigneeChanged := (req.Updates.AssigneeType != nil || req.Updates.AssigneeID != nil) &&
+		assigneeChanged := (batchTouchedType || batchTouchedID) &&
 			(prevIssue.AssigneeType.String != issue.AssigneeType.String || uuidToString(prevIssue.AssigneeID) != uuidToString(issue.AssigneeID))
 		statusChanged := req.Updates.Status != nil && prevIssue.Status != issue.Status
 		priorityChanged := req.Updates.Priority != nil && prevIssue.Priority != issue.Priority
-		projectChanged := req.Updates.ProjectID != nil && uuidToString(prevIssue.ProjectID) != uuidToString(issue.ProjectID)
+		_, batchProjectTouched := rawUpdates["project_id"]
+		projectChanged := batchProjectTouched && uuidToString(prevIssue.ProjectID) != uuidToString(issue.ProjectID)
 
 		h.publish(protocol.EventIssueUpdated, workspaceID, actorType, actorID, map[string]any{
-			"issue":            resp,
-			"assignee_changed": assigneeChanged,
-			"status_changed":   statusChanged,
-			"priority_changed": priorityChanged,
-			"project_changed":  projectChanged,
+			"issue":              resp,
+			"assignee_changed":   assigneeChanged,
+			"status_changed":     statusChanged,
+			"priority_changed":   priorityChanged,
+			"project_changed":    projectChanged,
+			"prev_assignee_type": textToPtr(prevIssue.AssigneeType),
+			"prev_assignee_id":   uuidToPtr(prevIssue.AssigneeID),
+			"prev_status":        prevIssue.Status,
+			"prev_priority":      prevIssue.Priority,
+			"prev_project_id":    uuidToPtr(prevIssue.ProjectID),
 		})
 
 		// Reassignment does not cancel existing tasks (#4963 / MUL-4113) —

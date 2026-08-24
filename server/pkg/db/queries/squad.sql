@@ -115,10 +115,11 @@ JOIN squad_member sm ON sm.squad_id = s.id
 WHERE s.workspace_id = $1 AND sm.member_type = $2 AND sm.member_id = $3
 ORDER BY s.created_at ASC;
 
--- name: TransferSquadAssignees :exec
+-- name: TransferSquadAssignees :many
 -- Transfer all issues assigned to a squad to the squad's leader agent.
 UPDATE issue SET assignee_type = 'agent', assignee_id = $2, revision = revision + 1, updated_at = now()
-WHERE assignee_type = 'squad' AND assignee_id = $1;
+WHERE assignee_type = 'squad' AND assignee_id = $1
+RETURNING *;
 
 -- name: TransferSquadAutopilotsToLeader :exec
 -- Mirrors TransferSquadAssignees for autopilot rows: when a squad is archived,

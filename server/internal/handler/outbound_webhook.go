@@ -18,6 +18,10 @@ type createOutboundWebhookRequest struct {
 	ScopeMode   string   `json:"scope_mode"`
 }
 
+type updateOutboundWebhookEventsRequest struct {
+	Events []string `json:"events"`
+}
+
 func (h *Handler) outboundWebhooksAvailable(w http.ResponseWriter) bool {
 	if h.OutboundWebhooks == nil || !h.OutboundWebhooks.Available() {
 		writeError(w, http.StatusServiceUnavailable, "outbound webhooks are not configured")
@@ -115,6 +119,44 @@ func (h *Handler) CreateOutboundWebhook(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	writeJSON(w, http.StatusCreated, result)
+}
+
+func (h *Handler) UpdateOutboundWebhookEvents(w http.ResponseWriter, r *http.Request) {
+	if !h.outboundWebhooksAvailable(w) {
+		return
+	}
+	workspaceID, ok := parseUUIDOrBadRequest(w, chi.URLParam(r, "id"), "workspace_id")
+	if !ok {
+		return
+	}
+	if _, ok := h.requireWorkspaceRole(w, r, chi.URLParam(r, "id"), "workspace not found", "owner", "admin"); !ok {
+		return
+	}
+	subscriptionID, ok := parseUUIDOrBadRequest(w, chi.URLParam(r, "subscriptionId"), "subscription_id")
+	if !ok {
+		return
+	}
+	var request updateOutboundWebhookEventsRequest
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	item, err := h.OutboundWebhooks.UpdateEvents(r.Context(), outwebhook.UpdateEventsInput{
+		WorkspaceID: workspaceID, SubscriptionID: subscriptionID, Events: request.Events,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "outbound webhook not found")
+		return
+	}
+	if errors.Is(err, outwebhook.ErrInvalidInput) {
+		writeError(w, http.StatusBadRequest, "invalid outbound webhook event selection")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to update outbound webhook")
+		return
+	}
+	writeJSON(w, http.StatusOK, item)
 }
 
 func (h *Handler) DeleteOutboundWebhook(w http.ResponseWriter, r *http.Request) {

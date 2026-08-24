@@ -4186,6 +4186,23 @@ export class ApiClient {
     );
   }
 
+  async updateOutboundWebhookEvents(
+    workspaceId: string,
+    subscriptionId: string,
+    events: string[],
+  ): Promise<OutboundWebhookSubscription> {
+    const raw = await this.fetch<unknown>(
+      `/api/workspaces/${workspaceId}/outbound-webhooks/${subscriptionId}/events`,
+      { method: "PATCH", body: JSON.stringify({ events }) },
+    );
+    return parseWithFallback(
+      raw,
+      OutboundWebhookSubscriptionSchema,
+      EMPTY_OUTBOUND_WEBHOOK_SUBSCRIPTION,
+      { endpoint: "PATCH /api/workspaces/:id/outbound-webhooks/:subscriptionId/events" },
+    );
+  }
+
   async deleteOutboundWebhookSubscription(
     workspaceId: string,
     subscriptionId: string,

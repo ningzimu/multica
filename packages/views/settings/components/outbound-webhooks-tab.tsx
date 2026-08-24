@@ -7,10 +7,15 @@ import { toast } from "sonner";
 import { useCurrentWorkspace } from "@multica/core/paths";
 import { useCurrentMember } from "@multica/core/permissions";
 import {
+  OUTBOUND_WEBHOOK_ISSUE_EVENTS,
+  type OutboundWebhookIssueEvent,
+} from "@multica/core/types";
+import {
   outboundWebhookSubscriptionOptions,
   outboundWebhookSubscriptionsOptions,
   useCreateOutboundWebhookSubscription,
   useDeleteOutboundWebhookSubscription,
+  useUpdateOutboundWebhookEvents,
 } from "@multica/core/outbound-webhooks";
 import { Button } from "@multica/ui/components/ui/button";
 import { Checkbox } from "@multica/ui/components/ui/checkbox";
@@ -28,15 +33,19 @@ export function OutboundWebhooksTab() {
   const subscriptions = useQuery(outboundWebhookSubscriptionsOptions(wsId));
   const [name, setName] = useState("");
   const [destination, setDestination] = useState("");
-  const [issueCreated, setIssueCreated] = useState(true);
+  const [selectedEvents, setSelectedEvents] = useState<OutboundWebhookIssueEvent[]>([
+    "issue.created",
+  ]);
   const [disclosedSecret, setDisclosedSecret] = useState<string | null>(null);
   const [selectedSubscriptionId, setSelectedSubscriptionId] = useState("");
+  const [editingEvents, setEditingEvents] = useState<string[]>([]);
   const selectedSubscription = useQuery(
     outboundWebhookSubscriptionOptions(wsId, selectedSubscriptionId),
   );
 
   const createSubscription = useCreateOutboundWebhookSubscription(wsId);
   const deleteSubscription = useDeleteOutboundWebhookSubscription(wsId);
+  const updateEvents = useUpdateOutboundWebhookEvents(wsId);
 
   return (
     <div className="space-y-4">
@@ -46,12 +55,12 @@ export function OutboundWebhooksTab() {
             className="space-y-4 p-4"
             onSubmit={(event) => {
               event.preventDefault();
-              if (!name.trim() || !destination.trim() || !issueCreated) return;
+              if (!name.trim() || !destination.trim() || selectedEvents.length === 0) return;
               createSubscription.mutate(
                 {
                   name,
                   destination,
-                  events: ["issue.created"],
+                  events: selectedEvents,
                   scopeMode: "workspace",
                 },
                 {
@@ -85,13 +94,28 @@ export function OutboundWebhooksTab() {
             </div>
             <div className="space-y-2">
               <p className="text-body font-medium">{t(($) => $.outbound_webhooks.event_selection)}</p>
-              <Label className="flex items-center gap-2 font-normal">
-                <Checkbox checked={issueCreated} onCheckedChange={(checked) => setIssueCreated(checked === true)} />
-                <code>{t(($) => $.outbound_webhooks.issue_created_event)}</code>
-              </Label>
+              {OUTBOUND_WEBHOOK_ISSUE_EVENTS.map((eventName) => (
+                <Label key={eventName} className="flex items-center gap-2 font-normal">
+                  <Checkbox
+                    checked={selectedEvents.includes(eventName)}
+                    onCheckedChange={(checked) =>
+                      setSelectedEvents((current) =>
+                        checked === true
+                          ? [...current, eventName].sort(
+                              (left, right) =>
+                                OUTBOUND_WEBHOOK_ISSUE_EVENTS.indexOf(left) -
+                                OUTBOUND_WEBHOOK_ISSUE_EVENTS.indexOf(right),
+                            )
+                          : current.filter((candidate) => candidate !== eventName),
+                      )
+                    }
+                  />
+                  <code>{eventName}</code>
+                </Label>
+              ))}
             </div>
             <p className="text-caption text-muted-foreground">{t(($) => $.outbound_webhooks.workspace_scope)}</p>
-            <Button type="submit" disabled={!issueCreated || createSubscription.isPending}>{t(($) => $.outbound_webhooks.create)}</Button>
+            <Button type="submit" disabled={selectedEvents.length === 0 || createSubscription.isPending}>{t(($) => $.outbound_webhooks.create)}</Button>
           </form>
         </SettingsCard>
       )}
@@ -117,12 +141,16 @@ export function OutboundWebhooksTab() {
                   <div className="min-w-0 flex-1">
                     <p className="truncate text-body font-medium">{subscription.name}</p>
                     <p className="truncate text-caption text-muted-foreground">{subscription.destinationHint}</p>
-                    <p className="text-caption text-muted-foreground"><code>{t(($) => $.outbound_webhooks.issue_created_event)}</code> · {t(($) => $.outbound_webhooks.workspace_scope_short)}</p>
+                    <p className="text-caption text-muted-foreground"><code>{subscription.events.join(", ")}</code> · {t(($) => $.outbound_webhooks.workspace_scope_short)}</p>
                   </div>
                   <Button
                     variant="outline"
                     size="sm"
-                    onClick={() => setSelectedSubscriptionId(selectedSubscriptionId === subscription.id ? "" : subscription.id)}
+                    onClick={() => {
+                      const opening = selectedSubscriptionId !== subscription.id;
+                      setSelectedSubscriptionId(opening ? subscription.id : "");
+                      setEditingEvents(opening ? subscription.events : []);
+                    }}
                   >
                     {selectedSubscriptionId === subscription.id
                       ? t(($) => $.outbound_webhooks.hide_details)
@@ -154,6 +182,40 @@ export function OutboundWebhooksTab() {
                     <div><dt className="text-muted-foreground">{t(($) => $.outbound_webhooks.event_catalog_version)}</dt><dd>{selectedSubscription.data.eventCatalogVersion}</dd></div>
                     <div><dt className="text-muted-foreground">{t(($) => $.outbound_webhooks.event_selection)}</dt><dd>{selectedSubscription.data.events.join(", ")}</dd></div>
                     <div><dt className="text-muted-foreground">{t(($) => $.outbound_webhooks.scope)}</dt><dd>{t(($) => $.outbound_webhooks.workspace_scope_short)}</dd></div>
+                    {canManage && (
+                      <div className="space-y-2 sm:col-span-2">
+                        {OUTBOUND_WEBHOOK_ISSUE_EVENTS.map((eventName) => (
+                          <Label key={eventName} className="flex items-center gap-2 font-normal">
+                            <Checkbox
+                              checked={editingEvents.includes(eventName)}
+                              onCheckedChange={(checked) =>
+                                setEditingEvents((current) =>
+                                  checked === true
+                                    ? [...current, eventName].filter((value, index, values) => values.indexOf(value) === index)
+                                    : current.filter((candidate) => candidate !== eventName),
+                                )
+                              }
+                            />
+                            <code>{eventName}</code>
+                          </Label>
+                        ))}
+                        <Button
+                          size="sm"
+                          disabled={editingEvents.length === 0 || updateEvents.isPending}
+                          onClick={() =>
+                            updateEvents.mutate(
+                              { subscriptionId: selectedSubscriptionId, events: editingEvents },
+                              {
+                                onSuccess: () => toast.success(t(($) => $.outbound_webhooks.events_saved)),
+                                onError: () => toast.error(t(($) => $.outbound_webhooks.events_save_failed)),
+                              },
+                            )
+                          }
+                        >
+                          {t(($) => $.outbound_webhooks.save_events)}
+                        </Button>
+                      </div>
+                    )}
                   </dl>
                 )}
               </div>

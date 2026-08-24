@@ -502,11 +502,26 @@ func (h *Handler) DeleteSquad(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Transfer issues assigned to this squad to the leader agent.
-	if err := h.Queries.TransferSquadAssignees(r.Context(), db.TransferSquadAssigneesParams{
+	transferredIssues, err := h.Queries.TransferSquadAssignees(r.Context(), db.TransferSquadAssigneesParams{
 		AssigneeID:   squad.ID,
 		AssigneeID_2: squad.LeaderID,
-	}); err != nil {
+	})
+	if err != nil {
 		slog.Warn("transfer squad assignees failed", "squad_id", uuidToString(squad.ID), "error", err)
+	}
+	for _, issue := range transferredIssues {
+		prefix := h.getIssuePrefix(r.Context(), issue.WorkspaceID)
+		resp := issueToResponse(issue, prefix)
+		h.fillStatusCategory(r.Context(), issue.WorkspaceID, &resp)
+		h.publish(protocol.EventIssueUpdated, workspaceID, "member", requestUserID(r), map[string]any{
+			"issue":              resp,
+			"assignee_changed":   true,
+			"status_changed":     false,
+			"priority_changed":   false,
+			"project_changed":    false,
+			"prev_assignee_type": "squad",
+			"prev_assignee_id":   uuidToString(squad.ID),
+		})
 	}
 
 	// Mirror the issue-assignee transfer for autopilots that target this

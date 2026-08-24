@@ -189,6 +189,266 @@ func TestIssueCreationPersistsAndDeliversSecureWorkspaceWebhook(t *testing.T) {
 	}
 }
 
+func TestMultiFieldIssueUpdatePersistsIndependentTypedProductEvents(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database unavailable")
+	}
+	received := make(chan receivedOutboundWebhook, 8)
+	receiver := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		observed := receivedOutboundWebhook{body: body, header: r.Header.Clone()}
+		observed.persistenceError = testPool.QueryRow(context.Background(),
+			`SELECT state, request_body FROM outbound_webhook_delivery WHERE id = $1`,
+			r.Header.Get("X-Multica-Delivery-ID"),
+		).Scan(&observed.persistedState, &observed.persistedBody)
+		received <- observed
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer receiver.Close()
+
+	box, err := secretbox.New([]byte("0123456789abcdef0123456789abcdef"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	queries := db.New(testPool)
+	bus := events.New()
+	outbound := outwebhook.New(queries, testPool, box, []string{receiver.URL}, outwebhook.WithHTTPClient(receiver.Client()))
+	outbound.Register(bus)
+	t.Cleanup(func() {
+		outbound.Close()
+		if !outbound.WaitWithTimeout(time.Second) {
+			t.Error("outbound webhook dispatcher did not stop")
+		}
+	})
+	h := New(queries, testPool, testHandler.Hub, bus, service.NewEmailService(), nil, nil, analytics.NoopClient{}, Config{AllowSignup: true})
+	h.OutboundWebhooks = outbound
+
+	var created struct {
+		Subscription outwebhook.Subscription `json:"subscription"`
+	}
+	testutil.Call(t, h.CreateOutboundWebhook,
+		withURLParam(newRequest(http.MethodPost, "/api/workspaces/"+testWorkspaceID+"/outbound-webhooks", map[string]any{
+			"name": "Issue changes", "destination": receiver.URL + "/events",
+			"events": []string{
+				outwebhook.EventIssueStatusChanged,
+				outwebhook.EventIssueAssigneeChanged,
+				outwebhook.EventIssuePriorityChanged,
+				outwebhook.EventIssueProjectChanged,
+			},
+			"scope_mode": "workspace",
+		}), "id", testWorkspaceID)).Want(http.StatusCreated).JSON(&created)
+	t.Cleanup(func() {
+		_, _ = testPool.Exec(context.Background(), `DELETE FROM outbound_webhook_delivery WHERE subscription_id = $1`, created.Subscription.ID)
+		_, _ = testPool.Exec(context.Background(), `DELETE FROM outbound_webhook_subscription WHERE id = $1`, created.Subscription.ID)
+	})
+
+	var issue struct {
+		ID string `json:"id"`
+	}
+	testutil.Call(t, h.CreateIssue,
+		newRequest(http.MethodPost, "/api/issues", map[string]any{"title": "Change every selected field"})).Want(http.StatusCreated).JSON(&issue)
+	t.Cleanup(func() { _, _ = testPool.Exec(context.Background(), `DELETE FROM issue WHERE id = $1`, issue.ID) })
+	agentID := createHandlerTestAgent(t, "Outbound Webhook Assignee", []byte("[]"))
+	projectID := createChatProjectTestProject(t, testWorkspaceID, "Outbound Webhook Project", "")
+
+	updateRequest := withURLParam(newRequest(http.MethodPatch, "/api/issues/"+issue.ID, map[string]any{
+		"status": "in_progress", "priority": "high", "project_id": projectID,
+		"assignee_type": "agent", "assignee_id": agentID, "suppress_run": true,
+	}), "id", issue.ID)
+	updateRequest.Header.Set("X-Agent-ID", agentID)
+	updateRequest.Header.Set("X-Actor-Source", "task_token")
+	testutil.Call(t, h.UpdateIssue, updateRequest).Want(http.StatusOK)
+
+	type changeEnvelope struct {
+		ID    string `json:"id"`
+		Type  string `json:"type"`
+		Actor struct {
+			Type string `json:"type"`
+			ID   string `json:"id"`
+		} `json:"actor"`
+		Data struct {
+			Issue struct {
+				ID       string `json:"id"`
+				Assignee *struct {
+					Type        string `json:"type"`
+					ID          string `json:"id"`
+					DisplayName string `json:"display_name"`
+				} `json:"assignee"`
+			} `json:"issue"`
+			Change struct {
+				Field    string          `json:"field"`
+				Previous json.RawMessage `json:"previous"`
+				Current  json.RawMessage `json:"current"`
+			} `json:"change"`
+		} `json:"data"`
+	}
+	got := make(map[string]changeEnvelope, 4)
+	eventIDs := make(map[string]struct{}, 4)
+	for range 4 {
+		select {
+		case request := <-received:
+			if request.persistenceError != nil || request.persistedState != "pending" || string(request.persistedBody) != string(request.body) {
+				t.Fatalf("delivery was not persisted before receiver I/O: state=%q err=%v", request.persistedState, request.persistenceError)
+			}
+			var envelope changeEnvelope
+			if err := json.Unmarshal(request.body, &envelope); err != nil {
+				t.Fatal(err)
+			}
+			if envelope.ID == "" || envelope.Data.Issue.ID != issue.ID {
+				t.Fatalf("invalid change envelope: %s", request.body)
+			}
+			if _, duplicate := eventIDs[envelope.ID]; duplicate {
+				t.Fatalf("Product Events shared an id: %s", envelope.ID)
+			}
+			eventIDs[envelope.ID] = struct{}{}
+			got[envelope.Type] = envelope
+		case <-time.After(5 * time.Second):
+			t.Fatalf("receiver observed %d of 4 Issue Product Events", len(got))
+		}
+	}
+	if len(got) != 4 {
+		t.Fatalf("received event types = %v", got)
+	}
+	if got[outwebhook.EventIssueStatusChanged].Actor.Type != "agent" || got[outwebhook.EventIssueStatusChanged].Actor.ID != agentID {
+		t.Fatalf("plugin/API actor identity lost: %+v", got[outwebhook.EventIssueStatusChanged].Actor)
+	}
+	assertTransition := func(eventType, field, previous, current string) {
+		t.Helper()
+		event, ok := got[eventType]
+		if !ok || event.Data.Change.Field != field || string(event.Data.Change.Previous) != previous || string(event.Data.Change.Current) != current {
+			t.Fatalf("%s transition = %+v", eventType, event.Data.Change)
+		}
+	}
+	assertTransition(outwebhook.EventIssueStatusChanged, "status", `"todo"`, `"in_progress"`)
+	assertTransition(outwebhook.EventIssuePriorityChanged, "priority", `"none"`, `"high"`)
+	assertTransition(outwebhook.EventIssueProjectChanged, "project", `null`, `"`+projectID+`"`)
+	assignee := got[outwebhook.EventIssueAssigneeChanged]
+	if string(assignee.Data.Change.Previous) != "null" || assignee.Data.Issue.Assignee == nil || assignee.Data.Issue.Assignee.Type != "agent" || assignee.Data.Issue.Assignee.ID != agentID || assignee.Data.Issue.Assignee.DisplayName != "Outbound Webhook Assignee" {
+		t.Fatalf("assignee transition lost typed identity: %+v", assignee)
+	}
+	if count := dbfx.Count(t, `SELECT count(*) FROM outbound_webhook_delivery WHERE subscription_id = $1 AND event_type = 'issue.updated'`, created.Subscription.ID); count != 0 {
+		t.Fatalf("broad issue.updated duplicate persisted: %d", count)
+	}
+
+	testutil.Call(t, h.BatchUpdateIssues, newRequest(http.MethodPatch, "/api/issues/batch", map[string]any{
+		"issue_ids": []string{issue.ID},
+		"updates":   map[string]any{"priority": "low"},
+	})).Want(http.StatusOK)
+	select {
+	case request := <-received:
+		var batch changeEnvelope
+		if err := json.Unmarshal(request.body, &batch); err != nil {
+			t.Fatal(err)
+		}
+		if batch.Type != outwebhook.EventIssuePriorityChanged || string(batch.Data.Change.Previous) != `"high"` || string(batch.Data.Change.Current) != `"low"` {
+			t.Fatalf("batch source lost canonical before/current values: %s", request.body)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("batch Issue update produced no Product Event")
+	}
+}
+
+func TestIssueAssigneeEventsPreserveVariantsAndExplicitNulls(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database unavailable")
+	}
+	receiver := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) }))
+	defer receiver.Close()
+	box, _ := secretbox.New([]byte("0123456789abcdef0123456789abcdef"))
+	queries := db.New(testPool)
+	bus := events.New()
+	outbound := outwebhook.New(queries, testPool, box, []string{receiver.URL}, outwebhook.WithHTTPClient(receiver.Client()))
+	outbound.Register(bus)
+	t.Cleanup(func() { outbound.Close(); outbound.WaitWithTimeout(time.Second) })
+	h := New(queries, testPool, testHandler.Hub, bus, service.NewEmailService(), nil, nil, analytics.NoopClient{}, Config{AllowSignup: true})
+	h.OutboundWebhooks = outbound
+
+	workspaceUUID, _ := util.ParseUUID(testWorkspaceID)
+	creatorUUID, _ := util.ParseUUID(testUserID)
+	created, err := outbound.Create(context.Background(), outwebhook.CreateInput{
+		WorkspaceID: workspaceUUID, CreatedBy: creatorUUID, Name: "Assignee variants",
+		Destination: receiver.URL + "/events", Events: []string{outwebhook.EventIssueAssigneeChanged, outwebhook.EventIssueProjectChanged},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		subscriptionID, _ := util.ParseUUID(created.Subscription.ID)
+		_, _ = outbound.Delete(context.Background(), workspaceUUID, subscriptionID)
+	})
+	var issue struct {
+		ID string `json:"id"`
+	}
+	testutil.Call(t, h.CreateIssue, newRequest(http.MethodPost, "/api/issues", map[string]any{"title": "Assignee variants"})).Want(http.StatusCreated).JSON(&issue)
+	t.Cleanup(func() { _, _ = testPool.Exec(context.Background(), `DELETE FROM issue WHERE id = $1`, issue.ID) })
+	agentID := createHandlerTestAgent(t, "Webhook Variant Agent", []byte("[]"))
+	squadID := createCommentTriggerPreviewSquad(t, "Webhook Variant Squad", agentID)
+	projectID := createChatProjectTestProject(t, testWorkspaceID, "Webhook Null Project", "")
+
+	update := func(body map[string]any) map[string]any {
+		t.Helper()
+		body["suppress_run"] = true
+		testutil.Call(t, h.UpdateIssue, withURLParam(newRequest(http.MethodPatch, "/api/issues/"+issue.ID, body), "id", issue.ID)).Want(http.StatusOK)
+		var raw []byte
+		if err := testPool.QueryRow(context.Background(), `
+			SELECT request_body FROM outbound_webhook_delivery
+			WHERE subscription_id = $1 ORDER BY created_at DESC LIMIT 1
+		`, created.Subscription.ID).Scan(&raw); err != nil {
+			t.Fatal(err)
+		}
+		var envelope map[string]any
+		if err := json.Unmarshal(raw, &envelope); err != nil {
+			t.Fatal(err)
+		}
+		return envelope["data"].(map[string]any)["change"].(map[string]any)
+	}
+
+	change := update(map[string]any{"assignee_type": "agent", "assignee_id": agentID})
+	if change["previous"] != nil || change["current"].(map[string]any)["display_name"] != "Webhook Variant Agent" {
+		t.Fatalf("nil -> agent transition = %#v", change)
+	}
+	change = update(map[string]any{"assignee_type": "squad", "assignee_id": squadID})
+	if change["previous"].(map[string]any)["type"] != "agent" || change["current"].(map[string]any)["display_name"] != "Webhook Variant Squad" {
+		t.Fatalf("agent -> squad transition = %#v", change)
+	}
+	change = update(map[string]any{"assignee_type": "member", "assignee_id": testUserID})
+	if change["previous"].(map[string]any)["type"] != "squad" || change["current"].(map[string]any)["type"] != "member" {
+		t.Fatalf("squad -> member transition = %#v", change)
+	}
+	change = update(map[string]any{"assignee_type": nil, "assignee_id": nil})
+	if change["previous"].(map[string]any)["type"] != "member" || change["current"] != nil {
+		t.Fatalf("member -> unassigned transition = %#v", change)
+	}
+	_ = update(map[string]any{"project_id": projectID})
+	change = update(map[string]any{"project_id": nil})
+	if change["previous"] != projectID || change["current"] != nil {
+		t.Fatalf("project explicit null transition = %#v", change)
+	}
+
+	transferSquadID := createCommentTriggerPreviewSquad(t, "Webhook Transfer Squad", agentID)
+	_ = update(map[string]any{"assignee_type": "squad", "assignee_id": transferSquadID})
+	testutil.Call(t, h.DeleteSquad, withURLParams(
+		newRequest(http.MethodDelete, "/api/workspaces/"+testWorkspaceID+"/squads/"+transferSquadID, nil),
+		"workspaceId", testWorkspaceID,
+		"id", transferSquadID,
+	)).Want(http.StatusNoContent)
+	var transferBody []byte
+	if err := testPool.QueryRow(context.Background(), `
+		SELECT request_body FROM outbound_webhook_delivery
+		WHERE subscription_id = $1 AND event_type = $2 ORDER BY created_at DESC LIMIT 1
+	`, created.Subscription.ID, outwebhook.EventIssueAssigneeChanged).Scan(&transferBody); err != nil {
+		t.Fatal(err)
+	}
+	var transferEnvelope map[string]any
+	if err := json.Unmarshal(transferBody, &transferEnvelope); err != nil {
+		t.Fatal(err)
+	}
+	transferChange := transferEnvelope["data"].(map[string]any)["change"].(map[string]any)
+	if transferChange["previous"].(map[string]any)["type"] != "squad" || transferChange["current"].(map[string]any)["type"] != "agent" {
+		t.Fatalf("bulk squad assignee transfer = %#v", transferChange)
+	}
+}
+
 func TestOutboundWebhookMutationPermissionsAndWorkspaceBoundary(t *testing.T) {
 	if testHandler == nil || testPool == nil {
 		t.Skip("database unavailable")
@@ -241,6 +501,50 @@ func TestOutboundWebhookMutationPermissionsAndWorkspaceBoundary(t *testing.T) {
 	testutil.Call(t, h.GetOutboundWebhook, get).Want(http.StatusNotFound)
 }
 
+func TestOutboundWebhookEventSelectionCanBeEditedExplicitly(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database unavailable")
+	}
+	box, _ := secretbox.New([]byte("0123456789abcdef0123456789abcdef"))
+	outbound := outwebhook.New(db.New(testPool), testPool, box, []string{"https://127.0.0.1:9443"})
+	h := *testHandler
+	h.OutboundWebhooks = outbound
+
+	var created struct {
+		Subscription outwebhook.Subscription `json:"subscription"`
+	}
+	testutil.Call(t, h.CreateOutboundWebhook,
+		withURLParam(newRequest(http.MethodPost, "/api/workspaces/"+testWorkspaceID+"/outbound-webhooks", map[string]any{
+			"name": "Explicit events", "destination": "https://127.0.0.1:9443/events",
+			"events": []string{outwebhook.EventIssueCreated, outwebhook.EventIssueStatusChanged}, "scope_mode": "workspace",
+		}), "id", testWorkspaceID)).Want(http.StatusCreated).JSON(&created)
+	t.Cleanup(func() {
+		subscriptionID, _ := util.ParseUUID(created.Subscription.ID)
+		workspaceID, _ := util.ParseUUID(testWorkspaceID)
+		_, _ = outbound.Delete(context.Background(), workspaceID, subscriptionID)
+	})
+
+	var updated outwebhook.Subscription
+	testutil.Call(t, h.UpdateOutboundWebhookEvents, withURLParams(
+		newRequest(http.MethodPatch, "/api/workspaces/"+testWorkspaceID+"/outbound-webhooks/"+created.Subscription.ID+"/events", map[string]any{
+			"events": []string{outwebhook.EventIssuePriorityChanged},
+		}),
+		"id", testWorkspaceID,
+		"subscriptionId", created.Subscription.ID,
+	)).Want(http.StatusOK).JSON(&updated)
+	if updated.EventCatalogVersion != outwebhook.CatalogVersion || len(updated.Events) != 1 || updated.Events[0] != outwebhook.EventIssuePriorityChanged {
+		t.Fatalf("event selection was implicitly widened: %+v", updated)
+	}
+
+	testutil.Call(t, h.UpdateOutboundWebhookEvents, withURLParams(
+		newRequest(http.MethodPatch, "/api/workspaces/"+testWorkspaceID+"/outbound-webhooks/"+created.Subscription.ID+"/events", map[string]any{
+			"events": []string{"issue.updated"},
+		}),
+		"id", testWorkspaceID,
+		"subscriptionId", created.Subscription.ID,
+	)).Want(http.StatusBadRequest)
+}
+
 func TestOutboundWebhookDeleteWaitsForCaptureAndSweepsItsDelivery(t *testing.T) {
 	if testHandler == nil || testPool == nil {
 		t.Skip("database unavailable")
@@ -279,7 +583,7 @@ func TestOutboundWebhookDeleteWaitsForCaptureAndSweepsItsDelivery(t *testing.T) 
 	}
 	defer captureTx.Rollback(context.Background())
 	captureQueries := db.New(testPool).WithTx(captureTx)
-	rows, err := captureQueries.ListActiveIssueCreatedOutboundWebhookSubscriptions(context.Background(), workspaceID)
+	rows, err := captureQueries.ListActiveOutboundWebhookSubscriptionsForEvent(context.Background(), db.ListActiveOutboundWebhookSubscriptionsForEventParams{WorkspaceID: workspaceID, EventType: outwebhook.EventIssueCreated})
 	if err != nil || len(rows) != 1 {
 		t.Fatalf("lock subscription for capture: rows=%d err=%v", len(rows), err)
 	}
@@ -352,7 +656,7 @@ func TestWorkspaceDeleteFencePreventsLateOutboundWebhookDelivery(t *testing.T) {
 	if _, err := captureQueries.LockWorkspaceForOutboundWebhookCapture(context.Background(), workspaceID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := captureQueries.ListActiveIssueCreatedOutboundWebhookSubscriptions(context.Background(), workspaceID); err != nil {
+	if _, err := captureQueries.ListActiveOutboundWebhookSubscriptionsForEvent(context.Background(), db.ListActiveOutboundWebhookSubscriptionsForEventParams{WorkspaceID: workspaceID, EventType: outwebhook.EventIssueCreated}); err != nil {
 		t.Fatal(err)
 	}
 	eventID, _ := util.ParseUUID(uuid.NewString())

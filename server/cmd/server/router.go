@@ -1599,6 +1599,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					r.Post("/plugins/{installationId}/disable", h.DisablePlugin)
 					r.Delete("/plugins/{installationId}", h.UninstallPlugin)
 					r.Post("/outbound-webhooks", h.CreateOutboundWebhook)
+					r.Patch("/outbound-webhooks/{subscriptionId}/events", h.UpdateOutboundWebhookEvents)
 					r.Delete("/outbound-webhooks/{subscriptionId}", h.DeleteOutboundWebhook)
 				})
 				// Owner-only access

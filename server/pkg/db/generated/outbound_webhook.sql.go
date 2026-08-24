@@ -216,15 +216,20 @@ func (q *Queries) GetOutboundWebhookSubscriptionForUpdate(ctx context.Context, a
 	return i, err
 }
 
-const listActiveIssueCreatedOutboundWebhookSubscriptions = `-- name: ListActiveIssueCreatedOutboundWebhookSubscriptions :many
+const listActiveOutboundWebhookSubscriptionsForEvent = `-- name: ListActiveOutboundWebhookSubscriptionsForEvent :many
 SELECT id, workspace_id, name, destination_ciphertext, secret_ciphertext, destination_hint, events, event_catalog_version, scope_mode, created_by, created_at, updated_at FROM outbound_webhook_subscription
-WHERE workspace_id = $1 AND events ? 'issue.created'
+WHERE workspace_id = $1 AND events ? $2::text
 ORDER BY created_at ASC
 FOR SHARE
 `
 
-func (q *Queries) ListActiveIssueCreatedOutboundWebhookSubscriptions(ctx context.Context, workspaceID pgtype.UUID) ([]OutboundWebhookSubscription, error) {
-	rows, err := q.db.Query(ctx, listActiveIssueCreatedOutboundWebhookSubscriptions, workspaceID)
+type ListActiveOutboundWebhookSubscriptionsForEventParams struct {
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+	EventType   string      `json:"event_type"`
+}
+
+func (q *Queries) ListActiveOutboundWebhookSubscriptionsForEvent(ctx context.Context, arg ListActiveOutboundWebhookSubscriptionsForEventParams) ([]OutboundWebhookSubscription, error) {
+	rows, err := q.db.Query(ctx, listActiveOutboundWebhookSubscriptionsForEvent, arg.WorkspaceID, arg.EventType)
 	if err != nil {
 		return nil, err
 	}
@@ -341,4 +346,37 @@ type MarkOutboundWebhookDeliverySucceededParams struct {
 func (q *Queries) MarkOutboundWebhookDeliverySucceeded(ctx context.Context, arg MarkOutboundWebhookDeliverySucceededParams) error {
 	_, err := q.db.Exec(ctx, markOutboundWebhookDeliverySucceeded, arg.ID, arg.ResponseStatus)
 	return err
+}
+
+const updateOutboundWebhookSubscriptionEvents = `-- name: UpdateOutboundWebhookSubscriptionEvents :one
+UPDATE outbound_webhook_subscription
+SET events = $3, updated_at = now()
+WHERE workspace_id = $1 AND id = $2
+RETURNING id, workspace_id, name, destination_ciphertext, secret_ciphertext, destination_hint, events, event_catalog_version, scope_mode, created_by, created_at, updated_at
+`
+
+type UpdateOutboundWebhookSubscriptionEventsParams struct {
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+	ID          pgtype.UUID `json:"id"`
+	Events      []byte      `json:"events"`
+}
+
+func (q *Queries) UpdateOutboundWebhookSubscriptionEvents(ctx context.Context, arg UpdateOutboundWebhookSubscriptionEventsParams) (OutboundWebhookSubscription, error) {
+	row := q.db.QueryRow(ctx, updateOutboundWebhookSubscriptionEvents, arg.WorkspaceID, arg.ID, arg.Events)
+	var i OutboundWebhookSubscription
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.Name,
+		&i.DestinationCiphertext,
+		&i.SecretCiphertext,
+		&i.DestinationHint,
+		&i.Events,
+		&i.EventCatalogVersion,
+		&i.ScopeMode,
+		&i.CreatedBy,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
 }

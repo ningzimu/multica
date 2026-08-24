@@ -32,14 +32,26 @@ import (
 )
 
 const (
-	EventIssueCreated = "issue.created"
-	ScopeWorkspace    = "workspace"
-	CatalogVersion    = 1
-	maxResponseBytes  = 64 << 10
-	deliveryTimeout   = 10 * time.Second
-	dispatchWorkers   = 4
-	dispatchQueueSize = 64
+	EventIssueCreated         = "issue.created"
+	EventIssueStatusChanged   = "issue.status_changed"
+	EventIssueAssigneeChanged = "issue.assignee_changed"
+	EventIssuePriorityChanged = "issue.priority_changed"
+	EventIssueProjectChanged  = "issue.project_changed"
+	ScopeWorkspace            = "workspace"
+	CatalogVersion            = 1
+	maxResponseBytes          = 64 << 10
+	deliveryTimeout           = 10 * time.Second
+	dispatchWorkers           = 4
+	dispatchQueueSize         = 64
 )
+
+var issueEventCatalog = []string{
+	EventIssueCreated,
+	EventIssueStatusChanged,
+	EventIssueAssigneeChanged,
+	EventIssuePriorityChanged,
+	EventIssueProjectChanged,
+}
 
 var (
 	ErrUnavailable  = errors.New("outbound webhooks are unavailable")
@@ -102,6 +114,12 @@ type CreateResult struct {
 	SigningSecret string       `json:"signing_secret"`
 }
 
+type UpdateEventsInput struct {
+	WorkspaceID    pgtype.UUID
+	SubscriptionID pgtype.UUID
+	Events         []string
+}
+
 func New(queries *db.Queries, txStarter interface {
 	Begin(context.Context) (pgx.Tx, error)
 }, box *secretbox.Box, allowedOrigins []string, options ...Option) *Service {
@@ -143,6 +161,7 @@ func (s *Service) Register(bus *events.Bus) {
 		s.startDispatcher()
 	}
 	bus.Subscribe(protocol.EventIssueCreated, s.captureIssueCreated)
+	bus.Subscribe(protocol.EventIssueUpdated, s.captureIssueUpdated)
 }
 
 func (s *Service) startDispatcher() {
@@ -208,8 +227,8 @@ func (s *Service) Create(ctx context.Context, input CreateInput) (CreateResult, 
 	if len(input.Name) < 1 || len(input.Name) > 100 {
 		return CreateResult{}, fmt.Errorf("%w: name must contain 1 to 100 characters", ErrInvalidInput)
 	}
-	if len(input.Events) != 1 || input.Events[0] != EventIssueCreated {
-		return CreateResult{}, fmt.Errorf("%w: event selection must contain issue.created", ErrInvalidInput)
+	if err := validateEventSelection(input.Events); err != nil {
+		return CreateResult{}, err
 	}
 	endpoint, _, err := s.validateDestination(ctx, input.Destination)
 	if err != nil {
@@ -238,6 +257,46 @@ func (s *Service) Create(ctx context.Context, input CreateInput) (CreateResult, 
 		return CreateResult{}, err
 	}
 	return CreateResult{Subscription: subscriptionResponse(row), SigningSecret: secret}, nil
+}
+
+func (s *Service) UpdateEvents(ctx context.Context, input UpdateEventsInput) (Subscription, error) {
+	if !s.Available() {
+		return Subscription{}, ErrUnavailable
+	}
+	if err := validateEventSelection(input.Events); err != nil {
+		return Subscription{}, err
+	}
+	eventsJSON, _ := json.Marshal(input.Events)
+	row, err := s.queries.UpdateOutboundWebhookSubscriptionEvents(ctx, db.UpdateOutboundWebhookSubscriptionEventsParams{
+		WorkspaceID: input.WorkspaceID,
+		ID:          input.SubscriptionID,
+		Events:      eventsJSON,
+	})
+	if err != nil {
+		return Subscription{}, err
+	}
+	return subscriptionResponse(row), nil
+}
+
+func validateEventSelection(selected []string) error {
+	if len(selected) == 0 {
+		return fmt.Errorf("%w: select at least one event", ErrInvalidInput)
+	}
+	known := make(map[string]struct{}, len(issueEventCatalog))
+	for _, eventType := range issueEventCatalog {
+		known[eventType] = struct{}{}
+	}
+	seen := make(map[string]struct{}, len(selected))
+	for _, eventType := range selected {
+		if _, ok := known[eventType]; !ok {
+			return fmt.Errorf("%w: unsupported event %q", ErrInvalidInput, eventType)
+		}
+		if _, duplicate := seen[eventType]; duplicate {
+			return fmt.Errorf("%w: duplicate event %q", ErrInvalidInput, eventType)
+		}
+		seen[eventType] = struct{}{}
+	}
+	return nil
 }
 
 func (s *Service) List(ctx context.Context, workspaceID pgtype.UUID) ([]Subscription, error) {
@@ -287,57 +346,122 @@ func (s *Service) Delete(ctx context.Context, workspaceID, id pgtype.UUID) (bool
 }
 
 func (s *Service) captureIssueCreated(event events.Event) {
+	s.captureProductEvents(event, []productEvent{{eventType: EventIssueCreated}})
+}
+
+func (s *Service) captureIssueUpdated(event events.Event) {
+	payload, ok := event.Payload.(map[string]any)
+	if !ok {
+		slog.Error("outbound webhook canonicalization failed", "event_type", "issue changes", "error", "issue:updated payload is not an object")
+		return
+	}
+	changes, err := issueProductEvents(payload)
+	if err != nil {
+		slog.Error("outbound webhook canonicalization failed", "event_type", "issue changes", "error", err)
+		return
+	}
+	if len(changes) > 0 {
+		s.captureProductEvents(event, changes)
+	}
+}
+
+func issueProductEvents(payload map[string]any) ([]productEvent, error) {
+	changes := make([]productEvent, 0, 4)
+	for _, candidate := range []struct {
+		flag      string
+		eventType string
+		field     string
+		previous  []string
+	}{
+		{flag: "status_changed", eventType: EventIssueStatusChanged, field: "status", previous: []string{"prev_status"}},
+		{flag: "assignee_changed", eventType: EventIssueAssigneeChanged, field: "assignee", previous: []string{"prev_assignee_type", "prev_assignee_id"}},
+		{flag: "priority_changed", eventType: EventIssuePriorityChanged, field: "priority", previous: []string{"prev_priority"}},
+		{flag: "project_changed", eventType: EventIssueProjectChanged, field: "project", previous: []string{"prev_project_id"}},
+	} {
+		changed, _ := payload[candidate.flag].(bool)
+		if !changed {
+			continue
+		}
+		missing := false
+		for _, key := range candidate.previous {
+			if _, exists := payload[key]; !exists {
+				missing = true
+				break
+			}
+		}
+		if missing {
+			return nil, fmt.Errorf("%s payload has no previous value", candidate.eventType)
+		}
+		changes = append(changes, productEvent{eventType: candidate.eventType, changeField: candidate.field})
+	}
+	return changes, nil
+}
+
+type productEvent struct {
+	eventType   string
+	changeField string
+}
+
+func (s *Service) captureProductEvents(event events.Event, productEvents []productEvent) {
 	if !s.Available() || s.txStarter == nil {
 		return
 	}
 	workspaceID, err := util.ParseUUID(event.WorkspaceID)
 	if err != nil {
-		slog.Error("outbound webhook capture rejected invalid workspace", "event_type", EventIssueCreated)
+		slog.Error("outbound webhook capture rejected invalid workspace", "event_type", event.Type)
 		return
 	}
 	ctx := context.Background()
 	tx, err := s.txStarter.Begin(ctx)
 	if err != nil {
-		slog.Error("outbound webhook capture transaction failed", "event_type", EventIssueCreated, "error", err)
+		slog.Error("outbound webhook capture transaction failed", "event_type", event.Type, "error", err)
 		return
 	}
 	defer tx.Rollback(ctx)
 	queries := s.queries.WithTx(tx)
 	if _, err := queries.LockWorkspaceForOutboundWebhookCapture(ctx, workspaceID); err != nil {
 		if !errors.Is(err, pgx.ErrNoRows) {
-			slog.Error("outbound webhook workspace capture lock failed", "event_type", EventIssueCreated, "error", err)
+			slog.Error("outbound webhook workspace capture lock failed", "event_type", event.Type, "error", err)
 		}
 		return
 	}
-	rows, err := queries.ListActiveIssueCreatedOutboundWebhookSubscriptions(ctx, workspaceID)
-	if err != nil {
-		slog.Error("outbound webhook subscription lookup failed", "event_type", EventIssueCreated, "error", err)
-		return
+	pending := make([]pendingDispatch, 0)
+	for _, product := range productEvents {
+		rows, err := queries.ListActiveOutboundWebhookSubscriptionsForEvent(ctx, db.ListActiveOutboundWebhookSubscriptionsForEventParams{
+			WorkspaceID: workspaceID,
+			EventType:   product.eventType,
+		})
+		if err != nil {
+			slog.Error("outbound webhook subscription lookup failed", "event_type", product.eventType, "error", err)
+			return
+		}
+		if len(rows) == 0 {
+			continue
+		}
+		eventID := uuid.New()
+		body, err := s.issueEventBody(ctx, event, eventID, product)
+		if err != nil {
+			slog.Error("outbound webhook canonicalization failed", "event_type", product.eventType, "error", err)
+			return
+		}
+		for _, subscription := range rows {
+			delivery, err := queries.CreateOutboundWebhookDelivery(ctx, db.CreateOutboundWebhookDeliveryParams{
+				EventID: pgtype.UUID{Bytes: eventID, Valid: true}, SubscriptionID: subscription.ID,
+				WorkspaceID: subscription.WorkspaceID, EventType: product.eventType, RequestBody: body,
+			})
+			if err != nil {
+				slog.Error("outbound webhook delivery persistence failed", "event_type", product.eventType, "error", err)
+				return
+			}
+			pending = append(pending, pendingDispatch{subscription: subscription, delivery: delivery})
+		}
 	}
-	if len(rows) == 0 {
+	if len(pending) == 0 {
 		_ = tx.Rollback(ctx)
 		return
 	}
-	eventID := uuid.New()
-	body, err := s.issueCreatedBody(event, eventID)
-	if err != nil {
-		slog.Error("outbound webhook canonicalization failed", "event_type", EventIssueCreated, "error", err)
-		return
-	}
-	pending := make([]pendingDispatch, 0, len(rows))
-	for _, subscription := range rows {
-		delivery, err := queries.CreateOutboundWebhookDelivery(ctx, db.CreateOutboundWebhookDeliveryParams{
-			EventID: pgtype.UUID{Bytes: eventID, Valid: true}, SubscriptionID: subscription.ID,
-			WorkspaceID: subscription.WorkspaceID, EventType: EventIssueCreated, RequestBody: body,
-		})
-		if err != nil {
-			slog.Error("outbound webhook delivery persistence failed", "event_type", EventIssueCreated, "error", err)
-			return
-		}
-		pending = append(pending, pendingDispatch{subscription: subscription, delivery: delivery})
-	}
 	if err := tx.Commit(ctx); err != nil {
-		slog.Error("outbound webhook delivery commit failed", "event_type", EventIssueCreated, "error", err)
+		slog.Error("outbound webhook delivery commit failed", "event_type", event.Type, "error", err)
 		return
 	}
 	for _, item := range pending {
@@ -349,32 +473,61 @@ func (s *Service) captureIssueCreated(event events.Event) {
 	}
 }
 
-func (s *Service) issueCreatedBody(event events.Event, eventID uuid.UUID) ([]byte, error) {
+type issuePayload struct {
+	ID           string  `json:"id"`
+	Identifier   string  `json:"identifier"`
+	Title        string  `json:"title"`
+	Status       string  `json:"status"`
+	Priority     string  `json:"priority"`
+	ProjectID    *string `json:"project_id"`
+	AssigneeType *string `json:"assignee_type"`
+	AssigneeID   *string `json:"assignee_id"`
+}
+
+type assigneeSnapshot struct {
+	Type        string `json:"type"`
+	ID          string `json:"id"`
+	DisplayName string `json:"display_name"`
+}
+
+type issueSnapshot struct {
+	ID         string            `json:"id"`
+	Identifier string            `json:"identifier"`
+	Title      string            `json:"title"`
+	Status     string            `json:"status"`
+	Priority   string            `json:"priority"`
+	ProjectID  *string           `json:"project_id"`
+	Assignee   *assigneeSnapshot `json:"assignee"`
+}
+
+type issueChange struct {
+	Field    string `json:"field"`
+	Previous any    `json:"previous"`
+	Current  any    `json:"current"`
+}
+
+func (s *Service) issueEventBody(ctx context.Context, event events.Event, eventID uuid.UUID, product productEvent) ([]byte, error) {
 	payload, ok := event.Payload.(map[string]any)
 	if !ok {
-		return nil, errors.New("issue.created payload is not an object")
+		return nil, errors.New("issue event payload is not an object")
 	}
 	rawIssue, ok := payload["issue"]
 	if !ok {
-		return nil, errors.New("issue.created payload has no issue")
+		return nil, errors.New("issue event payload has no issue")
 	}
 	encoded, err := json.Marshal(rawIssue)
 	if err != nil {
 		return nil, err
 	}
-	var issue struct {
-		ID           string  `json:"id"`
-		Identifier   string  `json:"identifier"`
-		Title        string  `json:"title"`
-		Status       string  `json:"status"`
-		Priority     string  `json:"priority"`
-		ProjectID    *string `json:"project_id"`
-		AssigneeType *string `json:"assignee_type"`
-		AssigneeID   *string `json:"assignee_id"`
-	}
+	var issue issuePayload
 	if err := json.Unmarshal(encoded, &issue); err != nil || issue.ID == "" || issue.Title == "" {
-		return nil, errors.New("issue.created payload is incomplete")
+		return nil, errors.New("issue event payload is incomplete")
 	}
+	assignee, err := s.resolveAssignee(ctx, event.WorkspaceID, issue.AssigneeType, issue.AssigneeID)
+	if err != nil {
+		return nil, err
+	}
+	snapshot := issueSnapshot{ID: issue.ID, Identifier: issue.Identifier, Title: issue.Title, Status: issue.Status, Priority: issue.Priority, ProjectID: issue.ProjectID, Assignee: assignee}
 	envelope := struct {
 		Version    int       `json:"version"`
 		ID         string    `json:"id"`
@@ -388,13 +541,130 @@ func (s *Service) issueCreatedBody(event events.Event, eventID uuid.UUID) ([]byt
 			ID   string `json:"id"`
 		} `json:"actor"`
 		Data struct {
-			Issue any `json:"issue"`
+			Issue  issueSnapshot `json:"issue"`
+			Change *issueChange  `json:"change,omitempty"`
 		} `json:"data"`
-	}{Version: 1, ID: eventID.String(), Type: EventIssueCreated, OccurredAt: s.now().UTC()}
+	}{Version: 1, ID: eventID.String(), Type: product.eventType, OccurredAt: s.now().UTC()}
 	envelope.Workspace.ID = event.WorkspaceID
 	envelope.Actor.Type, envelope.Actor.ID = event.ActorType, event.ActorID
-	envelope.Data.Issue = issue
+	envelope.Data.Issue = snapshot
+	if product.changeField != "" {
+		change, err := s.issueChange(ctx, event.WorkspaceID, payload, issue, assignee, product.changeField)
+		if err != nil {
+			return nil, err
+		}
+		envelope.Data.Change = change
+	}
 	return json.Marshal(envelope)
+}
+
+func (s *Service) issueChange(ctx context.Context, workspaceID string, payload map[string]any, issue issuePayload, currentAssignee *assigneeSnapshot, field string) (*issueChange, error) {
+	change := &issueChange{Field: field}
+	switch field {
+	case "status":
+		previous, err := requiredString(payload, "prev_status")
+		if err != nil {
+			return nil, err
+		}
+		change.Previous, change.Current = previous, issue.Status
+	case "priority":
+		previous, err := requiredString(payload, "prev_priority")
+		if err != nil {
+			return nil, err
+		}
+		change.Previous, change.Current = previous, issue.Priority
+	case "project":
+		previous, err := nullableString(payload, "prev_project_id")
+		if err != nil {
+			return nil, err
+		}
+		change.Previous, change.Current = previous, issue.ProjectID
+	case "assignee":
+		previousType, err := nullableString(payload, "prev_assignee_type")
+		if err != nil {
+			return nil, err
+		}
+		previousID, err := nullableString(payload, "prev_assignee_id")
+		if err != nil {
+			return nil, err
+		}
+		previous, err := s.resolveAssignee(ctx, workspaceID, previousType, previousID)
+		if err != nil {
+			return nil, err
+		}
+		change.Previous, change.Current = previous, currentAssignee
+	default:
+		return nil, fmt.Errorf("unsupported issue change field %q", field)
+	}
+	return change, nil
+}
+
+func requiredString(payload map[string]any, key string) (string, error) {
+	value, err := nullableString(payload, key)
+	if err != nil || value == nil {
+		return "", fmt.Errorf("issue change payload has invalid %s", key)
+	}
+	return *value, nil
+}
+
+func nullableString(payload map[string]any, key string) (*string, error) {
+	raw, exists := payload[key]
+	if !exists {
+		return nil, fmt.Errorf("issue change payload has no %s", key)
+	}
+	encoded, err := json.Marshal(raw)
+	if err != nil {
+		return nil, err
+	}
+	var value *string
+	if err := json.Unmarshal(encoded, &value); err != nil {
+		return nil, fmt.Errorf("issue change payload has invalid %s", key)
+	}
+	return value, nil
+}
+
+func (s *Service) resolveAssignee(ctx context.Context, workspaceID string, assigneeType, assigneeID *string) (*assigneeSnapshot, error) {
+	if assigneeType == nil && assigneeID == nil {
+		return nil, nil
+	}
+	if assigneeType == nil || assigneeID == nil || *assigneeType == "" || *assigneeID == "" {
+		return nil, errors.New("issue assignee identity is incomplete")
+	}
+	workspaceUUID, err := util.ParseUUID(workspaceID)
+	if err != nil {
+		return nil, errors.New("issue assignee workspace is invalid")
+	}
+	identity, err := util.ParseUUID(*assigneeID)
+	if err != nil {
+		return nil, errors.New("issue assignee id is invalid")
+	}
+	snapshot := &assigneeSnapshot{Type: *assigneeType, ID: *assigneeID}
+	switch *assigneeType {
+	case "member":
+		if _, err := s.queries.GetMemberByUserAndWorkspace(ctx, db.GetMemberByUserAndWorkspaceParams{UserID: identity, WorkspaceID: workspaceUUID}); err != nil {
+			return nil, errors.New("issue member assignee is unavailable")
+		}
+		user, err := s.queries.GetUser(ctx, identity)
+		if err != nil {
+			return nil, errors.New("issue member assignee is unavailable")
+		}
+		snapshot.DisplayName = user.Name
+	case "agent":
+		agent, err := s.queries.GetAgentInWorkspace(ctx, db.GetAgentInWorkspaceParams{ID: identity, WorkspaceID: workspaceUUID})
+		if err != nil {
+			return nil, errors.New("issue agent assignee is unavailable")
+		}
+		snapshot.DisplayName = agent.Name
+	case "squad":
+		squad, err := s.queries.GetSquadInWorkspace(ctx, db.GetSquadInWorkspaceParams{ID: identity, WorkspaceID: workspaceUUID})
+		if err != nil {
+			return nil, errors.New("issue squad assignee is unavailable")
+		}
+		snapshot.DisplayName = squad.Name
+	default:
+		return nil, fmt.Errorf("unsupported issue assignee type %q", *assigneeType)
+	}
+	return snapshot, nil
 }
 
 func (s *Service) deliver(ctx context.Context, subscription db.OutboundWebhookSubscription, delivery db.OutboundWebhookDelivery) {
