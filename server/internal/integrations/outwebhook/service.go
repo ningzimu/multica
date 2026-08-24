@@ -41,6 +41,7 @@ const (
 	EventCommentCreated       = "comment.created"
 	EventCommentUpdated       = "comment.updated"
 	EventCommentDeleted       = "comment.deleted"
+	EventWebhookTest          = "webhook.test"
 	ScopeWorkspace            = "workspace"
 	CatalogVersion            = 1
 
@@ -151,6 +152,21 @@ type CreateInput struct {
 	Events      []string
 }
 
+type UpdateInput struct {
+	WorkspaceID pgtype.UUID
+	ID          pgtype.UUID
+	Name        string
+	Destination *string
+	Events      []string
+	ScopeMode   string
+}
+
+type TestInput struct {
+	WorkspaceID pgtype.UUID
+	ID          pgtype.UUID
+	ActorID     pgtype.UUID
+}
+
 type Subscription struct {
 	ID                          string    `json:"id"`
 	WorkspaceID                 string    `json:"workspace_id"`
@@ -162,6 +178,8 @@ type Subscription struct {
 	Status                      string    `json:"status"`
 	PauseReason                 *string   `json:"pause_reason"`
 	ConsecutiveTerminalFailures int32     `json:"consecutive_terminal_failures"`
+	SigningSecretHint           string    `json:"signing_secret_hint"`
+	SecretVersion               int32     `json:"secret_version"`
 	CreatedAt                   time.Time `json:"created_at"`
 	UpdatedAt                   time.Time `json:"updated_at"`
 }
@@ -171,10 +189,10 @@ type CreateResult struct {
 	SigningSecret string       `json:"signing_secret"`
 }
 
-type UpdateEventsInput struct {
-	WorkspaceID    pgtype.UUID
-	SubscriptionID pgtype.UUID
-	Events         []string
+type TestResult struct {
+	DeliveryID string `json:"delivery_id"`
+	EventID    string `json:"event_id"`
+	State      string `json:"state"`
 }
 
 func New(queries *db.Queries, txStarter interface {
@@ -318,7 +336,7 @@ func (s *Service) dispatchOne(ctx context.Context) bool {
 		}
 		return false
 	}
-	subscription, err := s.queries.GetActiveOutboundWebhookSubscription(ctx, db.GetActiveOutboundWebhookSubscriptionParams{
+	subscription, err := s.queries.GetOutboundWebhookSubscription(ctx, db.GetOutboundWebhookSubscriptionParams{
 		WorkspaceID: delivery.WorkspaceID,
 		ID:          delivery.SubscriptionID,
 	})
@@ -326,6 +344,10 @@ func (s *Service) dispatchOne(ctx context.Context) bool {
 		if !errors.Is(err, pgx.ErrNoRows) {
 			slog.Error("outbound webhook claimed subscription lookup failed", "delivery_id", util.UUIDToString(delivery.ID), "error", err)
 		}
+		s.releaseClaim(delivery)
+		return true
+	}
+	if subscription.Status != "active" && delivery.EventType != EventWebhookTest {
 		s.releaseClaim(delivery)
 		return true
 	}
@@ -385,11 +407,10 @@ func (s *Service) Create(ctx context.Context, input CreateInput) (CreateResult, 
 	if err != nil {
 		return CreateResult{}, fmt.Errorf("%w: destination is not allowed", ErrInvalidInput)
 	}
-	secretBytes := make([]byte, 32)
-	if _, err := rand.Read(secretBytes); err != nil {
-		return CreateResult{}, fmt.Errorf("generate signing secret: %w", err)
+	secret, err := generateSigningSecret()
+	if err != nil {
+		return CreateResult{}, err
 	}
-	secret := "whsec_" + base64.RawURLEncoding.EncodeToString(secretBytes)
 	destinationCiphertext, err := s.box.Seal([]byte(endpoint.String()))
 	if err != nil {
 		return CreateResult{}, fmt.Errorf("encrypt destination: %w", err)
@@ -403,6 +424,7 @@ func (s *Service) Create(ctx context.Context, input CreateInput) (CreateResult, 
 		WorkspaceID: input.WorkspaceID, Name: input.Name,
 		DestinationCiphertext: destinationCiphertext, SecretCiphertext: secretCiphertext,
 		DestinationHint: safeDestinationHint(endpoint), Events: eventsJSON, CreatedBy: input.CreatedBy,
+		SigningSecretHint: signingSecretHint(secret),
 	})
 	if err != nil {
 		return CreateResult{}, err
@@ -410,23 +432,19 @@ func (s *Service) Create(ctx context.Context, input CreateInput) (CreateResult, 
 	return CreateResult{Subscription: subscriptionResponse(row), SigningSecret: secret}, nil
 }
 
-func (s *Service) UpdateEvents(ctx context.Context, input UpdateEventsInput) (Subscription, error) {
-	if !s.Available() {
-		return Subscription{}, ErrUnavailable
+func generateSigningSecret() (string, error) {
+	secretBytes := make([]byte, 32)
+	if _, err := rand.Read(secretBytes); err != nil {
+		return "", fmt.Errorf("generate signing secret: %w", err)
 	}
-	if err := validateEventSelection(input.Events); err != nil {
-		return Subscription{}, err
+	return "whsec_" + base64.RawURLEncoding.EncodeToString(secretBytes), nil
+}
+
+func signingSecretHint(secret string) string {
+	if len(secret) < 4 {
+		return "whsec_..."
 	}
-	eventsJSON, _ := json.Marshal(input.Events)
-	row, err := s.queries.UpdateOutboundWebhookSubscriptionEvents(ctx, db.UpdateOutboundWebhookSubscriptionEventsParams{
-		WorkspaceID: input.WorkspaceID,
-		ID:          input.SubscriptionID,
-		Events:      eventsJSON,
-	})
-	if err != nil {
-		return Subscription{}, err
-	}
-	return subscriptionResponse(row), nil
+	return "whsec_..." + secret[len(secret)-4:]
 }
 
 func validateEventSelection(selected []string) error {
@@ -468,6 +486,183 @@ func (s *Service) Get(ctx context.Context, workspaceID, id pgtype.UUID) (Subscri
 		return Subscription{}, err
 	}
 	return subscriptionResponse(row), nil
+}
+
+func (s *Service) Update(ctx context.Context, input UpdateInput) (Subscription, error) {
+	if !s.Available() || s.txStarter == nil {
+		return Subscription{}, ErrUnavailable
+	}
+	name := strings.TrimSpace(input.Name)
+	if len(name) < 1 || len(name) > 100 {
+		return Subscription{}, fmt.Errorf("%w: name must contain 1 to 100 characters", ErrInvalidInput)
+	}
+	if err := validateEventSelection(input.Events); err != nil {
+		return Subscription{}, err
+	}
+	tx, err := s.txStarter.Begin(ctx)
+	if err != nil {
+		return Subscription{}, err
+	}
+	defer tx.Rollback(context.Background())
+	queries := s.queries.WithTx(tx)
+	existing, err := queries.GetOutboundWebhookSubscriptionForUpdate(ctx, db.GetOutboundWebhookSubscriptionForUpdateParams{
+		WorkspaceID: input.WorkspaceID, ID: input.ID,
+	})
+	if err != nil {
+		return Subscription{}, err
+	}
+	// Project Scope is implemented by its own ticket. Editing lifecycle fields
+	// must preserve the stored scope and can never widen disclosure.
+	if input.ScopeMode != existing.ScopeMode {
+		return Subscription{}, fmt.Errorf("%w: scope mode cannot be changed by this operation", ErrInvalidInput)
+	}
+	destinationCiphertext := existing.DestinationCiphertext
+	destinationHint := existing.DestinationHint
+	if input.Destination != nil {
+		endpoint, _, err := s.validateDestination(ctx, *input.Destination)
+		if err != nil {
+			return Subscription{}, fmt.Errorf("%w: destination is not allowed", ErrInvalidInput)
+		}
+		destinationCiphertext, err = s.box.Seal([]byte(endpoint.String()))
+		if err != nil {
+			return Subscription{}, fmt.Errorf("encrypt destination: %w", err)
+		}
+		destinationHint = safeDestinationHint(endpoint)
+	}
+	eventsJSON, err := json.Marshal(input.Events)
+	if err != nil {
+		return Subscription{}, err
+	}
+	updated, err := queries.UpdateOutboundWebhookSubscription(ctx, db.UpdateOutboundWebhookSubscriptionParams{
+		WorkspaceID: input.WorkspaceID, ID: input.ID, Name: name,
+		DestinationCiphertext: destinationCiphertext, DestinationHint: destinationHint,
+		Events: eventsJSON, ScopeMode: existing.ScopeMode,
+	})
+	if err != nil {
+		return Subscription{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Subscription{}, err
+	}
+	return subscriptionResponse(updated), nil
+}
+
+func (s *Service) Pause(ctx context.Context, workspaceID, id pgtype.UUID) (Subscription, error) {
+	if !s.Available() {
+		return Subscription{}, ErrUnavailable
+	}
+	row, err := s.queries.PauseOutboundWebhookSubscription(ctx, db.PauseOutboundWebhookSubscriptionParams{WorkspaceID: workspaceID, ID: id})
+	if err != nil {
+		return Subscription{}, err
+	}
+	return subscriptionResponse(row), nil
+}
+
+func (s *Service) Resume(ctx context.Context, workspaceID, id pgtype.UUID) (Subscription, error) {
+	if !s.Available() || s.txStarter == nil {
+		return Subscription{}, ErrUnavailable
+	}
+	tx, err := s.txStarter.Begin(ctx)
+	if err != nil {
+		return Subscription{}, err
+	}
+	defer tx.Rollback(context.Background())
+	queries := s.queries.WithTx(tx)
+	row, err := queries.GetOutboundWebhookSubscriptionForUpdate(ctx, db.GetOutboundWebhookSubscriptionForUpdateParams{WorkspaceID: workspaceID, ID: id})
+	if err != nil {
+		return Subscription{}, err
+	}
+	if row.PauseReason.Valid && row.PauseReason.String == "scope_empty" {
+		return Subscription{}, fmt.Errorf("%w: an empty project scope cannot be resumed", ErrInvalidInput)
+	}
+	row, err = queries.ResumeOutboundWebhookSubscription(ctx, db.ResumeOutboundWebhookSubscriptionParams{WorkspaceID: workspaceID, ID: id})
+	if err != nil {
+		return Subscription{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Subscription{}, err
+	}
+	s.wakeDispatcher()
+	return subscriptionResponse(row), nil
+}
+
+func (s *Service) RotateSecret(ctx context.Context, workspaceID, id pgtype.UUID) (CreateResult, error) {
+	if !s.Available() || s.txStarter == nil {
+		return CreateResult{}, ErrUnavailable
+	}
+	secret, err := generateSigningSecret()
+	if err != nil {
+		return CreateResult{}, err
+	}
+	ciphertext, err := s.box.Seal([]byte(secret))
+	if err != nil {
+		return CreateResult{}, fmt.Errorf("encrypt signing secret: %w", err)
+	}
+	tx, err := s.txStarter.Begin(ctx)
+	if err != nil {
+		return CreateResult{}, err
+	}
+	defer tx.Rollback(context.Background())
+	queries := s.queries.WithTx(tx)
+	if _, err := queries.GetOutboundWebhookSubscriptionForUpdate(ctx, db.GetOutboundWebhookSubscriptionForUpdateParams{WorkspaceID: workspaceID, ID: id}); err != nil {
+		return CreateResult{}, err
+	}
+	row, err := queries.RotateOutboundWebhookSigningSecret(ctx, db.RotateOutboundWebhookSigningSecretParams{
+		WorkspaceID: workspaceID, ID: id, SecretCiphertext: ciphertext, SigningSecretHint: signingSecretHint(secret),
+	})
+	if err != nil {
+		return CreateResult{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return CreateResult{}, err
+	}
+	return CreateResult{Subscription: subscriptionResponse(row), SigningSecret: secret}, nil
+}
+
+func (s *Service) Test(ctx context.Context, input TestInput) (TestResult, error) {
+	if !s.Available() || s.txStarter == nil {
+		return TestResult{}, ErrUnavailable
+	}
+	tx, err := s.txStarter.Begin(ctx)
+	if err != nil {
+		return TestResult{}, err
+	}
+	defer tx.Rollback(ctx)
+	queries := s.queries.WithTx(tx)
+	if _, err := queries.LockWorkspaceForOutboundWebhookCapture(ctx, input.WorkspaceID); err != nil {
+		return TestResult{}, err
+	}
+	subscription, err := queries.GetOutboundWebhookSubscriptionForUpdate(ctx, db.GetOutboundWebhookSubscriptionForUpdateParams{WorkspaceID: input.WorkspaceID, ID: input.ID})
+	if err != nil {
+		return TestResult{}, err
+	}
+	eventID := uuid.New()
+	body, err := json.Marshal(map[string]any{
+		"version": 1, "id": eventID.String(), "type": EventWebhookTest, "occurred_at": s.now().UTC(),
+		"workspace": map[string]string{"id": util.UUIDToString(input.WorkspaceID)},
+		"actor":     map[string]string{"type": "member", "id": util.UUIDToString(input.ActorID)},
+		"data":      map[string]bool{"synthetic": true},
+	})
+	if err != nil {
+		return TestResult{}, err
+	}
+	delivery, err := queries.CreateOutboundWebhookDelivery(ctx, db.CreateOutboundWebhookDeliveryParams{
+		EventID: pgtype.UUID{Bytes: eventID, Valid: true}, SubscriptionID: subscription.ID,
+		WorkspaceID: subscription.WorkspaceID, EventType: EventWebhookTest, RequestBody: body,
+		SigningSecretCiphertext: subscription.SecretCiphertext, DestinationCiphertext: subscription.DestinationCiphertext,
+		SecretVersion: subscription.SecretVersion, MaxPending: s.policy.MaxPendingPerSubscription,
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return TestResult{}, fmt.Errorf("%w: pending delivery limit reached", ErrInvalidInput)
+		}
+		return TestResult{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return TestResult{}, err
+	}
+	s.wakeDispatcher()
+	return TestResult{DeliveryID: util.UUIDToString(delivery.ID), EventID: eventID.String(), State: delivery.State}, nil
 }
 
 func (s *Service) Delete(ctx context.Context, workspaceID, id pgtype.UUID) (bool, error) {
@@ -601,7 +796,10 @@ func (s *Service) captureProductEvents(event events.Event, productEvents []produ
 			_, err := queries.CreateOutboundWebhookDelivery(ctx, db.CreateOutboundWebhookDeliveryParams{
 				EventID: pgtype.UUID{Bytes: eventID, Valid: true}, SubscriptionID: subscription.ID,
 				WorkspaceID: subscription.WorkspaceID, EventType: product.eventType, RequestBody: body,
-				MaxPending: s.policy.MaxPendingPerSubscription,
+				SigningSecretCiphertext: subscription.SecretCiphertext,
+				DestinationCiphertext:   subscription.DestinationCiphertext,
+				SecretVersion:           subscription.SecretVersion,
+				MaxPending:              s.policy.MaxPendingPerSubscription,
 			})
 			if err != nil {
 				if errors.Is(err, pgx.ErrNoRows) {
@@ -998,12 +1196,12 @@ func optionalString(value any) *string {
 }
 
 func (s *Service) deliver(ctx context.Context, subscription db.OutboundWebhookSubscription, delivery db.OutboundWebhookDelivery) {
-	destination, err := s.box.Open(subscription.DestinationCiphertext)
+	destination, err := s.box.Open(delivery.DestinationCiphertext)
 	if err != nil {
 		s.failClaim(delivery, 0, "encrypted destination is unavailable")
 		return
 	}
-	secret, err := s.box.Open(subscription.SecretCiphertext)
+	secret, err := s.box.Open(delivery.SigningSecretCiphertext)
 	if err != nil {
 		s.failClaim(delivery, 0, "encrypted signing secret is unavailable")
 		return
@@ -1179,6 +1377,8 @@ func subscriptionResponse(row db.OutboundWebhookSubscription) Subscription {
 		DestinationHint: row.DestinationHint, Events: events, EventCatalogVersion: row.EventCatalogVersion,
 		ScopeMode: row.ScopeMode, Status: row.Status, PauseReason: pauseReason,
 		ConsecutiveTerminalFailures: row.ConsecutiveTerminalFailures,
+		SigningSecretHint:           row.SigningSecretHint,
+		SecretVersion:               row.SecretVersion,
 		CreatedAt:                   row.CreatedAt.Time, UpdatedAt: row.UpdatedAt.Time,
 	}
 }

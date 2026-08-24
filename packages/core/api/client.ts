@@ -220,6 +220,9 @@ import type {
   OutboundWebhookSubscription,
   CreateOutboundWebhookSubscriptionRequest,
   CreateOutboundWebhookSubscriptionResponse,
+  UpdateOutboundWebhookSubscriptionRequest,
+  RotateOutboundWebhookSecretResponse,
+  TestOutboundWebhookSubscriptionResponse,
 } from "../types";
 import type { OnboardingCompletionPath } from "../onboarding/types";
 import type {
@@ -401,6 +404,8 @@ import {
   ListOutboundWebhookSubscriptionsResponseSchema,
   OutboundWebhookSubscriptionSchema,
   CreateOutboundWebhookSubscriptionResponseSchema,
+  RotateOutboundWebhookSecretResponseSchema,
+  TestOutboundWebhookSubscriptionResponseSchema,
   EMPTY_OUTBOUND_WEBHOOK_SUBSCRIPTION,
   EMPTY_LIST_OUTBOUND_WEBHOOK_SUBSCRIPTIONS,
   EMPTY_CREATE_OUTBOUND_WEBHOOK_SUBSCRIPTION,
@@ -4186,20 +4191,83 @@ export class ApiClient {
     );
   }
 
-  async updateOutboundWebhookEvents(
+  async updateOutboundWebhookSubscription(
     workspaceId: string,
     subscriptionId: string,
-    events: string[],
+    data: UpdateOutboundWebhookSubscriptionRequest,
   ): Promise<OutboundWebhookSubscription> {
     const raw = await this.fetch<unknown>(
-      `/api/workspaces/${workspaceId}/outbound-webhooks/${subscriptionId}/events`,
-      { method: "PATCH", body: JSON.stringify({ events }) },
+      `/api/workspaces/${workspaceId}/outbound-webhooks/${subscriptionId}`,
+      {
+        method: "PUT",
+        body: JSON.stringify({
+          name: data.name,
+          destination: data.destination,
+          events: data.events,
+          scope_mode: data.scopeMode,
+        }),
+      },
     );
     return parseWithFallback(
       raw,
       OutboundWebhookSubscriptionSchema,
       EMPTY_OUTBOUND_WEBHOOK_SUBSCRIPTION,
-      { endpoint: "PATCH /api/workspaces/:id/outbound-webhooks/:subscriptionId/events" },
+      { endpoint: "PUT /api/workspaces/:id/outbound-webhooks/:subscriptionId" },
+    );
+  }
+
+  async pauseOutboundWebhookSubscription(
+    workspaceId: string,
+    subscriptionId: string,
+  ): Promise<OutboundWebhookSubscription> {
+    const raw = await this.fetch<unknown>(
+      `/api/workspaces/${workspaceId}/outbound-webhooks/${subscriptionId}/pause`,
+      { method: "POST" },
+    );
+    return parseWithFallback(raw, OutboundWebhookSubscriptionSchema, EMPTY_OUTBOUND_WEBHOOK_SUBSCRIPTION, {
+      endpoint: "POST /api/workspaces/:id/outbound-webhooks/:subscriptionId/pause",
+    });
+  }
+
+  async resumeOutboundWebhookSubscription(
+    workspaceId: string,
+    subscriptionId: string,
+  ): Promise<OutboundWebhookSubscription> {
+    const raw = await this.fetch<unknown>(
+      `/api/workspaces/${workspaceId}/outbound-webhooks/${subscriptionId}/resume`,
+      { method: "POST" },
+    );
+    return parseWithFallback(raw, OutboundWebhookSubscriptionSchema, EMPTY_OUTBOUND_WEBHOOK_SUBSCRIPTION, {
+      endpoint: "POST /api/workspaces/:id/outbound-webhooks/:subscriptionId/resume",
+    });
+  }
+
+  async testOutboundWebhookSubscription(
+    workspaceId: string,
+    subscriptionId: string,
+  ): Promise<TestOutboundWebhookSubscriptionResponse> {
+    const raw = await this.fetch<unknown>(
+      `/api/workspaces/${workspaceId}/outbound-webhooks/${subscriptionId}/test`,
+      { method: "POST" },
+    );
+    return parseWithFallback(raw, TestOutboundWebhookSubscriptionResponseSchema, {
+      deliveryId: "", eventId: "", state: "pending",
+    }, { endpoint: "POST /api/workspaces/:id/outbound-webhooks/:subscriptionId/test" });
+  }
+
+  async rotateOutboundWebhookSecret(
+    workspaceId: string,
+    subscriptionId: string,
+  ): Promise<RotateOutboundWebhookSecretResponse> {
+    const raw = await this.fetch<unknown>(
+      `/api/workspaces/${workspaceId}/outbound-webhooks/${subscriptionId}/rotate-secret`,
+      { method: "POST" },
+    );
+    return parseWithFallback(
+      raw,
+      RotateOutboundWebhookSecretResponseSchema,
+      EMPTY_CREATE_OUTBOUND_WEBHOOK_SUBSCRIPTION,
+      { endpoint: "POST /api/workspaces/:id/outbound-webhooks/:subscriptionId/rotate-secret" },
     );
   }
 

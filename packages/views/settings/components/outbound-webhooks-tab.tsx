@@ -6,16 +6,17 @@ import { Trash2 } from "lucide-react";
 import { toast } from "sonner";
 import { useCurrentWorkspace } from "@multica/core/paths";
 import { useCurrentMember } from "@multica/core/permissions";
-import {
-  outboundWebhookEventTypes,
-  type OutboundWebhookEventType,
-} from "@multica/core/types";
+import type { OutboundWebhookEvent, OutboundWebhookSubscription } from "@multica/core/types";
 import {
   outboundWebhookSubscriptionOptions,
   outboundWebhookSubscriptionsOptions,
   useCreateOutboundWebhookSubscription,
   useDeleteOutboundWebhookSubscription,
-  useUpdateOutboundWebhookEvents,
+  usePauseOutboundWebhookSubscription,
+  useResumeOutboundWebhookSubscription,
+  useRotateOutboundWebhookSecret,
+  useTestOutboundWebhookSubscription,
+  useUpdateOutboundWebhookSubscription,
 } from "@multica/core/outbound-webhooks";
 import { Button } from "@multica/ui/components/ui/button";
 import { Checkbox } from "@multica/ui/components/ui/checkbox";
@@ -23,6 +24,36 @@ import { Input } from "@multica/ui/components/ui/input";
 import { Label } from "@multica/ui/components/ui/label";
 import { useT } from "../../i18n";
 import { SettingsCard } from "./settings-layout";
+
+const EVENT_CATALOG: OutboundWebhookEvent[] = [
+  "issue.created", "issue.status_changed", "issue.assignee_changed", "issue.priority_changed",
+  "issue.project_changed", "comment.created", "comment.updated", "comment.deleted",
+];
+
+const DEFAULT_EVENTS: OutboundWebhookEvent[] = [
+  "issue.created", "issue.status_changed", "issue.assignee_changed", "comment.created",
+];
+
+function EventSelection({ selected, onChange }: {
+  selected: string[];
+  onChange: (events: string[]) => void;
+}) {
+  return (
+    <div className="grid gap-2 sm:grid-cols-2">
+      {EVENT_CATALOG.map((eventType) => (
+        <Label key={eventType} className="flex items-center gap-2 font-normal">
+          <Checkbox
+            checked={selected.includes(eventType)}
+            onCheckedChange={(checked) => onChange(
+              checked === true ? [...selected, eventType] : selected.filter((item) => item !== eventType),
+            )}
+          />
+          <code>{eventType}</code>
+        </Label>
+      ))}
+    </div>
+  );
+}
 
 export function OutboundWebhooksTab() {
   const { t } = useT("settings");
@@ -33,58 +64,60 @@ export function OutboundWebhooksTab() {
   const subscriptions = useQuery(outboundWebhookSubscriptionsOptions(wsId));
   const [name, setName] = useState("");
   const [destination, setDestination] = useState("");
-  const [selectedEvents, setSelectedEvents] = useState<OutboundWebhookEventType[]>([
-    "issue.created",
-  ]);
+  const [events, setEvents] = useState<string[]>(DEFAULT_EVENTS);
   const [disclosedSecret, setDisclosedSecret] = useState<string | null>(null);
   const [selectedSubscriptionId, setSelectedSubscriptionId] = useState("");
-  const [editingEvents, setEditingEvents] = useState<string[]>([]);
+  const [editing, setEditing] = useState<OutboundWebhookSubscription | null>(null);
+  const [editName, setEditName] = useState("");
+  const [editDestination, setEditDestination] = useState("");
+  const [editEvents, setEditEvents] = useState<string[]>([]);
   const selectedSubscription = useQuery(
     outboundWebhookSubscriptionOptions(wsId, selectedSubscriptionId),
   );
 
   const createSubscription = useCreateOutboundWebhookSubscription(wsId);
+  const updateSubscription = useUpdateOutboundWebhookSubscription(wsId);
   const deleteSubscription = useDeleteOutboundWebhookSubscription(wsId);
-  const updateEvents = useUpdateOutboundWebhookEvents(wsId);
+  const pauseSubscription = usePauseOutboundWebhookSubscription(wsId);
+  const resumeSubscription = useResumeOutboundWebhookSubscription(wsId);
+  const testSubscription = useTestOutboundWebhookSubscription(wsId);
+  const rotateSecret = useRotateOutboundWebhookSecret(wsId);
+  const showMutationError = (error: unknown, fallback: string) =>
+    toast.error(error instanceof Error ? error.message : fallback);
+
+  if (subscriptions.data?.capabilityAvailable === false) {
+    return (
+      <SettingsCard>
+        <div className="space-y-1 p-4">
+          <p className="text-body font-medium">{t(($) => $.outbound_webhooks.unavailable)}</p>
+          <p className="text-caption text-muted-foreground">{t(($) => $.outbound_webhooks.unavailable_description)}</p>
+        </div>
+      </SettingsCard>
+    );
+  }
 
   return (
     <div className="space-y-4">
       {canManage && (
         <SettingsCard>
-          <form
-            className="space-y-4 p-4"
-            onSubmit={(event) => {
-              event.preventDefault();
-              if (!name.trim() || !destination.trim() || selectedEvents.length === 0) return;
-              createSubscription.mutate(
-                {
-                  name,
-                  destination,
-                  events: selectedEvents,
-                  scopeMode: "workspace",
-                },
-                {
-                  onSuccess: (result) => {
-                    if (!result.subscription.id || !result.signingSecret) {
-                      toast.error(t(($) => $.outbound_webhooks.create_partial_failure));
-                      return;
-                    }
-                    setDisclosedSecret(result.signingSecret);
-                    setName("");
-                    setDestination("");
-                    setSelectedEvents(["issue.created"]);
-                    toast.success(t(($) => $.outbound_webhooks.created));
-                  },
-                  onError: (error) =>
-                    toast.error(
-                      error instanceof Error
-                        ? error.message
-                        : t(($) => $.outbound_webhooks.create_failed),
-                    ),
-                },
-              );
-            }}
-          >
+          <form className="space-y-4 p-4" onSubmit={(event) => {
+            event.preventDefault();
+            if (!name.trim() || !destination.trim() || events.length === 0) return;
+            createSubscription.mutate({ name, destination, events: events as OutboundWebhookEvent[], scopeMode: "workspace" }, {
+              onSuccess: (result) => {
+                if (!result.subscription.id || !result.signingSecret) {
+                  toast.error(t(($) => $.outbound_webhooks.create_partial_failure));
+                  return;
+                }
+                setDisclosedSecret(result.signingSecret);
+                setName("");
+                setDestination("");
+                setEvents(DEFAULT_EVENTS);
+                toast.success(t(($) => $.outbound_webhooks.created));
+              },
+              onError: (error) => showMutationError(error, t(($) => $.outbound_webhooks.create_failed)),
+            });
+          }}>
             <div className="space-y-1.5">
               <Label htmlFor="outbound-webhook-name">{t(($) => $.outbound_webhooks.name)}</Label>
               <Input id="outbound-webhook-name" value={name} onChange={(event) => setName(event.target.value)} required maxLength={100} />
@@ -95,26 +128,10 @@ export function OutboundWebhooksTab() {
             </div>
             <div className="space-y-2">
               <p className="text-body font-medium">{t(($) => $.outbound_webhooks.event_selection)}</p>
-              {outboundWebhookEventTypes.map((eventType) => (
-                <Label key={eventType} className="flex items-center gap-2 font-normal">
-                  <Checkbox
-                    checked={selectedEvents.includes(eventType)}
-                    onCheckedChange={(checked) =>
-                      setSelectedEvents((current) =>
-                        checked === true
-                          ? current.includes(eventType)
-                            ? current
-                            : [...current, eventType]
-                          : current.filter((candidate) => candidate !== eventType),
-                      )
-                    }
-                  />
-                  <code>{eventType}</code>
-                </Label>
-              ))}
+              <EventSelection selected={events} onChange={setEvents} />
             </div>
             <p className="text-caption text-muted-foreground">{t(($) => $.outbound_webhooks.workspace_scope)}</p>
-            <Button type="submit" disabled={selectedEvents.length === 0 || createSubscription.isPending}>{t(($) => $.outbound_webhooks.create)}</Button>
+            <Button type="submit" disabled={events.length === 0 || createSubscription.isPending}>{t(($) => $.outbound_webhooks.create)}</Button>
           </form>
         </SettingsCard>
       )}
@@ -134,91 +151,101 @@ export function OutboundWebhooksTab() {
       ) : subscriptions.data?.subscriptions.length ? (
         <SettingsCard>
           <div className="divide-y divide-border">
-            {subscriptions.data.subscriptions.map((subscription) => (
-              <div key={subscription.id}>
-                <div className="flex items-center gap-3 p-4">
-                  <div className="min-w-0 flex-1">
-                    <p className="truncate text-body font-medium">{subscription.name}</p>
-                    <p className="truncate text-caption text-muted-foreground">{subscription.destinationHint}</p>
-                    <p className="text-caption text-muted-foreground"><code>{subscription.events.join(", ")}</code> · {t(($) => $.outbound_webhooks.workspace_scope_short)}</p>
-                  </div>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={() => {
-                      const opening = selectedSubscriptionId !== subscription.id;
-                      setSelectedSubscriptionId(opening ? subscription.id : "");
-                      setEditingEvents(opening ? subscription.events : []);
-                    }}
-                  >
-                    {selectedSubscriptionId === subscription.id
-                      ? t(($) => $.outbound_webhooks.hide_details)
-                      : t(($) => $.outbound_webhooks.inspect)}
-                  </Button>
-                  {canManage && (
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      aria-label={t(($) => $.outbound_webhooks.delete)}
-                      onClick={() =>
-                        deleteSubscription.mutate(subscription.id, {
-                          onSuccess: () => {
-                            setSelectedSubscriptionId("");
-                            toast.success(t(($) => $.outbound_webhooks.deleted));
-                          },
-                          onError: () => toast.error(t(($) => $.outbound_webhooks.delete_failed)),
-                        })
-                      }
-                      disabled={deleteSubscription.isPending}
-                    >
-                      <Trash2 className="h-4 w-4" />
+            {subscriptions.data.subscriptions.map((subscription) => {
+              const paused = subscription.status === "paused";
+              return (
+                <div key={subscription.id}>
+                  <div className="flex flex-wrap items-center gap-3 p-4">
+                    <div className="min-w-0 flex-1">
+                      <p className="truncate text-body font-medium">{subscription.name}</p>
+                      <p className="truncate text-caption text-muted-foreground">{subscription.destinationHint}</p>
+                      <p className="text-caption text-muted-foreground">
+                        {paused ? t(($) => $.outbound_webhooks.paused) : t(($) => $.outbound_webhooks.active)}
+                        {paused && subscription.pauseReason ? ` · ${subscription.pauseReason}` : ""}
+                      </p>
+                    </div>
+                    <Button variant="outline" size="sm" onClick={() => setSelectedSubscriptionId(selectedSubscriptionId === subscription.id ? "" : subscription.id)}>
+                      {selectedSubscriptionId === subscription.id ? t(($) => $.outbound_webhooks.hide_details) : t(($) => $.outbound_webhooks.inspect)}
                     </Button>
+                    {canManage && (
+                      <>
+                        <Button variant="outline" size="sm" onClick={() => {
+                          setEditing(subscription);
+                          setEditName(subscription.name);
+                          setEditDestination("");
+                          setEditEvents(subscription.events);
+                        }}>{t(($) => $.outbound_webhooks.edit)}</Button>
+                        <Button variant="outline" size="sm" onClick={() => {
+                          const mutation = paused ? resumeSubscription : pauseSubscription;
+                          mutation.mutate(subscription.id, {
+                            onSuccess: () => toast.success(paused ? t(($) => $.outbound_webhooks.resumed) : t(($) => $.outbound_webhooks.paused_success)),
+                            onError: (error) => showMutationError(error, t(($) => $.outbound_webhooks.lifecycle_failed)),
+                          });
+                        }}>{paused ? t(($) => $.outbound_webhooks.resume) : t(($) => $.outbound_webhooks.pause)}</Button>
+                        <Button variant="outline" size="sm" onClick={() => testSubscription.mutate(subscription.id, {
+                          onSuccess: (result) => {
+                            if (!result.deliveryId || !result.eventId) {
+                              toast.error(t(($) => $.outbound_webhooks.test_failed));
+                              return;
+                            }
+                            toast.success(t(($) => $.outbound_webhooks.test_queued));
+                          },
+                          onError: (error) => showMutationError(error, t(($) => $.outbound_webhooks.test_failed)),
+                        })}>{t(($) => $.outbound_webhooks.test)}</Button>
+                        <Button variant="outline" size="sm" onClick={() => rotateSecret.mutate(subscription.id, {
+                          onSuccess: (result) => {
+                            if (!result.signingSecret) {
+                              toast.error(t(($) => $.outbound_webhooks.rotate_failed));
+                              return;
+                            }
+                            setDisclosedSecret(result.signingSecret);
+                            toast.success(t(($) => $.outbound_webhooks.rotated));
+                          },
+                          onError: (error) => showMutationError(error, t(($) => $.outbound_webhooks.rotate_failed)),
+                        })}>{t(($) => $.outbound_webhooks.rotate)}</Button>
+                        <Button variant="ghost" size="icon" aria-label={t(($) => $.outbound_webhooks.delete)} onClick={() =>
+                          deleteSubscription.mutate(subscription.id, {
+                            onSuccess: () => { setSelectedSubscriptionId(""); toast.success(t(($) => $.outbound_webhooks.deleted)); },
+                            onError: () => toast.error(t(($) => $.outbound_webhooks.delete_failed)),
+                          })
+                        } disabled={deleteSubscription.isPending}>
+                          <Trash2 className="h-4 w-4" />
+                        </Button>
+                      </>
+                    )}
+                  </div>
+                  {editing?.id === subscription.id && (
+                    <form className="space-y-3 border-t border-border p-4" onSubmit={(event) => {
+                      event.preventDefault();
+                      if (!editName.trim() || editEvents.length === 0) return;
+                      updateSubscription.mutate({ subscriptionId: subscription.id, input: {
+                        name: editName,
+                        destination: editDestination.trim() || undefined,
+                        events: editEvents,
+                        scopeMode: subscription.scopeMode,
+                      } }, {
+                        onSuccess: () => { setEditing(null); toast.success(t(($) => $.outbound_webhooks.updated)); },
+                        onError: (error) => showMutationError(error, t(($) => $.outbound_webhooks.update_failed)),
+                      });
+                    }}>
+                      <div className="space-y-1.5"><Label htmlFor={`outbound-webhook-edit-name-${subscription.id}`}>{t(($) => $.outbound_webhooks.name)}</Label><Input id={`outbound-webhook-edit-name-${subscription.id}`} value={editName} onChange={(event) => setEditName(event.target.value)} maxLength={100} required /></div>
+                      <div className="space-y-1.5"><Label htmlFor={`outbound-webhook-edit-destination-${subscription.id}`}>{t(($) => $.outbound_webhooks.destination)}</Label><Input id={`outbound-webhook-edit-destination-${subscription.id}`} type="url" value={editDestination} onChange={(event) => setEditDestination(event.target.value)} placeholder={t(($) => $.outbound_webhooks.destination_unchanged)} /></div>
+                      <EventSelection selected={editEvents} onChange={setEditEvents} />
+                      <div className="flex gap-2"><Button type="submit" disabled={editEvents.length === 0 || updateSubscription.isPending}>{t(($) => $.outbound_webhooks.save)}</Button><Button type="button" variant="outline" onClick={() => setEditing(null)}>{t(($) => $.outbound_webhooks.cancel)}</Button></div>
+                    </form>
+                  )}
+                  {selectedSubscriptionId === subscription.id && selectedSubscription.data && (
+                    <dl className="grid gap-2 border-t border-border p-4 text-caption sm:grid-cols-2">
+                      <div><dt className="text-muted-foreground">{t(($) => $.outbound_webhooks.destination_hint)}</dt><dd>{selectedSubscription.data.destinationHint}</dd></div>
+                      <div><dt className="text-muted-foreground">{t(($) => $.outbound_webhooks.secret_hint)}</dt><dd>{selectedSubscription.data.signingSecretHint || "—"}</dd></div>
+                      <div><dt className="text-muted-foreground">{t(($) => $.outbound_webhooks.event_catalog_version)}</dt><dd>{selectedSubscription.data.eventCatalogVersion}</dd></div>
+                      <div><dt className="text-muted-foreground">{t(($) => $.outbound_webhooks.event_selection)}</dt><dd>{selectedSubscription.data.events.join(", ")}</dd></div>
+                      <div><dt className="text-muted-foreground">{t(($) => $.outbound_webhooks.scope)}</dt><dd>{selectedSubscription.data.scopeMode === "workspace" ? t(($) => $.outbound_webhooks.workspace_scope_short) : selectedSubscription.data.scopeMode}</dd></div>
+                    </dl>
                   )}
                 </div>
-                {selectedSubscriptionId === subscription.id && selectedSubscription.data && (
-                  <dl className="grid gap-2 border-t border-border p-4 text-caption sm:grid-cols-2">
-                    <div><dt className="text-muted-foreground">{t(($) => $.outbound_webhooks.destination_hint)}</dt><dd>{selectedSubscription.data.destinationHint}</dd></div>
-                    <div><dt className="text-muted-foreground">{t(($) => $.outbound_webhooks.event_catalog_version)}</dt><dd>{selectedSubscription.data.eventCatalogVersion}</dd></div>
-                    <div><dt className="text-muted-foreground">{t(($) => $.outbound_webhooks.event_selection)}</dt><dd>{selectedSubscription.data.events.join(", ")}</dd></div>
-                    <div><dt className="text-muted-foreground">{t(($) => $.outbound_webhooks.scope)}</dt><dd>{t(($) => $.outbound_webhooks.workspace_scope_short)}</dd></div>
-                    {canManage && (
-                      <div className="space-y-2 sm:col-span-2">
-                        {outboundWebhookEventTypes.map((eventName) => (
-                          <Label key={eventName} className="flex items-center gap-2 font-normal">
-                            <Checkbox
-                              checked={editingEvents.includes(eventName)}
-                              onCheckedChange={(checked) =>
-                                setEditingEvents((current) =>
-                                  checked === true
-                                    ? [...current, eventName].filter((value, index, values) => values.indexOf(value) === index)
-                                    : current.filter((candidate) => candidate !== eventName),
-                                )
-                              }
-                            />
-                            <code>{eventName}</code>
-                          </Label>
-                        ))}
-                        <Button
-                          size="sm"
-                          disabled={editingEvents.length === 0 || updateEvents.isPending}
-                          onClick={() =>
-                            updateEvents.mutate(
-                              { subscriptionId: selectedSubscriptionId, events: editingEvents },
-                              {
-                                onSuccess: () => toast.success(t(($) => $.outbound_webhooks.events_saved)),
-                                onError: () => toast.error(t(($) => $.outbound_webhooks.events_save_failed)),
-                              },
-                            )
-                          }
-                        >
-                          {t(($) => $.outbound_webhooks.save_events)}
-                        </Button>
-                      </div>
-                    )}
-                  </dl>
-                )}
-              </div>
-            ))}
+              );
+            })}
           </div>
         </SettingsCard>
       ) : (

@@ -1206,6 +1206,29 @@ func TestOutboundWebhookMutationPermissionsAndWorkspaceBoundary(t *testing.T) {
 	request.Header.Set("X-User-ID", memberID)
 	testutil.Call(t, h.CreateOutboundWebhook, request).Want(http.StatusForbidden)
 
+	for _, tc := range []struct {
+		name    string
+		method  string
+		suffix  string
+		body    any
+		handler func(http.ResponseWriter, *http.Request)
+	}{
+		{name: "update", method: http.MethodPut, body: map[string]any{"name": "Denied", "events": []string{"issue.created"}, "scope_mode": "workspace"}, handler: h.UpdateOutboundWebhook},
+		{name: "pause", method: http.MethodPost, suffix: "/pause", handler: h.PauseOutboundWebhook},
+		{name: "resume", method: http.MethodPost, suffix: "/resume", handler: h.ResumeOutboundWebhook},
+		{name: "test", method: http.MethodPost, suffix: "/test", handler: h.TestOutboundWebhook},
+		{name: "rotate", method: http.MethodPost, suffix: "/rotate-secret", handler: h.RotateOutboundWebhookSecret},
+		{name: "delete", method: http.MethodDelete, handler: h.DeleteOutboundWebhook},
+	} {
+		t.Run("member cannot "+tc.name, func(t *testing.T) {
+			subscriptionID := uuid.NewString()
+			request := withURLParams(newRequest(tc.method, "/api/workspaces/"+testWorkspaceID+"/outbound-webhooks/"+subscriptionID+tc.suffix, tc.body),
+				"id", testWorkspaceID, "subscriptionId", subscriptionID)
+			request.Header.Set("X-User-ID", memberID)
+			testutil.Call(t, tc.handler, request).Want(http.StatusForbidden)
+		})
+	}
+
 	foreignWorkspaceID := dbfx.Workspace(t, "Outbound Webhook Foreign", "outbound-webhook-foreign-"+uuid.NewString())
 	foreignWorkspaceUUID, err := util.ParseUUID(foreignWorkspaceID)
 	if err != nil {
@@ -1235,6 +1258,9 @@ func TestOutboundWebhookMutationPermissionsAndWorkspaceBoundary(t *testing.T) {
 	get := withURLParams(newRequest(http.MethodGet, "/api/workspaces/"+testWorkspaceID+"/outbound-webhooks/"+created.Subscription.ID, nil),
 		"id", testWorkspaceID, "subscriptionId", created.Subscription.ID)
 	testutil.Call(t, h.GetOutboundWebhook, get).Want(http.StatusNotFound)
+	pause := withURLParams(newRequest(http.MethodPost, "/api/workspaces/"+testWorkspaceID+"/outbound-webhooks/"+created.Subscription.ID+"/pause", nil),
+		"id", testWorkspaceID, "subscriptionId", created.Subscription.ID)
+	testutil.Call(t, h.PauseOutboundWebhook, pause).Want(http.StatusNotFound)
 }
 
 func TestOutboundWebhookDeleteWaitsForCaptureAndSweepsItsDelivery(t *testing.T) {
@@ -1286,6 +1312,7 @@ func TestOutboundWebhookDeleteWaitsForCaptureAndSweepsItsDelivery(t *testing.T) 
 	if _, err := captureQueries.CreateOutboundWebhookDelivery(context.Background(), db.CreateOutboundWebhookDeliveryParams{
 		EventID: eventID, SubscriptionID: subscriptionID, WorkspaceID: workspaceID,
 		EventType: outwebhook.EventIssueCreated, RequestBody: []byte(`{"version":1}`), MaxPending: 1,
+		SigningSecretCiphertext: []byte("test-only"), DestinationCiphertext: []byte("test-only"), SecretVersion: 1,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -1361,6 +1388,7 @@ func TestWorkspaceDeleteFencePreventsLateOutboundWebhookDelivery(t *testing.T) {
 	if _, err := captureQueries.CreateOutboundWebhookDelivery(context.Background(), db.CreateOutboundWebhookDeliveryParams{
 		EventID: eventID, SubscriptionID: subscriptionID, WorkspaceID: workspaceID,
 		EventType: outwebhook.EventIssueCreated, RequestBody: []byte(`{"version":1}`), MaxPending: 1,
+		SigningSecretCiphertext: []byte("test-only"), DestinationCiphertext: []byte("test-only"), SecretVersion: 1,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -1418,5 +1446,146 @@ func TestOutboundWebhooksFailClosedWithoutEncryptionKey(t *testing.T) {
 		}), "id", testWorkspaceID)).Want(http.StatusServiceUnavailable).Text()
 	if !strings.Contains(body, "not configured") {
 		t.Fatalf("unexpected response: %s", body)
+	}
+	var listed struct {
+		Subscriptions       []outwebhook.Subscription `json:"subscriptions"`
+		CapabilityAvailable bool                      `json:"capability_available"`
+	}
+	testutil.Call(t, h.ListOutboundWebhooks,
+		withURLParam(newRequest(http.MethodGet, "/api/workspaces/"+testWorkspaceID+"/outbound-webhooks", nil), "id", testWorkspaceID)).Want(http.StatusOK).JSON(&listed)
+	if listed.CapabilityAvailable || len(listed.Subscriptions) != 0 {
+		t.Fatalf("unavailable capability response was unsafe: %+v", listed)
+	}
+}
+
+func TestOutboundWebhookLifecycleKeepsSecretsOneTimeAndTestsThroughPersistedDelivery(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database unavailable")
+	}
+	received := make(chan receivedOutboundWebhook, 1)
+	receiver := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		received <- receivedOutboundWebhook{body: body, header: r.Header.Clone()}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer receiver.Close()
+
+	box, err := secretbox.New([]byte("0123456789abcdef0123456789abcdef"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	queries := db.New(testPool)
+	bus := events.New()
+	outbound := outwebhook.New(queries, testPool, box, []string{receiver.URL}, outwebhook.WithHTTPClient(receiver.Client()))
+	h := New(queries, testPool, testHandler.Hub, bus, service.NewEmailService(), nil, nil, analytics.NoopClient{}, Config{AllowSignup: true})
+	h.OutboundWebhooks = outbound
+
+	var created struct {
+		Subscription  outwebhook.Subscription `json:"subscription"`
+		SigningSecret string                  `json:"signing_secret"`
+	}
+	testutil.Call(t, h.CreateOutboundWebhook,
+		withURLParam(newRequest(http.MethodPost, "/api/workspaces/"+testWorkspaceID+"/outbound-webhooks", map[string]any{
+			"name": "Lifecycle receiver", "destination": receiver.URL + "/events",
+			"events": []string{"issue.created"}, "scope_mode": "workspace",
+		}), "id", testWorkspaceID)).Want(http.StatusCreated).JSON(&created)
+	subscriptionID := created.Subscription.ID
+	t.Cleanup(func() {
+		_, _ = testPool.Exec(context.Background(), `DELETE FROM outbound_webhook_delivery WHERE subscription_id = $1`, subscriptionID)
+		_, _ = testPool.Exec(context.Background(), `DELETE FROM outbound_webhook_subscription WHERE id = $1`, subscriptionID)
+		outbound.Close()
+		outbound.WaitWithTimeout(time.Second)
+	})
+
+	params := func(method, suffix string, body any) *http.Request {
+		return withURLParams(newRequest(method, "/api/workspaces/"+testWorkspaceID+"/outbound-webhooks/"+subscriptionID+suffix, body),
+			"id", testWorkspaceID, "subscriptionId", subscriptionID)
+	}
+	var paused outwebhook.Subscription
+	testutil.Call(t, h.PauseOutboundWebhook, params(http.MethodPost, "/pause", nil)).Want(http.StatusOK).JSON(&paused)
+	if paused.Status != "paused" || paused.PauseReason == nil || *paused.PauseReason != "manual" {
+		t.Fatalf("manual pause was not represented safely: %+v", paused)
+	}
+
+	var tested outwebhook.TestResult
+	testutil.Call(t, h.TestOutboundWebhook, params(http.MethodPost, "/test", nil)).Want(http.StatusAccepted).JSON(&tested)
+	if tested.DeliveryID == "" || tested.EventID == "" || tested.State != "pending" {
+		t.Fatalf("synthetic delivery was not persisted: %+v", tested)
+	}
+
+	var rotated struct {
+		Subscription  outwebhook.Subscription `json:"subscription"`
+		SigningSecret string                  `json:"signing_secret"`
+	}
+	testutil.Call(t, h.RotateOutboundWebhookSecret, params(http.MethodPost, "/rotate-secret", nil)).Want(http.StatusOK).JSON(&rotated)
+	if rotated.SigningSecret == "" || rotated.SigningSecret == created.SigningSecret || rotated.Subscription.SecretVersion != 2 {
+		t.Fatalf("rotation did not disclose exactly one new version: %+v", rotated)
+	}
+
+	listBody := testutil.Call(t, h.ListOutboundWebhooks,
+		withURLParam(newRequest(http.MethodGet, "/api/workspaces/"+testWorkspaceID+"/outbound-webhooks", nil), "id", testWorkspaceID)).Want(http.StatusOK).Text()
+	if strings.Contains(listBody, created.SigningSecret) || strings.Contains(listBody, rotated.SigningSecret) || strings.Contains(listBody, "/events") {
+		t.Fatalf("normal reads exposed a secret or destination path: %s", listBody)
+	}
+
+	outbound.Register(bus)
+	var got receivedOutboundWebhook
+	select {
+	case got = <-received:
+	case <-time.After(5 * time.Second):
+		t.Fatal("paused subscription test did not use the normal dispatcher")
+	}
+	if got.header.Get("X-Multica-Event") != outwebhook.EventWebhookTest || got.header.Get("X-Multica-Delivery-ID") != tested.DeliveryID {
+		t.Fatalf("unexpected synthetic request: event=%q delivery=%q", got.header.Get("X-Multica-Event"), got.header.Get("X-Multica-Delivery-ID"))
+	}
+	signatureFor := func(secret string) string {
+		mac := hmac.New(sha256.New, []byte(secret))
+		mac.Write([]byte(got.header.Get("X-Multica-Timestamp")))
+		mac.Write([]byte("."))
+		mac.Write(got.body)
+		return "v1=" + hex.EncodeToString(mac.Sum(nil))
+	}
+	if got.header.Get("X-Multica-Signature") != signatureFor(created.SigningSecret) || got.header.Get("X-Multica-Signature") == signatureFor(rotated.SigningSecret) {
+		t.Fatal("automatic delivery did not retain the signing secret version captured with its body")
+	}
+
+	var issue struct {
+		ID string `json:"id"`
+	}
+	testutil.Call(t, h.CreateIssue, newRequest(http.MethodPost, "/api/issues", map[string]any{"title": "Paused webhook must not capture"})).Want(http.StatusCreated).JSON(&issue)
+	t.Cleanup(func() { _, _ = testPool.Exec(context.Background(), `DELETE FROM issue WHERE id = $1`, issue.ID) })
+	if count := dbfx.Count(t, `SELECT count(*) FROM outbound_webhook_delivery WHERE subscription_id = $1 AND event_type = 'issue.created'`, subscriptionID); count != 0 {
+		t.Fatalf("paused subscription captured %d normal deliveries", count)
+	}
+
+	if _, err := testPool.Exec(context.Background(), `UPDATE outbound_webhook_subscription SET pause_reason = 'scope_empty' WHERE id = $1`, subscriptionID); err != nil {
+		t.Fatal(err)
+	}
+	testutil.Call(t, h.ResumeOutboundWebhook, params(http.MethodPost, "/resume", nil)).Want(http.StatusBadRequest)
+	if _, err := testPool.Exec(context.Background(), `UPDATE outbound_webhook_subscription SET pause_reason = 'manual' WHERE id = $1`, subscriptionID); err != nil {
+		t.Fatal(err)
+	}
+	var resumed outwebhook.Subscription
+	testutil.Call(t, h.ResumeOutboundWebhook, params(http.MethodPost, "/resume", nil)).Want(http.StatusOK).JSON(&resumed)
+	if resumed.Status != "active" || resumed.PauseReason != nil {
+		t.Fatalf("subscription did not resume: %+v", resumed)
+	}
+	allEvents := []string{"issue.created", "issue.status_changed", "issue.assignee_changed", "issue.priority_changed", "issue.project_changed", "comment.created", "comment.updated", "comment.deleted"}
+	var updated outwebhook.Subscription
+	testutil.Call(t, h.UpdateOutboundWebhook, params(http.MethodPut, "", map[string]any{
+		"name": "Updated lifecycle receiver", "events": allEvents, "scope_mode": "workspace",
+	})).Want(http.StatusOK).JSON(&updated)
+	if updated.Name != "Updated lifecycle receiver" || len(updated.Events) != len(allEvents) {
+		t.Fatalf("configuration update lost explicit event selection: %+v", updated)
+	}
+
+	foreignID := uuid.NewString()
+	foreignRequest := withURLParams(newRequest(http.MethodPost, "/api/workspaces/"+testWorkspaceID+"/outbound-webhooks/"+foreignID+"/pause", nil),
+		"id", testWorkspaceID, "subscriptionId", foreignID)
+	testutil.Call(t, h.PauseOutboundWebhook, foreignRequest).Want(http.StatusNotFound)
+
+	testutil.Call(t, h.DeleteOutboundWebhook, params(http.MethodDelete, "", nil)).Want(http.StatusNoContent)
+	if count := dbfx.Count(t, `SELECT count(*) FROM outbound_webhook_delivery WHERE subscription_id = $1`, subscriptionID); count != 0 {
+		t.Fatalf("delete left %d retained deliveries", count)
 	}
 }

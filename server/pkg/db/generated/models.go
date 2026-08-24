@@ -960,22 +960,25 @@ type NotificationPreference struct {
 }
 
 type OutboundWebhookDelivery struct {
-	ID             pgtype.UUID        `json:"id"`
-	EventID        pgtype.UUID        `json:"event_id"`
-	SubscriptionID pgtype.UUID        `json:"subscription_id"`
-	WorkspaceID    pgtype.UUID        `json:"workspace_id"`
-	EventType      string             `json:"event_type"`
-	RequestBody    []byte             `json:"request_body"`
-	State          string             `json:"state"`
-	AttemptCount   int32              `json:"attempt_count"`
-	ResponseStatus pgtype.Int4        `json:"response_status"`
-	FailureReason  pgtype.Text        `json:"failure_reason"`
-	CreatedAt      pgtype.Timestamptz `json:"created_at"`
-	CompletedAt    pgtype.Timestamptz `json:"completed_at"`
-	NextAttemptAt  pgtype.Timestamptz `json:"next_attempt_at"`
-	LeaseToken     pgtype.UUID        `json:"lease_token"`
-	LeaseExpiresAt pgtype.Timestamptz `json:"lease_expires_at"`
-	LastAttemptAt  pgtype.Timestamptz `json:"last_attempt_at"`
+	ID                      pgtype.UUID        `json:"id"`
+	EventID                 pgtype.UUID        `json:"event_id"`
+	SubscriptionID          pgtype.UUID        `json:"subscription_id"`
+	WorkspaceID             pgtype.UUID        `json:"workspace_id"`
+	EventType               string             `json:"event_type"`
+	RequestBody             []byte             `json:"request_body"`
+	State                   string             `json:"state"`
+	AttemptCount            int32              `json:"attempt_count"`
+	ResponseStatus          pgtype.Int4        `json:"response_status"`
+	FailureReason           pgtype.Text        `json:"failure_reason"`
+	CreatedAt               pgtype.Timestamptz `json:"created_at"`
+	CompletedAt             pgtype.Timestamptz `json:"completed_at"`
+	NextAttemptAt           pgtype.Timestamptz `json:"next_attempt_at"`
+	LeaseToken              pgtype.UUID        `json:"lease_token"`
+	LeaseExpiresAt          pgtype.Timestamptz `json:"lease_expires_at"`
+	LastAttemptAt           pgtype.Timestamptz `json:"last_attempt_at"`
+	SigningSecretCiphertext []byte             `json:"signing_secret_ciphertext"`
+	DestinationCiphertext   []byte             `json:"destination_ciphertext"`
+	SecretVersion           int32              `json:"secret_version"`
 }
 
 type OutboundWebhookSubscription struct {
@@ -994,6 +997,8 @@ type OutboundWebhookSubscription struct {
 	Status                      string             `json:"status"`
 	PauseReason                 pgtype.Text        `json:"pause_reason"`
 	ConsecutiveTerminalFailures int32              `json:"consecutive_terminal_failures"`
+	SigningSecretHint           string             `json:"signing_secret_hint"`
+	SecretVersion               int32              `json:"secret_version"`
 }
 
 type PersonalAccessToken struct {

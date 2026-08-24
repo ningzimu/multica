@@ -62,8 +62,11 @@ import {
   EMPTY_PLUGIN_INSTALLATION_LIST,
   EMPTY_PLUGIN_PREVIEW,
   ListOutboundWebhookSubscriptionsResponseSchema,
+  OutboundWebhookSubscriptionSchema,
   EMPTY_LIST_OUTBOUND_WEBHOOK_SUBSCRIPTIONS,
   CreateOutboundWebhookSubscriptionResponseSchema,
+  RotateOutboundWebhookSecretResponseSchema,
+  TestOutboundWebhookSubscriptionResponseSchema,
   EMPTY_CREATE_OUTBOUND_WEBHOOK_SUBSCRIPTION,
 } from "./schemas";
 import { IssueViewSchema, IssueViewListSchema } from "./schemas";
@@ -132,6 +135,44 @@ describe("outbound webhook schemas", () => {
       { endpoint: "POST /api/workspaces/:id/outbound-webhooks" },
     );
     expect(parsed).toEqual(EMPTY_CREATE_OUTBOUND_WEBHOOK_SUBSCRIPTION);
+  });
+
+  it.each([
+    "PUT /api/workspaces/:id/outbound-webhooks/:subscriptionId",
+    "POST /api/workspaces/:id/outbound-webhooks/:subscriptionId/pause",
+    "POST /api/workspaces/:id/outbound-webhooks/:subscriptionId/resume",
+  ])("fails closed when %s returns a malformed subscription", (endpoint) => {
+    const parsed = parseWithFallback(
+      { ...subscription, id: 42 },
+      OutboundWebhookSubscriptionSchema,
+      EMPTY_CREATE_OUTBOUND_WEBHOOK_SUBSCRIPTION.subscription,
+      { endpoint },
+    );
+    expect(parsed).toEqual(EMPTY_CREATE_OUTBOUND_WEBHOOK_SUBSCRIPTION.subscription);
+    expect(parsed.status).toBe("paused");
+  });
+
+  it("fails closed when rotate omits the newly disclosed one-time secret", () => {
+    const parsed = parseWithFallback(
+      { subscription },
+      RotateOutboundWebhookSecretResponseSchema,
+      EMPTY_CREATE_OUTBOUND_WEBHOOK_SUBSCRIPTION,
+      { endpoint: "POST /api/workspaces/:id/outbound-webhooks/:subscriptionId/rotate-secret" },
+    );
+    expect(parsed).toEqual(EMPTY_CREATE_OUTBOUND_WEBHOOK_SUBSCRIPTION);
+    expect(parsed.signingSecret).toBe("");
+  });
+
+  it("does not treat a malformed test response as a queued delivery", () => {
+    const fallback = { deliveryId: "", eventId: "", state: "pending" as const };
+    const parsed = parseWithFallback(
+      { delivery_id: "delivery-1", state: "pending" },
+      TestOutboundWebhookSubscriptionResponseSchema,
+      fallback,
+      { endpoint: "POST /api/workspaces/:id/outbound-webhooks/:subscriptionId/test" },
+    );
+    expect(parsed).toEqual(fallback);
+    expect(parsed.deliveryId).toBe("");
   });
 });
 

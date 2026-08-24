@@ -8,6 +8,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/integrations/outwebhook"
 )
 
@@ -18,8 +19,11 @@ type createOutboundWebhookRequest struct {
 	ScopeMode   string   `json:"scope_mode"`
 }
 
-type updateOutboundWebhookEventsRequest struct {
-	Events []string `json:"events"`
+type updateOutboundWebhookRequest struct {
+	Name        string   `json:"name"`
+	Destination *string  `json:"destination"`
+	Events      []string `json:"events"`
+	ScopeMode   string   `json:"scope_mode"`
 }
 
 func (h *Handler) outboundWebhooksAvailable(w http.ResponseWriter) bool {
@@ -31,14 +35,15 @@ func (h *Handler) outboundWebhooksAvailable(w http.ResponseWriter) bool {
 }
 
 func (h *Handler) ListOutboundWebhooks(w http.ResponseWriter, r *http.Request) {
-	if !h.outboundWebhooksAvailable(w) {
-		return
-	}
 	workspaceID, ok := parseUUIDOrBadRequest(w, chi.URLParam(r, "id"), "workspace_id")
 	if !ok {
 		return
 	}
 	if _, ok := h.requireWorkspaceMember(w, r, chi.URLParam(r, "id"), "workspace not found"); !ok {
+		return
+	}
+	if h.OutboundWebhooks == nil || !h.OutboundWebhooks.Available() {
+		writeJSON(w, http.StatusOK, map[string]any{"subscriptions": []outwebhook.Subscription{}, "capability_available": false})
 		return
 	}
 	items, err := h.OutboundWebhooks.List(r.Context(), workspaceID)
@@ -46,18 +51,18 @@ func (h *Handler) ListOutboundWebhooks(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to list outbound webhooks")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"subscriptions": items})
+	writeJSON(w, http.StatusOK, map[string]any{"subscriptions": items, "capability_available": true})
 }
 
 func (h *Handler) GetOutboundWebhook(w http.ResponseWriter, r *http.Request) {
-	if !h.outboundWebhooksAvailable(w) {
-		return
-	}
 	workspaceID, ok := parseUUIDOrBadRequest(w, chi.URLParam(r, "id"), "workspace_id")
 	if !ok {
 		return
 	}
 	if _, ok := h.requireWorkspaceMember(w, r, chi.URLParam(r, "id"), "workspace not found"); !ok {
+		return
+	}
+	if !h.outboundWebhooksAvailable(w) {
 		return
 	}
 	subscriptionID, ok := parseUUIDOrBadRequest(w, chi.URLParam(r, "subscriptionId"), "subscription_id")
@@ -77,14 +82,14 @@ func (h *Handler) GetOutboundWebhook(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) CreateOutboundWebhook(w http.ResponseWriter, r *http.Request) {
-	if !h.outboundWebhooksAvailable(w) {
-		return
-	}
 	workspaceID, ok := parseUUIDOrBadRequest(w, chi.URLParam(r, "id"), "workspace_id")
 	if !ok {
 		return
 	}
 	if _, ok := h.requireWorkspaceRole(w, r, chi.URLParam(r, "id"), "workspace not found", "owner", "admin"); !ok {
+		return
+	}
+	if !h.outboundWebhooksAvailable(w) {
 		return
 	}
 	userID, ok := requireUserID(w, r)
@@ -121,53 +126,15 @@ func (h *Handler) CreateOutboundWebhook(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, http.StatusCreated, result)
 }
 
-func (h *Handler) UpdateOutboundWebhookEvents(w http.ResponseWriter, r *http.Request) {
-	if !h.outboundWebhooksAvailable(w) {
-		return
-	}
-	workspaceID, ok := parseUUIDOrBadRequest(w, chi.URLParam(r, "id"), "workspace_id")
-	if !ok {
-		return
-	}
-	if _, ok := h.requireWorkspaceRole(w, r, chi.URLParam(r, "id"), "workspace not found", "owner", "admin"); !ok {
-		return
-	}
-	subscriptionID, ok := parseUUIDOrBadRequest(w, chi.URLParam(r, "subscriptionId"), "subscription_id")
-	if !ok {
-		return
-	}
-	var request updateOutboundWebhookEventsRequest
-	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-	item, err := h.OutboundWebhooks.UpdateEvents(r.Context(), outwebhook.UpdateEventsInput{
-		WorkspaceID: workspaceID, SubscriptionID: subscriptionID, Events: request.Events,
-	})
-	if errors.Is(err, pgx.ErrNoRows) {
-		writeError(w, http.StatusNotFound, "outbound webhook not found")
-		return
-	}
-	if errors.Is(err, outwebhook.ErrInvalidInput) {
-		writeError(w, http.StatusBadRequest, "invalid outbound webhook event selection")
-		return
-	}
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to update outbound webhook")
-		return
-	}
-	writeJSON(w, http.StatusOK, item)
-}
-
 func (h *Handler) DeleteOutboundWebhook(w http.ResponseWriter, r *http.Request) {
-	if !h.outboundWebhooksAvailable(w) {
-		return
-	}
 	workspaceID, ok := parseUUIDOrBadRequest(w, chi.URLParam(r, "id"), "workspace_id")
 	if !ok {
 		return
 	}
 	if _, ok := h.requireWorkspaceRole(w, r, chi.URLParam(r, "id"), "workspace not found", "owner", "admin"); !ok {
+		return
+	}
+	if !h.outboundWebhooksAvailable(w) {
 		return
 	}
 	subscriptionID, ok := parseUUIDOrBadRequest(w, chi.URLParam(r, "subscriptionId"), "subscription_id")
@@ -184,4 +151,122 @@ func (h *Handler) DeleteOutboundWebhook(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *Handler) UpdateOutboundWebhook(w http.ResponseWriter, r *http.Request) {
+	workspaceID, subscriptionID, ok := h.requireOutboundWebhookMutation(w, r)
+	if !ok {
+		return
+	}
+	var request updateOutboundWebhookRequest
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	item, err := h.OutboundWebhooks.Update(r.Context(), outwebhook.UpdateInput{
+		WorkspaceID: workspaceID, ID: subscriptionID, Name: request.Name,
+		Destination: request.Destination, Events: request.Events, ScopeMode: request.ScopeMode,
+	})
+	h.writeOutboundWebhookMutationResult(w, item, err, "update")
+}
+
+func (h *Handler) PauseOutboundWebhook(w http.ResponseWriter, r *http.Request) {
+	workspaceID, subscriptionID, ok := h.requireOutboundWebhookMutation(w, r)
+	if !ok {
+		return
+	}
+	item, err := h.OutboundWebhooks.Pause(r.Context(), workspaceID, subscriptionID)
+	h.writeOutboundWebhookMutationResult(w, item, err, "pause")
+}
+
+func (h *Handler) ResumeOutboundWebhook(w http.ResponseWriter, r *http.Request) {
+	workspaceID, subscriptionID, ok := h.requireOutboundWebhookMutation(w, r)
+	if !ok {
+		return
+	}
+	item, err := h.OutboundWebhooks.Resume(r.Context(), workspaceID, subscriptionID)
+	h.writeOutboundWebhookMutationResult(w, item, err, "resume")
+}
+
+func (h *Handler) TestOutboundWebhook(w http.ResponseWriter, r *http.Request) {
+	workspaceID, subscriptionID, ok := h.requireOutboundWebhookMutation(w, r)
+	if !ok {
+		return
+	}
+	userID, ok := requireUserID(w, r)
+	if !ok {
+		return
+	}
+	actorID, ok := parseUUIDOrBadRequest(w, userID, "user_id")
+	if !ok {
+		return
+	}
+	result, err := h.OutboundWebhooks.Test(r.Context(), outwebhook.TestInput{
+		WorkspaceID: workspaceID, ID: subscriptionID, ActorID: actorID,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "outbound webhook not found")
+		return
+	}
+	if errors.Is(err, outwebhook.ErrInvalidInput) {
+		writeError(w, http.StatusBadRequest, "outbound webhook test is unavailable")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to test outbound webhook")
+		return
+	}
+	writeJSON(w, http.StatusAccepted, result)
+}
+
+func (h *Handler) RotateOutboundWebhookSecret(w http.ResponseWriter, r *http.Request) {
+	workspaceID, subscriptionID, ok := h.requireOutboundWebhookMutation(w, r)
+	if !ok {
+		return
+	}
+	result, err := h.OutboundWebhooks.RotateSecret(r.Context(), workspaceID, subscriptionID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "outbound webhook not found")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to rotate outbound webhook secret")
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (h *Handler) requireOutboundWebhookMutation(w http.ResponseWriter, r *http.Request) (pgtype.UUID, pgtype.UUID, bool) {
+	workspaceID, ok := parseUUIDOrBadRequest(w, chi.URLParam(r, "id"), "workspace_id")
+	if !ok {
+		return pgtype.UUID{}, pgtype.UUID{}, false
+	}
+	if _, ok := h.requireWorkspaceRole(w, r, chi.URLParam(r, "id"), "workspace not found", "owner", "admin"); !ok {
+		return pgtype.UUID{}, pgtype.UUID{}, false
+	}
+	if !h.outboundWebhooksAvailable(w) {
+		return pgtype.UUID{}, pgtype.UUID{}, false
+	}
+	subscriptionID, ok := parseUUIDOrBadRequest(w, chi.URLParam(r, "subscriptionId"), "subscription_id")
+	if !ok {
+		return pgtype.UUID{}, pgtype.UUID{}, false
+	}
+	return workspaceID, subscriptionID, true
+}
+
+func (h *Handler) writeOutboundWebhookMutationResult(w http.ResponseWriter, item outwebhook.Subscription, err error, action string) {
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "outbound webhook not found")
+		return
+	}
+	if errors.Is(err, outwebhook.ErrInvalidInput) {
+		writeError(w, http.StatusBadRequest, "invalid outbound webhook subscription")
+		return
+	}
+	if err != nil {
+		slog.Error(action+" outbound webhook failed", "error", err)
+		writeError(w, http.StatusInternalServerError, "failed to "+action+" outbound webhook")
+		return
+	}
+	writeJSON(w, http.StatusOK, item)
 }

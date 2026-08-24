@@ -86,6 +86,8 @@ import type {
   OutboundWebhookSubscription,
   ListOutboundWebhookSubscriptionsResponse,
   CreateOutboundWebhookSubscriptionResponse,
+  RotateOutboundWebhookSecretResponse,
+  TestOutboundWebhookSubscriptionResponse,
 } from "../types";
 import type { CloudRuntimeNode } from "../runtimes/cloud-runtime";
 import type { CreateFeedbackResponse } from "../feedback/types";
@@ -366,9 +368,14 @@ export const OutboundWebhookSubscriptionSchema = z
     destination_hint: z.string(),
     events: z.array(z.string()).default([]),
     event_catalog_version: z.number().default(1),
-    scope_mode: z.literal("workspace").default("workspace"),
-    status: z.enum(["active", "paused"]).catch("paused").default("active"),
-    pause_reason: z.string().nullable().default(null),
+    scope_mode: z.enum(["workspace", "projects"]).catch("workspace"),
+    status: z.enum(["active", "paused"]).default("active").catch("paused"),
+    pause_reason: z
+      .enum(["manual", "scope_empty", "failure_threshold"])
+      .nullable()
+      .catch(null),
+    signing_secret_hint: z.string().default(""),
+    secret_version: z.number().int().positive().default(1),
     consecutive_terminal_failures: z.number().int().nonnegative().default(0),
     created_at: z.string(),
     updated_at: z.string(),
@@ -386,6 +393,8 @@ export const OutboundWebhookSubscriptionSchema = z
       status: value.status,
       pauseReason: value.pause_reason,
       consecutiveTerminalFailures: value.consecutive_terminal_failures,
+      signingSecretHint: value.signing_secret_hint,
+      secretVersion: value.secret_version,
       createdAt: value.created_at,
       updatedAt: value.updated_at,
     }),
@@ -393,7 +402,11 @@ export const OutboundWebhookSubscriptionSchema = z
 
 export const ListOutboundWebhookSubscriptionsResponseSchema = z.object({
   subscriptions: z.array(OutboundWebhookSubscriptionSchema).default([]),
-}).loose();
+  capability_available: z.boolean().default(true),
+}).loose().transform((value): ListOutboundWebhookSubscriptionsResponse => ({
+  subscriptions: value.subscriptions,
+  capabilityAvailable: value.capability_available,
+}));
 
 export const CreateOutboundWebhookSubscriptionResponseSchema = z
   .object({
@@ -408,13 +421,34 @@ export const CreateOutboundWebhookSubscriptionResponseSchema = z
     }),
   );
 
+export const RotateOutboundWebhookSecretResponseSchema =
+  CreateOutboundWebhookSubscriptionResponseSchema.transform(
+    (value): RotateOutboundWebhookSecretResponse => value,
+  );
+
+export const TestOutboundWebhookSubscriptionResponseSchema = z
+  .object({
+    delivery_id: z.string(),
+    event_id: z.string(),
+    state: z.literal("pending"),
+  })
+  .loose()
+  .transform(
+    (value): TestOutboundWebhookSubscriptionResponse => ({
+      deliveryId: value.delivery_id,
+      eventId: value.event_id,
+      state: value.state,
+    }),
+  );
+
 export const EMPTY_OUTBOUND_WEBHOOK_SUBSCRIPTION: OutboundWebhookSubscription = {
   id: "", workspaceId: "", name: "", destinationHint: "", events: [],
-  eventCatalogVersion: 1, scopeMode: "workspace", status: "active", pauseReason: null,
-  consecutiveTerminalFailures: 0, createdAt: "", updatedAt: "",
+  eventCatalogVersion: 1, scopeMode: "workspace", createdAt: "", updatedAt: "",
+  status: "paused", pauseReason: null, consecutiveTerminalFailures: 0,
+  signingSecretHint: "", secretVersion: 1,
 };
 
-export const EMPTY_LIST_OUTBOUND_WEBHOOK_SUBSCRIPTIONS: ListOutboundWebhookSubscriptionsResponse = { subscriptions: [] };
+export const EMPTY_LIST_OUTBOUND_WEBHOOK_SUBSCRIPTIONS: ListOutboundWebhookSubscriptionsResponse = { subscriptions: [], capabilityAvailable: false };
 export const EMPTY_CREATE_OUTBOUND_WEBHOOK_SUBSCRIPTION: CreateOutboundWebhookSubscriptionResponse = {
   subscription: EMPTY_OUTBOUND_WEBHOOK_SUBSCRIPTION,
   signingSecret: "",

@@ -21,7 +21,7 @@ WITH candidate AS (
       AND delivery.next_attempt_at <= now()
       AND (delivery.lease_expires_at IS NULL OR delivery.lease_expires_at <= now())
       AND delivery.attempt_count < $2::integer
-      AND subscription.status = 'active'
+      AND (subscription.status = 'active' OR delivery.event_type = 'webhook.test')
       AND (
           SELECT count(*) FROM outbound_webhook_delivery AS globally_leased
           WHERE globally_leased.state = 'pending'
@@ -46,7 +46,7 @@ SET lease_token = gen_random_uuid(),
     last_attempt_at = now()
 FROM candidate
 WHERE delivery.id = candidate.id
-RETURNING delivery.id, delivery.event_id, delivery.subscription_id, delivery.workspace_id, delivery.event_type, delivery.request_body, delivery.state, delivery.attempt_count, delivery.response_status, delivery.failure_reason, delivery.created_at, delivery.completed_at, delivery.next_attempt_at, delivery.lease_token, delivery.lease_expires_at, delivery.last_attempt_at
+RETURNING delivery.id, delivery.event_id, delivery.subscription_id, delivery.workspace_id, delivery.event_type, delivery.request_body, delivery.state, delivery.attempt_count, delivery.response_status, delivery.failure_reason, delivery.created_at, delivery.completed_at, delivery.next_attempt_at, delivery.lease_token, delivery.lease_expires_at, delivery.last_attempt_at, delivery.signing_secret_ciphertext, delivery.destination_ciphertext, delivery.secret_version
 `
 
 type ClaimDueOutboundWebhookDeliveryParams struct {
@@ -81,29 +81,36 @@ func (q *Queries) ClaimDueOutboundWebhookDelivery(ctx context.Context, arg Claim
 		&i.LeaseToken,
 		&i.LeaseExpiresAt,
 		&i.LastAttemptAt,
+		&i.SigningSecretCiphertext,
+		&i.DestinationCiphertext,
+		&i.SecretVersion,
 	)
 	return i, err
 }
 
 const createOutboundWebhookDelivery = `-- name: CreateOutboundWebhookDelivery :one
 INSERT INTO outbound_webhook_delivery (
-    event_id, subscription_id, workspace_id, event_type, request_body
-) SELECT $1, $2, $3, $4, $5
+    event_id, subscription_id, workspace_id, event_type, request_body,
+    signing_secret_ciphertext, destination_ciphertext, secret_version
+) SELECT $1, $2, $3, $4, $5, $6, $7, $8
 WHERE (
     SELECT count(*)
     FROM outbound_webhook_delivery AS existing
     WHERE existing.subscription_id = $2 AND existing.state = 'pending'
-) < $6::bigint
-RETURNING id, event_id, subscription_id, workspace_id, event_type, request_body, state, attempt_count, response_status, failure_reason, created_at, completed_at, next_attempt_at, lease_token, lease_expires_at, last_attempt_at
+) < $9::bigint
+RETURNING id, event_id, subscription_id, workspace_id, event_type, request_body, state, attempt_count, response_status, failure_reason, created_at, completed_at, next_attempt_at, lease_token, lease_expires_at, last_attempt_at, signing_secret_ciphertext, destination_ciphertext, secret_version
 `
 
 type CreateOutboundWebhookDeliveryParams struct {
-	EventID        pgtype.UUID `json:"event_id"`
-	SubscriptionID pgtype.UUID `json:"subscription_id"`
-	WorkspaceID    pgtype.UUID `json:"workspace_id"`
-	EventType      string      `json:"event_type"`
-	RequestBody    []byte      `json:"request_body"`
-	MaxPending     int64       `json:"max_pending"`
+	EventID                 pgtype.UUID `json:"event_id"`
+	SubscriptionID          pgtype.UUID `json:"subscription_id"`
+	WorkspaceID             pgtype.UUID `json:"workspace_id"`
+	EventType               string      `json:"event_type"`
+	RequestBody             []byte      `json:"request_body"`
+	SigningSecretCiphertext []byte      `json:"signing_secret_ciphertext"`
+	DestinationCiphertext   []byte      `json:"destination_ciphertext"`
+	SecretVersion           int32       `json:"secret_version"`
+	MaxPending              int64       `json:"max_pending"`
 }
 
 func (q *Queries) CreateOutboundWebhookDelivery(ctx context.Context, arg CreateOutboundWebhookDeliveryParams) (OutboundWebhookDelivery, error) {
@@ -113,6 +120,9 @@ func (q *Queries) CreateOutboundWebhookDelivery(ctx context.Context, arg CreateO
 		arg.WorkspaceID,
 		arg.EventType,
 		arg.RequestBody,
+		arg.SigningSecretCiphertext,
+		arg.DestinationCiphertext,
+		arg.SecretVersion,
 		arg.MaxPending,
 	)
 	var i OutboundWebhookDelivery
@@ -133,6 +143,9 @@ func (q *Queries) CreateOutboundWebhookDelivery(ctx context.Context, arg CreateO
 		&i.LeaseToken,
 		&i.LeaseExpiresAt,
 		&i.LastAttemptAt,
+		&i.SigningSecretCiphertext,
+		&i.DestinationCiphertext,
+		&i.SecretVersion,
 	)
 	return i, err
 }
@@ -140,9 +153,9 @@ func (q *Queries) CreateOutboundWebhookDelivery(ctx context.Context, arg CreateO
 const createOutboundWebhookSubscription = `-- name: CreateOutboundWebhookSubscription :one
 INSERT INTO outbound_webhook_subscription (
     workspace_id, name, destination_ciphertext, secret_ciphertext,
-    destination_hint, events, created_by
-) VALUES ($1, $2, $3, $4, $5, $6, $7)
-RETURNING id, workspace_id, name, destination_ciphertext, secret_ciphertext, destination_hint, events, event_catalog_version, scope_mode, created_by, created_at, updated_at, status, pause_reason, consecutive_terminal_failures
+    destination_hint, events, created_by, signing_secret_hint
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+RETURNING id, workspace_id, name, destination_ciphertext, secret_ciphertext, destination_hint, events, event_catalog_version, scope_mode, created_by, created_at, updated_at, status, pause_reason, consecutive_terminal_failures, signing_secret_hint, secret_version
 `
 
 type CreateOutboundWebhookSubscriptionParams struct {
@@ -153,6 +166,7 @@ type CreateOutboundWebhookSubscriptionParams struct {
 	DestinationHint       string      `json:"destination_hint"`
 	Events                []byte      `json:"events"`
 	CreatedBy             pgtype.UUID `json:"created_by"`
+	SigningSecretHint     string      `json:"signing_secret_hint"`
 }
 
 func (q *Queries) CreateOutboundWebhookSubscription(ctx context.Context, arg CreateOutboundWebhookSubscriptionParams) (OutboundWebhookSubscription, error) {
@@ -164,6 +178,7 @@ func (q *Queries) CreateOutboundWebhookSubscription(ctx context.Context, arg Cre
 		arg.DestinationHint,
 		arg.Events,
 		arg.CreatedBy,
+		arg.SigningSecretHint,
 	)
 	var i OutboundWebhookSubscription
 	err := row.Scan(
@@ -182,6 +197,8 @@ func (q *Queries) CreateOutboundWebhookSubscription(ctx context.Context, arg Cre
 		&i.Status,
 		&i.PauseReason,
 		&i.ConsecutiveTerminalFailures,
+		&i.SigningSecretHint,
+		&i.SecretVersion,
 	)
 	return i, err
 }
@@ -340,41 +357,8 @@ func (q *Queries) FailExhaustedOutboundWebhookDelivery(ctx context.Context, arg 
 	return result.RowsAffected(), nil
 }
 
-const getActiveOutboundWebhookSubscription = `-- name: GetActiveOutboundWebhookSubscription :one
-SELECT id, workspace_id, name, destination_ciphertext, secret_ciphertext, destination_hint, events, event_catalog_version, scope_mode, created_by, created_at, updated_at, status, pause_reason, consecutive_terminal_failures FROM outbound_webhook_subscription
-WHERE workspace_id = $1 AND id = $2 AND status = 'active'
-`
-
-type GetActiveOutboundWebhookSubscriptionParams struct {
-	WorkspaceID pgtype.UUID `json:"workspace_id"`
-	ID          pgtype.UUID `json:"id"`
-}
-
-func (q *Queries) GetActiveOutboundWebhookSubscription(ctx context.Context, arg GetActiveOutboundWebhookSubscriptionParams) (OutboundWebhookSubscription, error) {
-	row := q.db.QueryRow(ctx, getActiveOutboundWebhookSubscription, arg.WorkspaceID, arg.ID)
-	var i OutboundWebhookSubscription
-	err := row.Scan(
-		&i.ID,
-		&i.WorkspaceID,
-		&i.Name,
-		&i.DestinationCiphertext,
-		&i.SecretCiphertext,
-		&i.DestinationHint,
-		&i.Events,
-		&i.EventCatalogVersion,
-		&i.ScopeMode,
-		&i.CreatedBy,
-		&i.CreatedAt,
-		&i.UpdatedAt,
-		&i.Status,
-		&i.PauseReason,
-		&i.ConsecutiveTerminalFailures,
-	)
-	return i, err
-}
-
 const getOutboundWebhookDelivery = `-- name: GetOutboundWebhookDelivery :one
-SELECT id, event_id, subscription_id, workspace_id, event_type, request_body, state, attempt_count, response_status, failure_reason, created_at, completed_at, next_attempt_at, lease_token, lease_expires_at, last_attempt_at FROM outbound_webhook_delivery WHERE id = $1
+SELECT id, event_id, subscription_id, workspace_id, event_type, request_body, state, attempt_count, response_status, failure_reason, created_at, completed_at, next_attempt_at, lease_token, lease_expires_at, last_attempt_at, signing_secret_ciphertext, destination_ciphertext, secret_version FROM outbound_webhook_delivery WHERE id = $1
 `
 
 func (q *Queries) GetOutboundWebhookDelivery(ctx context.Context, id pgtype.UUID) (OutboundWebhookDelivery, error) {
@@ -397,12 +381,15 @@ func (q *Queries) GetOutboundWebhookDelivery(ctx context.Context, id pgtype.UUID
 		&i.LeaseToken,
 		&i.LeaseExpiresAt,
 		&i.LastAttemptAt,
+		&i.SigningSecretCiphertext,
+		&i.DestinationCiphertext,
+		&i.SecretVersion,
 	)
 	return i, err
 }
 
 const getOutboundWebhookSubscription = `-- name: GetOutboundWebhookSubscription :one
-SELECT id, workspace_id, name, destination_ciphertext, secret_ciphertext, destination_hint, events, event_catalog_version, scope_mode, created_by, created_at, updated_at, status, pause_reason, consecutive_terminal_failures FROM outbound_webhook_subscription
+SELECT id, workspace_id, name, destination_ciphertext, secret_ciphertext, destination_hint, events, event_catalog_version, scope_mode, created_by, created_at, updated_at, status, pause_reason, consecutive_terminal_failures, signing_secret_hint, secret_version FROM outbound_webhook_subscription
 WHERE workspace_id = $1 AND id = $2
 `
 
@@ -430,12 +417,14 @@ func (q *Queries) GetOutboundWebhookSubscription(ctx context.Context, arg GetOut
 		&i.Status,
 		&i.PauseReason,
 		&i.ConsecutiveTerminalFailures,
+		&i.SigningSecretHint,
+		&i.SecretVersion,
 	)
 	return i, err
 }
 
 const getOutboundWebhookSubscriptionForUpdate = `-- name: GetOutboundWebhookSubscriptionForUpdate :one
-SELECT id, workspace_id, name, destination_ciphertext, secret_ciphertext, destination_hint, events, event_catalog_version, scope_mode, created_by, created_at, updated_at, status, pause_reason, consecutive_terminal_failures FROM outbound_webhook_subscription
+SELECT id, workspace_id, name, destination_ciphertext, secret_ciphertext, destination_hint, events, event_catalog_version, scope_mode, created_by, created_at, updated_at, status, pause_reason, consecutive_terminal_failures, signing_secret_hint, secret_version FROM outbound_webhook_subscription
 WHERE workspace_id = $1 AND id = $2
 FOR UPDATE
 `
@@ -464,12 +453,14 @@ func (q *Queries) GetOutboundWebhookSubscriptionForUpdate(ctx context.Context, a
 		&i.Status,
 		&i.PauseReason,
 		&i.ConsecutiveTerminalFailures,
+		&i.SigningSecretHint,
+		&i.SecretVersion,
 	)
 	return i, err
 }
 
 const listActiveOutboundWebhookSubscriptionsForEvent = `-- name: ListActiveOutboundWebhookSubscriptionsForEvent :many
-SELECT id, workspace_id, name, destination_ciphertext, secret_ciphertext, destination_hint, events, event_catalog_version, scope_mode, created_by, created_at, updated_at, status, pause_reason, consecutive_terminal_failures FROM outbound_webhook_subscription
+SELECT id, workspace_id, name, destination_ciphertext, secret_ciphertext, destination_hint, events, event_catalog_version, scope_mode, created_by, created_at, updated_at, status, pause_reason, consecutive_terminal_failures, signing_secret_hint, secret_version FROM outbound_webhook_subscription
 WHERE workspace_id = $1
   AND status = 'active'
   AND events ? $2::text
@@ -507,6 +498,8 @@ func (q *Queries) ListActiveOutboundWebhookSubscriptionsForEvent(ctx context.Con
 			&i.Status,
 			&i.PauseReason,
 			&i.ConsecutiveTerminalFailures,
+			&i.SigningSecretHint,
+			&i.SecretVersion,
 		); err != nil {
 			return nil, err
 		}
@@ -519,7 +512,7 @@ func (q *Queries) ListActiveOutboundWebhookSubscriptionsForEvent(ctx context.Con
 }
 
 const listOutboundWebhookSubscriptions = `-- name: ListOutboundWebhookSubscriptions :many
-SELECT id, workspace_id, name, destination_ciphertext, secret_ciphertext, destination_hint, events, event_catalog_version, scope_mode, created_by, created_at, updated_at, status, pause_reason, consecutive_terminal_failures FROM outbound_webhook_subscription
+SELECT id, workspace_id, name, destination_ciphertext, secret_ciphertext, destination_hint, events, event_catalog_version, scope_mode, created_by, created_at, updated_at, status, pause_reason, consecutive_terminal_failures, signing_secret_hint, secret_version FROM outbound_webhook_subscription
 WHERE workspace_id = $1
 ORDER BY created_at ASC
 `
@@ -549,6 +542,8 @@ func (q *Queries) ListOutboundWebhookSubscriptions(ctx context.Context, workspac
 			&i.Status,
 			&i.PauseReason,
 			&i.ConsecutiveTerminalFailures,
+			&i.SigningSecretHint,
+			&i.SecretVersion,
 		); err != nil {
 			return nil, err
 		}
@@ -585,6 +580,43 @@ func (q *Queries) LockWorkspaceForOutboundWebhookCapture(ctx context.Context, id
 	return id_2, err
 }
 
+const pauseOutboundWebhookSubscription = `-- name: PauseOutboundWebhookSubscription :one
+UPDATE outbound_webhook_subscription
+SET status = 'paused', pause_reason = 'manual', updated_at = now()
+WHERE workspace_id = $1 AND id = $2
+RETURNING id, workspace_id, name, destination_ciphertext, secret_ciphertext, destination_hint, events, event_catalog_version, scope_mode, created_by, created_at, updated_at, status, pause_reason, consecutive_terminal_failures, signing_secret_hint, secret_version
+`
+
+type PauseOutboundWebhookSubscriptionParams struct {
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+	ID          pgtype.UUID `json:"id"`
+}
+
+func (q *Queries) PauseOutboundWebhookSubscription(ctx context.Context, arg PauseOutboundWebhookSubscriptionParams) (OutboundWebhookSubscription, error) {
+	row := q.db.QueryRow(ctx, pauseOutboundWebhookSubscription, arg.WorkspaceID, arg.ID)
+	var i OutboundWebhookSubscription
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.Name,
+		&i.DestinationCiphertext,
+		&i.SecretCiphertext,
+		&i.DestinationHint,
+		&i.Events,
+		&i.EventCatalogVersion,
+		&i.ScopeMode,
+		&i.CreatedBy,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.Status,
+		&i.PauseReason,
+		&i.ConsecutiveTerminalFailures,
+		&i.SigningSecretHint,
+		&i.SecretVersion,
+	)
+	return i, err
+}
+
 const releaseClaimedOutboundWebhookDelivery = `-- name: ReleaseClaimedOutboundWebhookDelivery :execrows
 UPDATE outbound_webhook_delivery
 SET lease_token = NULL, lease_expires_at = NULL
@@ -602,6 +634,44 @@ func (q *Queries) ReleaseClaimedOutboundWebhookDelivery(ctx context.Context, arg
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const resumeOutboundWebhookSubscription = `-- name: ResumeOutboundWebhookSubscription :one
+UPDATE outbound_webhook_subscription
+SET status = 'active', pause_reason = NULL,
+    consecutive_terminal_failures = 0, updated_at = now()
+WHERE workspace_id = $1 AND id = $2
+RETURNING id, workspace_id, name, destination_ciphertext, secret_ciphertext, destination_hint, events, event_catalog_version, scope_mode, created_by, created_at, updated_at, status, pause_reason, consecutive_terminal_failures, signing_secret_hint, secret_version
+`
+
+type ResumeOutboundWebhookSubscriptionParams struct {
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+	ID          pgtype.UUID `json:"id"`
+}
+
+func (q *Queries) ResumeOutboundWebhookSubscription(ctx context.Context, arg ResumeOutboundWebhookSubscriptionParams) (OutboundWebhookSubscription, error) {
+	row := q.db.QueryRow(ctx, resumeOutboundWebhookSubscription, arg.WorkspaceID, arg.ID)
+	var i OutboundWebhookSubscription
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.Name,
+		&i.DestinationCiphertext,
+		&i.SecretCiphertext,
+		&i.DestinationHint,
+		&i.Events,
+		&i.EventCatalogVersion,
+		&i.ScopeMode,
+		&i.CreatedBy,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.Status,
+		&i.PauseReason,
+		&i.ConsecutiveTerminalFailures,
+		&i.SigningSecretHint,
+		&i.SecretVersion,
+	)
+	return i, err
 }
 
 const retryClaimedOutboundWebhookDelivery = `-- name: RetryClaimedOutboundWebhookDelivery :execrows
@@ -634,6 +704,53 @@ func (q *Queries) RetryClaimedOutboundWebhookDelivery(ctx context.Context, arg R
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const rotateOutboundWebhookSigningSecret = `-- name: RotateOutboundWebhookSigningSecret :one
+UPDATE outbound_webhook_subscription
+SET secret_ciphertext = $3,
+    signing_secret_hint = $4,
+    secret_version = secret_version + 1,
+    updated_at = now()
+WHERE workspace_id = $1 AND id = $2
+RETURNING id, workspace_id, name, destination_ciphertext, secret_ciphertext, destination_hint, events, event_catalog_version, scope_mode, created_by, created_at, updated_at, status, pause_reason, consecutive_terminal_failures, signing_secret_hint, secret_version
+`
+
+type RotateOutboundWebhookSigningSecretParams struct {
+	WorkspaceID       pgtype.UUID `json:"workspace_id"`
+	ID                pgtype.UUID `json:"id"`
+	SecretCiphertext  []byte      `json:"secret_ciphertext"`
+	SigningSecretHint string      `json:"signing_secret_hint"`
+}
+
+func (q *Queries) RotateOutboundWebhookSigningSecret(ctx context.Context, arg RotateOutboundWebhookSigningSecretParams) (OutboundWebhookSubscription, error) {
+	row := q.db.QueryRow(ctx, rotateOutboundWebhookSigningSecret,
+		arg.WorkspaceID,
+		arg.ID,
+		arg.SecretCiphertext,
+		arg.SigningSecretHint,
+	)
+	var i OutboundWebhookSubscription
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.Name,
+		&i.DestinationCiphertext,
+		&i.SecretCiphertext,
+		&i.DestinationHint,
+		&i.Events,
+		&i.EventCatalogVersion,
+		&i.ScopeMode,
+		&i.CreatedBy,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.Status,
+		&i.PauseReason,
+		&i.ConsecutiveTerminalFailures,
+		&i.SigningSecretHint,
+		&i.SecretVersion,
+	)
+	return i, err
 }
 
 const succeedClaimedOutboundWebhookDelivery = `-- name: SucceedClaimedOutboundWebhookDelivery :execrows
@@ -679,21 +796,38 @@ func (q *Queries) SucceedClaimedOutboundWebhookDelivery(ctx context.Context, arg
 	return result.RowsAffected(), nil
 }
 
-const updateOutboundWebhookSubscriptionEvents = `-- name: UpdateOutboundWebhookSubscriptionEvents :one
+const updateOutboundWebhookSubscription = `-- name: UpdateOutboundWebhookSubscription :one
 UPDATE outbound_webhook_subscription
-SET events = $3, updated_at = now()
+SET name = $3,
+    destination_ciphertext = $4,
+    destination_hint = $5,
+    events = $6,
+    scope_mode = $7,
+    updated_at = now()
 WHERE workspace_id = $1 AND id = $2
-RETURNING id, workspace_id, name, destination_ciphertext, secret_ciphertext, destination_hint, events, event_catalog_version, scope_mode, created_by, created_at, updated_at, status, pause_reason, consecutive_terminal_failures
+RETURNING id, workspace_id, name, destination_ciphertext, secret_ciphertext, destination_hint, events, event_catalog_version, scope_mode, created_by, created_at, updated_at, status, pause_reason, consecutive_terminal_failures, signing_secret_hint, secret_version
 `
 
-type UpdateOutboundWebhookSubscriptionEventsParams struct {
-	WorkspaceID pgtype.UUID `json:"workspace_id"`
-	ID          pgtype.UUID `json:"id"`
-	Events      []byte      `json:"events"`
+type UpdateOutboundWebhookSubscriptionParams struct {
+	WorkspaceID           pgtype.UUID `json:"workspace_id"`
+	ID                    pgtype.UUID `json:"id"`
+	Name                  string      `json:"name"`
+	DestinationCiphertext []byte      `json:"destination_ciphertext"`
+	DestinationHint       string      `json:"destination_hint"`
+	Events                []byte      `json:"events"`
+	ScopeMode             string      `json:"scope_mode"`
 }
 
-func (q *Queries) UpdateOutboundWebhookSubscriptionEvents(ctx context.Context, arg UpdateOutboundWebhookSubscriptionEventsParams) (OutboundWebhookSubscription, error) {
-	row := q.db.QueryRow(ctx, updateOutboundWebhookSubscriptionEvents, arg.WorkspaceID, arg.ID, arg.Events)
+func (q *Queries) UpdateOutboundWebhookSubscription(ctx context.Context, arg UpdateOutboundWebhookSubscriptionParams) (OutboundWebhookSubscription, error) {
+	row := q.db.QueryRow(ctx, updateOutboundWebhookSubscription,
+		arg.WorkspaceID,
+		arg.ID,
+		arg.Name,
+		arg.DestinationCiphertext,
+		arg.DestinationHint,
+		arg.Events,
+		arg.ScopeMode,
+	)
 	var i OutboundWebhookSubscription
 	err := row.Scan(
 		&i.ID,
@@ -711,6 +845,8 @@ func (q *Queries) UpdateOutboundWebhookSubscriptionEvents(ctx context.Context, a
 		&i.Status,
 		&i.PauseReason,
 		&i.ConsecutiveTerminalFailures,
+		&i.SigningSecretHint,
+		&i.SecretVersion,
 	)
 	return i, err
 }

@@ -1,8 +1,8 @@
 -- name: CreateOutboundWebhookSubscription :one
 INSERT INTO outbound_webhook_subscription (
     workspace_id, name, destination_ciphertext, secret_ciphertext,
-    destination_hint, events, created_by
-) VALUES ($1, $2, $3, $4, $5, $6, $7)
+    destination_hint, events, created_by, signing_secret_hint
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 RETURNING *;
 
 -- name: ListOutboundWebhookSubscriptions :many
@@ -27,18 +27,41 @@ SELECT id FROM workspace WHERE id = $1 FOR KEY SHARE;
 SELECT * FROM outbound_webhook_subscription
 WHERE workspace_id = $1 AND id = $2;
 
--- name: GetActiveOutboundWebhookSubscription :one
-SELECT * FROM outbound_webhook_subscription
-WHERE workspace_id = $1 AND id = $2 AND status = 'active';
-
 -- name: GetOutboundWebhookSubscriptionForUpdate :one
 SELECT * FROM outbound_webhook_subscription
 WHERE workspace_id = $1 AND id = $2
 FOR UPDATE;
 
--- name: UpdateOutboundWebhookSubscriptionEvents :one
+-- name: UpdateOutboundWebhookSubscription :one
 UPDATE outbound_webhook_subscription
-SET events = $3, updated_at = now()
+SET name = $3,
+    destination_ciphertext = $4,
+    destination_hint = $5,
+    events = $6,
+    scope_mode = $7,
+    updated_at = now()
+WHERE workspace_id = $1 AND id = $2
+RETURNING *;
+
+-- name: PauseOutboundWebhookSubscription :one
+UPDATE outbound_webhook_subscription
+SET status = 'paused', pause_reason = 'manual', updated_at = now()
+WHERE workspace_id = $1 AND id = $2
+RETURNING *;
+
+-- name: ResumeOutboundWebhookSubscription :one
+UPDATE outbound_webhook_subscription
+SET status = 'active', pause_reason = NULL,
+    consecutive_terminal_failures = 0, updated_at = now()
+WHERE workspace_id = $1 AND id = $2
+RETURNING *;
+
+-- name: RotateOutboundWebhookSigningSecret :one
+UPDATE outbound_webhook_subscription
+SET secret_ciphertext = $3,
+    signing_secret_hint = $4,
+    secret_version = secret_version + 1,
+    updated_at = now()
 WHERE workspace_id = $1 AND id = $2
 RETURNING *;
 
@@ -52,8 +75,9 @@ WHERE workspace_id = $1 AND id = $2;
 
 -- name: CreateOutboundWebhookDelivery :one
 INSERT INTO outbound_webhook_delivery (
-    event_id, subscription_id, workspace_id, event_type, request_body
-) SELECT $1, $2, $3, $4, $5
+    event_id, subscription_id, workspace_id, event_type, request_body,
+    signing_secret_ciphertext, destination_ciphertext, secret_version
+) SELECT $1, $2, $3, $4, $5, $6, $7, $8
 WHERE (
     SELECT count(*)
     FROM outbound_webhook_delivery AS existing
@@ -77,7 +101,7 @@ WITH candidate AS (
       AND delivery.next_attempt_at <= now()
       AND (delivery.lease_expires_at IS NULL OR delivery.lease_expires_at <= now())
       AND delivery.attempt_count < sqlc.arg('max_attempts')::integer
-      AND subscription.status = 'active'
+      AND (subscription.status = 'active' OR delivery.event_type = 'webhook.test')
       AND (
           SELECT count(*) FROM outbound_webhook_delivery AS globally_leased
           WHERE globally_leased.state = 'pending'
