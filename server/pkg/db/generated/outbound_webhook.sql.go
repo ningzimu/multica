@@ -11,28 +11,57 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-const createOutboundWebhookDelivery = `-- name: CreateOutboundWebhookDelivery :one
-INSERT INTO outbound_webhook_delivery (
-    event_id, subscription_id, workspace_id, event_type, request_body
-) VALUES ($1, $2, $3, $4, $5)
-RETURNING id, event_id, subscription_id, workspace_id, event_type, request_body, state, attempt_count, response_status, failure_reason, created_at, completed_at
+const claimDueOutboundWebhookDelivery = `-- name: ClaimDueOutboundWebhookDelivery :one
+WITH candidate AS (
+    SELECT delivery.id
+    FROM outbound_webhook_delivery AS delivery
+    JOIN outbound_webhook_subscription AS subscription
+      ON subscription.id = delivery.subscription_id
+    WHERE delivery.state = 'pending'
+      AND delivery.next_attempt_at <= now()
+      AND (delivery.lease_expires_at IS NULL OR delivery.lease_expires_at <= now())
+      AND delivery.attempt_count < $2::integer
+      AND subscription.status = 'active'
+      AND (
+          SELECT count(*) FROM outbound_webhook_delivery AS globally_leased
+          WHERE globally_leased.state = 'pending'
+            AND globally_leased.lease_token IS NOT NULL
+            AND globally_leased.lease_expires_at > now()
+      ) < $3::bigint
+      AND (
+          SELECT count(*) FROM outbound_webhook_delivery AS subscription_leased
+          WHERE subscription_leased.state = 'pending'
+            AND subscription_leased.subscription_id = delivery.subscription_id
+            AND subscription_leased.lease_token IS NOT NULL
+            AND subscription_leased.lease_expires_at > now()
+      ) < $4::bigint
+    ORDER BY delivery.next_attempt_at, delivery.created_at
+    FOR UPDATE OF delivery SKIP LOCKED
+    LIMIT 1
+)
+UPDATE outbound_webhook_delivery AS delivery
+SET lease_token = gen_random_uuid(),
+    lease_expires_at = now() + make_interval(secs => $1::double precision),
+    attempt_count = delivery.attempt_count + 1,
+    last_attempt_at = now()
+FROM candidate
+WHERE delivery.id = candidate.id
+RETURNING delivery.id, delivery.event_id, delivery.subscription_id, delivery.workspace_id, delivery.event_type, delivery.request_body, delivery.state, delivery.attempt_count, delivery.response_status, delivery.failure_reason, delivery.created_at, delivery.completed_at, delivery.next_attempt_at, delivery.lease_token, delivery.lease_expires_at, delivery.last_attempt_at
 `
 
-type CreateOutboundWebhookDeliveryParams struct {
-	EventID        pgtype.UUID `json:"event_id"`
-	SubscriptionID pgtype.UUID `json:"subscription_id"`
-	WorkspaceID    pgtype.UUID `json:"workspace_id"`
-	EventType      string      `json:"event_type"`
-	RequestBody    []byte      `json:"request_body"`
+type ClaimDueOutboundWebhookDeliveryParams struct {
+	LeaseSeconds               float64 `json:"lease_seconds"`
+	MaxAttempts                int32   `json:"max_attempts"`
+	MaxGlobalConcurrency       int64   `json:"max_global_concurrency"`
+	MaxSubscriptionConcurrency int64   `json:"max_subscription_concurrency"`
 }
 
-func (q *Queries) CreateOutboundWebhookDelivery(ctx context.Context, arg CreateOutboundWebhookDeliveryParams) (OutboundWebhookDelivery, error) {
-	row := q.db.QueryRow(ctx, createOutboundWebhookDelivery,
-		arg.EventID,
-		arg.SubscriptionID,
-		arg.WorkspaceID,
-		arg.EventType,
-		arg.RequestBody,
+func (q *Queries) ClaimDueOutboundWebhookDelivery(ctx context.Context, arg ClaimDueOutboundWebhookDeliveryParams) (OutboundWebhookDelivery, error) {
+	row := q.db.QueryRow(ctx, claimDueOutboundWebhookDelivery,
+		arg.LeaseSeconds,
+		arg.MaxAttempts,
+		arg.MaxGlobalConcurrency,
+		arg.MaxSubscriptionConcurrency,
 	)
 	var i OutboundWebhookDelivery
 	err := row.Scan(
@@ -48,6 +77,62 @@ func (q *Queries) CreateOutboundWebhookDelivery(ctx context.Context, arg CreateO
 		&i.FailureReason,
 		&i.CreatedAt,
 		&i.CompletedAt,
+		&i.NextAttemptAt,
+		&i.LeaseToken,
+		&i.LeaseExpiresAt,
+		&i.LastAttemptAt,
+	)
+	return i, err
+}
+
+const createOutboundWebhookDelivery = `-- name: CreateOutboundWebhookDelivery :one
+INSERT INTO outbound_webhook_delivery (
+    event_id, subscription_id, workspace_id, event_type, request_body
+) SELECT $1, $2, $3, $4, $5
+WHERE (
+    SELECT count(*)
+    FROM outbound_webhook_delivery AS existing
+    WHERE existing.subscription_id = $2 AND existing.state = 'pending'
+) < $6::bigint
+RETURNING id, event_id, subscription_id, workspace_id, event_type, request_body, state, attempt_count, response_status, failure_reason, created_at, completed_at, next_attempt_at, lease_token, lease_expires_at, last_attempt_at
+`
+
+type CreateOutboundWebhookDeliveryParams struct {
+	EventID        pgtype.UUID `json:"event_id"`
+	SubscriptionID pgtype.UUID `json:"subscription_id"`
+	WorkspaceID    pgtype.UUID `json:"workspace_id"`
+	EventType      string      `json:"event_type"`
+	RequestBody    []byte      `json:"request_body"`
+	MaxPending     int64       `json:"max_pending"`
+}
+
+func (q *Queries) CreateOutboundWebhookDelivery(ctx context.Context, arg CreateOutboundWebhookDeliveryParams) (OutboundWebhookDelivery, error) {
+	row := q.db.QueryRow(ctx, createOutboundWebhookDelivery,
+		arg.EventID,
+		arg.SubscriptionID,
+		arg.WorkspaceID,
+		arg.EventType,
+		arg.RequestBody,
+		arg.MaxPending,
+	)
+	var i OutboundWebhookDelivery
+	err := row.Scan(
+		&i.ID,
+		&i.EventID,
+		&i.SubscriptionID,
+		&i.WorkspaceID,
+		&i.EventType,
+		&i.RequestBody,
+		&i.State,
+		&i.AttemptCount,
+		&i.ResponseStatus,
+		&i.FailureReason,
+		&i.CreatedAt,
+		&i.CompletedAt,
+		&i.NextAttemptAt,
+		&i.LeaseToken,
+		&i.LeaseExpiresAt,
+		&i.LastAttemptAt,
 	)
 	return i, err
 }
@@ -57,7 +142,7 @@ INSERT INTO outbound_webhook_subscription (
     workspace_id, name, destination_ciphertext, secret_ciphertext,
     destination_hint, events, created_by
 ) VALUES ($1, $2, $3, $4, $5, $6, $7)
-RETURNING id, workspace_id, name, destination_ciphertext, secret_ciphertext, destination_hint, events, event_catalog_version, scope_mode, created_by, created_at, updated_at
+RETURNING id, workspace_id, name, destination_ciphertext, secret_ciphertext, destination_hint, events, event_catalog_version, scope_mode, created_by, created_at, updated_at, status, pause_reason, consecutive_terminal_failures
 `
 
 type CreateOutboundWebhookSubscriptionParams struct {
@@ -94,6 +179,9 @@ func (q *Queries) CreateOutboundWebhookSubscription(ctx context.Context, arg Cre
 		&i.CreatedBy,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.Status,
+		&i.PauseReason,
+		&i.ConsecutiveTerminalFailures,
 	)
 	return i, err
 }
@@ -131,8 +219,162 @@ func (q *Queries) DeleteOutboundWebhookSubscription(ctx context.Context, arg Del
 	return result.RowsAffected(), nil
 }
 
+const failClaimedOutboundWebhookDelivery = `-- name: FailClaimedOutboundWebhookDelivery :execrows
+WITH locked_subscription AS MATERIALIZED (
+    SELECT subscription.id
+    FROM outbound_webhook_subscription AS subscription
+    JOIN outbound_webhook_delivery AS delivery
+      ON delivery.subscription_id = subscription.id
+    WHERE delivery.id = $1 AND delivery.lease_token = $2 AND delivery.state = 'pending'
+    FOR UPDATE OF subscription
+), completed AS (
+    UPDATE outbound_webhook_delivery AS delivery
+    SET state = 'failed',
+        response_status = $3,
+        failure_reason = $4,
+        completed_at = now(),
+        lease_token = NULL,
+        lease_expires_at = NULL
+    FROM locked_subscription
+    WHERE delivery.id = $1
+      AND delivery.subscription_id = locked_subscription.id
+      AND delivery.lease_token = $2
+      AND delivery.state = 'pending'
+    RETURNING delivery.subscription_id
+)
+UPDATE outbound_webhook_subscription AS subscription
+SET consecutive_terminal_failures = subscription.consecutive_terminal_failures + 1,
+    status = CASE
+        WHEN subscription.consecutive_terminal_failures + 1 >= $5 THEN 'paused'
+        ELSE subscription.status
+    END,
+    pause_reason = CASE
+        WHEN subscription.consecutive_terminal_failures + 1 >= $5 THEN 'failure_threshold'
+        ELSE subscription.pause_reason
+    END,
+    updated_at = now()
+WHERE id = (SELECT subscription_id FROM completed)
+`
+
+type FailClaimedOutboundWebhookDeliveryParams struct {
+	ID               pgtype.UUID `json:"id"`
+	LeaseToken       pgtype.UUID `json:"lease_token"`
+	ResponseStatus   pgtype.Int4 `json:"response_status"`
+	FailureReason    pgtype.Text `json:"failure_reason"`
+	FailureThreshold int32       `json:"failure_threshold"`
+}
+
+func (q *Queries) FailClaimedOutboundWebhookDelivery(ctx context.Context, arg FailClaimedOutboundWebhookDeliveryParams) (int64, error) {
+	result, err := q.db.Exec(ctx, failClaimedOutboundWebhookDelivery,
+		arg.ID,
+		arg.LeaseToken,
+		arg.ResponseStatus,
+		arg.FailureReason,
+		arg.FailureThreshold,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const failExhaustedOutboundWebhookDelivery = `-- name: FailExhaustedOutboundWebhookDelivery :execrows
+WITH target AS MATERIALIZED (
+    SELECT delivery.id, delivery.subscription_id
+    FROM outbound_webhook_delivery AS delivery
+    JOIN outbound_webhook_subscription AS subscription
+      ON subscription.id = delivery.subscription_id
+    WHERE delivery.state = 'pending'
+      AND delivery.next_attempt_at <= now()
+      AND (delivery.lease_expires_at IS NULL OR delivery.lease_expires_at <= now())
+      AND delivery.attempt_count >= $2::integer
+      AND subscription.status = 'active'
+    ORDER BY delivery.next_attempt_at, delivery.created_at
+    LIMIT 1
+), locked_subscription AS MATERIALIZED (
+    SELECT subscription.id
+    FROM outbound_webhook_subscription AS subscription
+    JOIN target ON target.subscription_id = subscription.id
+    WHERE subscription.status = 'active'
+    FOR UPDATE OF subscription
+), completed AS (
+    UPDATE outbound_webhook_delivery AS delivery
+    SET state = 'failed',
+        failure_reason = 'maximum delivery attempts exhausted',
+        completed_at = now(),
+        lease_token = NULL,
+        lease_expires_at = NULL
+    FROM target, locked_subscription
+    WHERE delivery.id = target.id
+      AND delivery.subscription_id = locked_subscription.id
+      AND delivery.state = 'pending'
+      AND delivery.next_attempt_at <= now()
+      AND (delivery.lease_expires_at IS NULL OR delivery.lease_expires_at <= now())
+      AND delivery.attempt_count >= $2::integer
+    RETURNING delivery.subscription_id
+)
+UPDATE outbound_webhook_subscription AS subscription
+SET consecutive_terminal_failures = subscription.consecutive_terminal_failures + 1,
+    status = CASE
+        WHEN subscription.consecutive_terminal_failures + 1 >= $1 THEN 'paused'
+        ELSE subscription.status
+    END,
+    pause_reason = CASE
+        WHEN subscription.consecutive_terminal_failures + 1 >= $1 THEN 'failure_threshold'
+        ELSE subscription.pause_reason
+    END,
+    updated_at = now()
+WHERE id = (SELECT subscription_id FROM completed)
+`
+
+type FailExhaustedOutboundWebhookDeliveryParams struct {
+	FailureThreshold int32 `json:"failure_threshold"`
+	MaxAttempts      int32 `json:"max_attempts"`
+}
+
+func (q *Queries) FailExhaustedOutboundWebhookDelivery(ctx context.Context, arg FailExhaustedOutboundWebhookDeliveryParams) (int64, error) {
+	result, err := q.db.Exec(ctx, failExhaustedOutboundWebhookDelivery, arg.FailureThreshold, arg.MaxAttempts)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const getActiveOutboundWebhookSubscription = `-- name: GetActiveOutboundWebhookSubscription :one
+SELECT id, workspace_id, name, destination_ciphertext, secret_ciphertext, destination_hint, events, event_catalog_version, scope_mode, created_by, created_at, updated_at, status, pause_reason, consecutive_terminal_failures FROM outbound_webhook_subscription
+WHERE workspace_id = $1 AND id = $2 AND status = 'active'
+`
+
+type GetActiveOutboundWebhookSubscriptionParams struct {
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+	ID          pgtype.UUID `json:"id"`
+}
+
+func (q *Queries) GetActiveOutboundWebhookSubscription(ctx context.Context, arg GetActiveOutboundWebhookSubscriptionParams) (OutboundWebhookSubscription, error) {
+	row := q.db.QueryRow(ctx, getActiveOutboundWebhookSubscription, arg.WorkspaceID, arg.ID)
+	var i OutboundWebhookSubscription
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.Name,
+		&i.DestinationCiphertext,
+		&i.SecretCiphertext,
+		&i.DestinationHint,
+		&i.Events,
+		&i.EventCatalogVersion,
+		&i.ScopeMode,
+		&i.CreatedBy,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.Status,
+		&i.PauseReason,
+		&i.ConsecutiveTerminalFailures,
+	)
+	return i, err
+}
+
 const getOutboundWebhookDelivery = `-- name: GetOutboundWebhookDelivery :one
-SELECT id, event_id, subscription_id, workspace_id, event_type, request_body, state, attempt_count, response_status, failure_reason, created_at, completed_at FROM outbound_webhook_delivery WHERE id = $1
+SELECT id, event_id, subscription_id, workspace_id, event_type, request_body, state, attempt_count, response_status, failure_reason, created_at, completed_at, next_attempt_at, lease_token, lease_expires_at, last_attempt_at FROM outbound_webhook_delivery WHERE id = $1
 `
 
 func (q *Queries) GetOutboundWebhookDelivery(ctx context.Context, id pgtype.UUID) (OutboundWebhookDelivery, error) {
@@ -151,12 +393,16 @@ func (q *Queries) GetOutboundWebhookDelivery(ctx context.Context, id pgtype.UUID
 		&i.FailureReason,
 		&i.CreatedAt,
 		&i.CompletedAt,
+		&i.NextAttemptAt,
+		&i.LeaseToken,
+		&i.LeaseExpiresAt,
+		&i.LastAttemptAt,
 	)
 	return i, err
 }
 
 const getOutboundWebhookSubscription = `-- name: GetOutboundWebhookSubscription :one
-SELECT id, workspace_id, name, destination_ciphertext, secret_ciphertext, destination_hint, events, event_catalog_version, scope_mode, created_by, created_at, updated_at FROM outbound_webhook_subscription
+SELECT id, workspace_id, name, destination_ciphertext, secret_ciphertext, destination_hint, events, event_catalog_version, scope_mode, created_by, created_at, updated_at, status, pause_reason, consecutive_terminal_failures FROM outbound_webhook_subscription
 WHERE workspace_id = $1 AND id = $2
 `
 
@@ -181,12 +427,15 @@ func (q *Queries) GetOutboundWebhookSubscription(ctx context.Context, arg GetOut
 		&i.CreatedBy,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.Status,
+		&i.PauseReason,
+		&i.ConsecutiveTerminalFailures,
 	)
 	return i, err
 }
 
 const getOutboundWebhookSubscriptionForUpdate = `-- name: GetOutboundWebhookSubscriptionForUpdate :one
-SELECT id, workspace_id, name, destination_ciphertext, secret_ciphertext, destination_hint, events, event_catalog_version, scope_mode, created_by, created_at, updated_at FROM outbound_webhook_subscription
+SELECT id, workspace_id, name, destination_ciphertext, secret_ciphertext, destination_hint, events, event_catalog_version, scope_mode, created_by, created_at, updated_at, status, pause_reason, consecutive_terminal_failures FROM outbound_webhook_subscription
 WHERE workspace_id = $1 AND id = $2
 FOR UPDATE
 `
@@ -212,16 +461,20 @@ func (q *Queries) GetOutboundWebhookSubscriptionForUpdate(ctx context.Context, a
 		&i.CreatedBy,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.Status,
+		&i.PauseReason,
+		&i.ConsecutiveTerminalFailures,
 	)
 	return i, err
 }
 
 const listActiveOutboundWebhookSubscriptionsForEvent = `-- name: ListActiveOutboundWebhookSubscriptionsForEvent :many
-SELECT id, workspace_id, name, destination_ciphertext, secret_ciphertext, destination_hint, events, event_catalog_version, scope_mode, created_by, created_at, updated_at FROM outbound_webhook_subscription
+SELECT id, workspace_id, name, destination_ciphertext, secret_ciphertext, destination_hint, events, event_catalog_version, scope_mode, created_by, created_at, updated_at, status, pause_reason, consecutive_terminal_failures FROM outbound_webhook_subscription
 WHERE workspace_id = $1
+  AND status = 'active'
   AND events ? $2::text
 ORDER BY created_at ASC
-FOR SHARE
+FOR UPDATE
 `
 
 type ListActiveOutboundWebhookSubscriptionsForEventParams struct {
@@ -251,6 +504,9 @@ func (q *Queries) ListActiveOutboundWebhookSubscriptionsForEvent(ctx context.Con
 			&i.CreatedBy,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.Status,
+			&i.PauseReason,
+			&i.ConsecutiveTerminalFailures,
 		); err != nil {
 			return nil, err
 		}
@@ -263,7 +519,7 @@ func (q *Queries) ListActiveOutboundWebhookSubscriptionsForEvent(ctx context.Con
 }
 
 const listOutboundWebhookSubscriptions = `-- name: ListOutboundWebhookSubscriptions :many
-SELECT id, workspace_id, name, destination_ciphertext, secret_ciphertext, destination_hint, events, event_catalog_version, scope_mode, created_by, created_at, updated_at FROM outbound_webhook_subscription
+SELECT id, workspace_id, name, destination_ciphertext, secret_ciphertext, destination_hint, events, event_catalog_version, scope_mode, created_by, created_at, updated_at, status, pause_reason, consecutive_terminal_failures FROM outbound_webhook_subscription
 WHERE workspace_id = $1
 ORDER BY created_at ASC
 `
@@ -290,6 +546,9 @@ func (q *Queries) ListOutboundWebhookSubscriptions(ctx context.Context, workspac
 			&i.CreatedBy,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.Status,
+			&i.PauseReason,
+			&i.ConsecutiveTerminalFailures,
 		); err != nil {
 			return nil, err
 		}
@@ -299,6 +558,18 @@ func (q *Queries) ListOutboundWebhookSubscriptions(ctx context.Context, workspac
 		return nil, err
 	}
 	return items, nil
+}
+
+const lockOutboundWebhookDeliveryClaim = `-- name: LockOutboundWebhookDeliveryClaim :exec
+SELECT pg_advisory_xact_lock(hashtext('outbound_webhook'), hashtext('delivery_claim'))
+`
+
+// Call in a short transaction before ClaimDueOutboundWebhookDelivery. Keeping
+// lock acquisition in its own statement gives the claim a fresh READ COMMITTED
+// snapshot after any preceding claimant commits.
+func (q *Queries) LockOutboundWebhookDeliveryClaim(ctx context.Context) error {
+	_, err := q.db.Exec(ctx, lockOutboundWebhookDeliveryClaim)
+	return err
 }
 
 const lockWorkspaceForOutboundWebhookCapture = `-- name: LockWorkspaceForOutboundWebhookCapture :one
@@ -314,46 +585,105 @@ func (q *Queries) LockWorkspaceForOutboundWebhookCapture(ctx context.Context, id
 	return id_2, err
 }
 
-const markOutboundWebhookDeliveryFailed = `-- name: MarkOutboundWebhookDeliveryFailed :exec
+const releaseClaimedOutboundWebhookDelivery = `-- name: ReleaseClaimedOutboundWebhookDelivery :execrows
 UPDATE outbound_webhook_delivery
-SET state = 'failed', attempt_count = attempt_count + 1,
-    response_status = $2, failure_reason = $3, completed_at = now()
-WHERE id = $1
+SET lease_token = NULL, lease_expires_at = NULL
+WHERE id = $1 AND lease_token = $2 AND state = 'pending'
 `
 
-type MarkOutboundWebhookDeliveryFailedParams struct {
-	ID             pgtype.UUID `json:"id"`
-	ResponseStatus pgtype.Int4 `json:"response_status"`
-	FailureReason  pgtype.Text `json:"failure_reason"`
+type ReleaseClaimedOutboundWebhookDeliveryParams struct {
+	ID         pgtype.UUID `json:"id"`
+	LeaseToken pgtype.UUID `json:"lease_token"`
 }
 
-func (q *Queries) MarkOutboundWebhookDeliveryFailed(ctx context.Context, arg MarkOutboundWebhookDeliveryFailedParams) error {
-	_, err := q.db.Exec(ctx, markOutboundWebhookDeliveryFailed, arg.ID, arg.ResponseStatus, arg.FailureReason)
-	return err
+func (q *Queries) ReleaseClaimedOutboundWebhookDelivery(ctx context.Context, arg ReleaseClaimedOutboundWebhookDeliveryParams) (int64, error) {
+	result, err := q.db.Exec(ctx, releaseClaimedOutboundWebhookDelivery, arg.ID, arg.LeaseToken)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
-const markOutboundWebhookDeliverySucceeded = `-- name: MarkOutboundWebhookDeliverySucceeded :exec
+const retryClaimedOutboundWebhookDelivery = `-- name: RetryClaimedOutboundWebhookDelivery :execrows
 UPDATE outbound_webhook_delivery
-SET state = 'succeeded', attempt_count = attempt_count + 1,
-    response_status = $2, failure_reason = NULL, completed_at = now()
-WHERE id = $1
+SET response_status = $3,
+    failure_reason = $4,
+    next_attempt_at = $5,
+    lease_token = NULL,
+    lease_expires_at = NULL
+WHERE id = $1 AND lease_token = $2 AND state = 'pending'
 `
 
-type MarkOutboundWebhookDeliverySucceededParams struct {
+type RetryClaimedOutboundWebhookDeliveryParams struct {
+	ID             pgtype.UUID        `json:"id"`
+	LeaseToken     pgtype.UUID        `json:"lease_token"`
+	ResponseStatus pgtype.Int4        `json:"response_status"`
+	FailureReason  pgtype.Text        `json:"failure_reason"`
+	NextAttemptAt  pgtype.Timestamptz `json:"next_attempt_at"`
+}
+
+func (q *Queries) RetryClaimedOutboundWebhookDelivery(ctx context.Context, arg RetryClaimedOutboundWebhookDeliveryParams) (int64, error) {
+	result, err := q.db.Exec(ctx, retryClaimedOutboundWebhookDelivery,
+		arg.ID,
+		arg.LeaseToken,
+		arg.ResponseStatus,
+		arg.FailureReason,
+		arg.NextAttemptAt,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const succeedClaimedOutboundWebhookDelivery = `-- name: SucceedClaimedOutboundWebhookDelivery :execrows
+WITH locked_subscription AS MATERIALIZED (
+    SELECT subscription.id
+    FROM outbound_webhook_subscription AS subscription
+    JOIN outbound_webhook_delivery AS delivery
+      ON delivery.subscription_id = subscription.id
+    WHERE delivery.id = $1 AND delivery.lease_token = $2 AND delivery.state = 'pending'
+    FOR UPDATE OF subscription
+), completed AS (
+    UPDATE outbound_webhook_delivery AS delivery
+    SET state = 'succeeded',
+        response_status = $3,
+        failure_reason = NULL,
+        completed_at = now(),
+        lease_token = NULL,
+        lease_expires_at = NULL
+    FROM locked_subscription
+    WHERE delivery.id = $1
+      AND delivery.subscription_id = locked_subscription.id
+      AND delivery.lease_token = $2
+      AND delivery.state = 'pending'
+    RETURNING delivery.subscription_id
+)
+UPDATE outbound_webhook_subscription
+SET consecutive_terminal_failures = 0,
+    updated_at = now()
+WHERE id = (SELECT subscription_id FROM completed)
+`
+
+type SucceedClaimedOutboundWebhookDeliveryParams struct {
 	ID             pgtype.UUID `json:"id"`
+	LeaseToken     pgtype.UUID `json:"lease_token"`
 	ResponseStatus pgtype.Int4 `json:"response_status"`
 }
 
-func (q *Queries) MarkOutboundWebhookDeliverySucceeded(ctx context.Context, arg MarkOutboundWebhookDeliverySucceededParams) error {
-	_, err := q.db.Exec(ctx, markOutboundWebhookDeliverySucceeded, arg.ID, arg.ResponseStatus)
-	return err
+func (q *Queries) SucceedClaimedOutboundWebhookDelivery(ctx context.Context, arg SucceedClaimedOutboundWebhookDeliveryParams) (int64, error) {
+	result, err := q.db.Exec(ctx, succeedClaimedOutboundWebhookDelivery, arg.ID, arg.LeaseToken, arg.ResponseStatus)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const updateOutboundWebhookSubscriptionEvents = `-- name: UpdateOutboundWebhookSubscriptionEvents :one
 UPDATE outbound_webhook_subscription
 SET events = $3, updated_at = now()
 WHERE workspace_id = $1 AND id = $2
-RETURNING id, workspace_id, name, destination_ciphertext, secret_ciphertext, destination_hint, events, event_catalog_version, scope_mode, created_by, created_at, updated_at
+RETURNING id, workspace_id, name, destination_ciphertext, secret_ciphertext, destination_hint, events, event_catalog_version, scope_mode, created_by, created_at, updated_at, status, pause_reason, consecutive_terminal_failures
 `
 
 type UpdateOutboundWebhookSubscriptionEventsParams struct {
@@ -378,6 +708,9 @@ func (q *Queries) UpdateOutboundWebhookSubscriptionEvents(ctx context.Context, a
 		&i.CreatedBy,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.Status,
+		&i.PauseReason,
+		&i.ConsecutiveTerminalFailures,
 	)
 	return i, err
 }

@@ -7,14 +7,18 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/analytics"
 	"github.com/multica-ai/multica/server/internal/events"
 	"github.com/multica-ai/multica/server/internal/integrations/outwebhook"
@@ -33,6 +37,58 @@ type receivedOutboundWebhook struct {
 	persistedState    string
 	persistedForEvent int
 	persistenceError  error
+}
+
+type outboundWebhookRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn outboundWebhookRoundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return fn(request)
+}
+
+func createReliabilityWebhookSubscription(t *testing.T, h *Handler, name, destination string) outwebhook.Subscription {
+	t.Helper()
+	var created struct {
+		Subscription outwebhook.Subscription `json:"subscription"`
+	}
+	testutil.Call(t, h.CreateOutboundWebhook,
+		withURLParam(newRequest(http.MethodPost, "/api/workspaces/"+testWorkspaceID+"/outbound-webhooks", map[string]any{
+			"name": name, "destination": destination,
+			"events": []string{"issue.created"}, "scope_mode": "workspace",
+		}), "id", testWorkspaceID)).Want(http.StatusCreated).JSON(&created)
+	t.Cleanup(func() {
+		_, _ = testPool.Exec(context.Background(), `DELETE FROM outbound_webhook_delivery WHERE subscription_id = $1`, created.Subscription.ID)
+		_, _ = testPool.Exec(context.Background(), `DELETE FROM outbound_webhook_subscription WHERE id = $1`, created.Subscription.ID)
+	})
+	return created.Subscription
+}
+
+func createReliabilityWebhookIssue(t *testing.T, h *Handler, title string) string {
+	t.Helper()
+	var issue struct {
+		ID string `json:"id"`
+	}
+	testutil.Call(t, h.CreateIssue,
+		newRequest(http.MethodPost, "/api/issues", map[string]any{"title": title})).Want(http.StatusCreated).JSON(&issue)
+	t.Cleanup(func() { _, _ = testPool.Exec(context.Background(), `DELETE FROM issue WHERE id = $1`, issue.ID) })
+	return issue.ID
+}
+
+func waitOutboundWebhookDeliveryState(t *testing.T, deliveryID, want string) (string, int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	var state string
+	var attemptCount int
+	for time.Now().Before(deadline) {
+		if err := testPool.QueryRow(context.Background(), `SELECT state, attempt_count FROM outbound_webhook_delivery WHERE id = $1`, deliveryID).Scan(&state, &attemptCount); err != nil {
+			t.Fatal(err)
+		}
+		if state == want {
+			return state, attemptCount
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("delivery %s state = %s, want %s", deliveryID, state, want)
+	return state, attemptCount
 }
 
 func TestIssueCreationPersistsAndDeliversSecureWorkspaceWebhook(t *testing.T) {
@@ -188,6 +244,512 @@ func TestIssueCreationPersistsAndDeliversSecureWorkspaceWebhook(t *testing.T) {
 	if !hmac.Equal([]byte(wantSignature), []byte(got.header.Get("X-Multica-Signature"))) {
 		t.Fatal("receiver could not verify the exact persisted body")
 	}
+}
+
+func TestOutboundWebhookRetriesTransientReceiverFailure(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database unavailable")
+	}
+	received := make(chan string, 6)
+	statuses := []int{http.StatusRequestTimeout, http.StatusTooEarly, http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusNoContent}
+	var receiverAttempts atomic.Int32
+	receiver := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempt := int(receiverAttempts.Add(1)) - 1
+		status := statuses[attempt]
+		if status == http.StatusTooManyRequests {
+			w.Header().Set("Retry-After", "0")
+		}
+		w.WriteHeader(status)
+	}))
+	defer receiver.Close()
+	client := receiver.Client()
+	baseTransport := client.Transport
+	var transportAttempts atomic.Int32
+	client.Transport = outboundWebhookRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		received <- request.Header.Get("X-Multica-Delivery-ID")
+		if transportAttempts.Add(1) == 1 {
+			return nil, errors.New("controlled network failure")
+		}
+		return baseTransport.RoundTrip(request)
+	})
+
+	box, _ := secretbox.New([]byte("0123456789abcdef0123456789abcdef"))
+	policy := outwebhook.DefaultDeliveryPolicy()
+	policy.PollInterval = 5 * time.Millisecond
+	policy.InitialBackoff = 5 * time.Millisecond
+	policy.MaxBackoff = 20 * time.Millisecond
+	outbound := outwebhook.New(db.New(testPool), testPool, box, []string{receiver.URL}, outwebhook.WithHTTPClient(client), outwebhook.WithDeliveryPolicy(policy), outwebhook.WithRetryJitter(func(delay time.Duration) time.Duration { return delay }))
+	bus := events.New()
+	outbound.Register(bus)
+	t.Cleanup(func() {
+		outbound.Close()
+		outbound.WaitWithTimeout(time.Second)
+	})
+	h := New(db.New(testPool), testPool, testHandler.Hub, bus, service.NewEmailService(), nil, nil, analytics.NoopClient{}, Config{AllowSignup: true})
+	h.OutboundWebhooks = outbound
+
+	var created struct {
+		Subscription outwebhook.Subscription `json:"subscription"`
+	}
+	testutil.Call(t, h.CreateOutboundWebhook,
+		withURLParam(newRequest(http.MethodPost, "/api/workspaces/"+testWorkspaceID+"/outbound-webhooks", map[string]any{
+			"name": "Retry receiver", "destination": receiver.URL + "/events",
+			"events": []string{"issue.created"}, "scope_mode": "workspace",
+		}), "id", testWorkspaceID)).Want(http.StatusCreated).JSON(&created)
+	t.Cleanup(func() {
+		_, _ = testPool.Exec(context.Background(), `DELETE FROM outbound_webhook_delivery WHERE subscription_id = $1`, created.Subscription.ID)
+		_, _ = testPool.Exec(context.Background(), `DELETE FROM outbound_webhook_subscription WHERE id = $1`, created.Subscription.ID)
+	})
+
+	var issue struct {
+		ID string `json:"id"`
+	}
+	testutil.Call(t, h.CreateIssue,
+		newRequest(http.MethodPost, "/api/issues", map[string]any{"title": "Retry durable webhook"})).Want(http.StatusCreated).JSON(&issue)
+	t.Cleanup(func() { _, _ = testPool.Exec(context.Background(), `DELETE FROM issue WHERE id = $1`, issue.ID) })
+
+	first := ""
+	for attempt := 0; attempt < 6; attempt++ {
+		select {
+		case deliveryID := <-received:
+			if first == "" {
+				first = deliveryID
+			} else if deliveryID != first {
+				t.Fatalf("retry changed delivery id: first=%s attempt=%s", first, deliveryID)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("transient receiver failure was not retried at attempt %d", attempt+1)
+		}
+	}
+	var state string
+	var attemptCount int
+	deadline := time.Now().Add(5 * time.Second)
+	for state != "succeeded" && time.Now().Before(deadline) {
+		if err := testPool.QueryRow(context.Background(), `SELECT state, attempt_count FROM outbound_webhook_delivery WHERE id = $1`, first).Scan(&state, &attemptCount); err != nil {
+			t.Fatal(err)
+		}
+		if state != "succeeded" {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	if state != "succeeded" || attemptCount != 6 {
+		t.Fatalf("retry outcome = state %s attempts %d, want succeeded after 6", state, attemptCount)
+	}
+}
+
+func TestOutboundWebhookRestartRecoversPendingAndExpiredLease(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database unavailable")
+	}
+	received := make(chan receivedOutboundWebhook, 2)
+	var attempts atomic.Int32
+	receiver := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		received <- receivedOutboundWebhook{body: body, header: r.Header.Clone()}
+		if attempts.Add(1) == 1 {
+			<-r.Context().Done()
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer receiver.Close()
+
+	box, _ := secretbox.New([]byte("0123456789abcdef0123456789abcdef"))
+	policy := outwebhook.DefaultDeliveryPolicy()
+	policy.PollInterval = 5 * time.Millisecond
+	policy.LeaseDuration = 500 * time.Millisecond
+	serviceOne := outwebhook.New(db.New(testPool), testPool, box, []string{receiver.URL}, outwebhook.WithHTTPClient(receiver.Client()), outwebhook.WithDeliveryPolicy(policy))
+	bus := events.New()
+	serviceOne.Register(bus)
+	h := New(db.New(testPool), testPool, testHandler.Hub, bus, service.NewEmailService(), nil, nil, analytics.NoopClient{}, Config{AllowSignup: true})
+	h.OutboundWebhooks = serviceOne
+	subscription := createReliabilityWebhookSubscription(t, h, "Restart receiver", receiver.URL+"/events")
+	createReliabilityWebhookIssue(t, h, "Restart durable webhook")
+
+	var first receivedOutboundWebhook
+	select {
+	case first = <-received:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first server did not start a durable delivery")
+	}
+	serviceOne.Close()
+	if !serviceOne.WaitWithTimeout(time.Second) {
+		t.Fatal("first server did not stop")
+	}
+
+	leaseExpiry := time.Now().Add(250 * time.Millisecond)
+	if _, err := testPool.Exec(context.Background(), `
+		UPDATE outbound_webhook_delivery
+		SET lease_token = gen_random_uuid(), lease_expires_at = $2, next_attempt_at = now()
+		WHERE id = $1 AND state = 'pending'
+	`, first.header.Get("X-Multica-Delivery-ID"), leaseExpiry); err != nil {
+		t.Fatal(err)
+	}
+	serviceTwo := outwebhook.New(db.New(testPool), testPool, box, []string{receiver.URL}, outwebhook.WithHTTPClient(receiver.Client()), outwebhook.WithDeliveryPolicy(policy))
+	serviceTwo.Register(events.New())
+	t.Cleanup(func() {
+		serviceTwo.Close()
+		serviceTwo.WaitWithTimeout(time.Second)
+	})
+
+	select {
+	case <-received:
+		t.Fatal("replacement server reclaimed a live lease before it expired")
+	case <-time.After(100 * time.Millisecond):
+	}
+	var second receivedOutboundWebhook
+	select {
+	case second = <-received:
+	case <-time.After(2 * time.Second):
+		t.Fatal("replacement server did not reclaim the expired lease")
+	}
+	if first.header.Get("X-Multica-Delivery-ID") != second.header.Get("X-Multica-Delivery-ID") ||
+		first.header.Get("X-Multica-Event-ID") != second.header.Get("X-Multica-Event-ID") ||
+		string(first.body) != string(second.body) {
+		t.Fatal("lease recovery changed the delivery id, event id, or saved body")
+	}
+	state, count := waitOutboundWebhookDeliveryState(t, second.header.Get("X-Multica-Delivery-ID"), "succeeded")
+	if state != "succeeded" || count != 2 {
+		t.Fatalf("recovered delivery = %s after %d counted attempts", state, count)
+	}
+	if got := subscription.ID; got == "" {
+		t.Fatal("subscription fixture was not created")
+	}
+}
+
+func TestOutboundWebhookHonorsBoundedRetryAfter(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database unavailable")
+	}
+	received := make(chan time.Time, 2)
+	var attempts atomic.Int32
+	receiver := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		received <- time.Now()
+		if attempts.Add(1) == 1 {
+			w.Header().Set("Retry-After", "3600")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer receiver.Close()
+
+	box, _ := secretbox.New([]byte("0123456789abcdef0123456789abcdef"))
+	policy := outwebhook.DefaultDeliveryPolicy()
+	policy.PollInterval = 2 * time.Millisecond
+	policy.InitialBackoff = 5 * time.Millisecond
+	policy.MaxBackoff = 300 * time.Millisecond
+	policy.MaxRetryAfter = 200 * time.Millisecond
+	serviceUnderTest := outwebhook.New(db.New(testPool), testPool, box, []string{receiver.URL}, outwebhook.WithHTTPClient(receiver.Client()), outwebhook.WithDeliveryPolicy(policy))
+	bus := events.New()
+	serviceUnderTest.Register(bus)
+	t.Cleanup(func() {
+		serviceUnderTest.Close()
+		serviceUnderTest.WaitWithTimeout(time.Second)
+	})
+	h := New(db.New(testPool), testPool, testHandler.Hub, bus, service.NewEmailService(), nil, nil, analytics.NoopClient{}, Config{AllowSignup: true})
+	h.OutboundWebhooks = serviceUnderTest
+	subscription := createReliabilityWebhookSubscription(t, h, "Retry-After receiver", receiver.URL+"/events")
+	createReliabilityWebhookIssue(t, h, "Bounded Retry-After")
+
+	var first time.Time
+	select {
+	case first = <-received:
+	case <-time.After(5 * time.Second):
+		t.Fatal("receiver did not observe initial Retry-After attempt")
+	}
+	var deliveryID string
+	var nextAttemptAt, lastAttemptAt time.Time
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		err := testPool.QueryRow(context.Background(), `
+			SELECT id, next_attempt_at, last_attempt_at
+			FROM outbound_webhook_delivery
+			WHERE subscription_id = $1 AND attempt_count = 1 AND lease_token IS NULL
+		`, subscription.ID).Scan(&deliveryID, &nextAttemptAt, &lastAttemptAt)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			t.Fatal(err)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if nextAttemptAt.IsZero() {
+		t.Fatal("Retry-After schedule was not persisted")
+	}
+	if delay := nextAttemptAt.Sub(lastAttemptAt); delay < 160*time.Millisecond || delay > 260*time.Millisecond {
+		t.Fatalf("persisted bounded Retry-After = %s, want approximately 200ms", delay)
+	}
+	select {
+	case <-received:
+		t.Fatal("delivery retried before the persisted Retry-After delay")
+	case <-time.After(75 * time.Millisecond):
+	}
+	var second time.Time
+	select {
+	case second = <-received:
+	case <-time.After(2 * time.Second):
+		t.Fatal("delivery did not retry after bounded Retry-After")
+	}
+	if elapsed := second.Sub(first); elapsed < 160*time.Millisecond || elapsed > time.Second {
+		t.Fatalf("receiver retry delay = %s, want bounded delay of at least 160ms", elapsed)
+	}
+	state, count := waitOutboundWebhookDeliveryState(t, deliveryID, "succeeded")
+	if state != "succeeded" || count != 2 {
+		t.Fatalf("Retry-After delivery = %s after %d attempts, want succeeded after 2", state, count)
+	}
+}
+
+func TestOutboundWebhookTerminalFailuresPauseAndSuccessResets(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database unavailable")
+	}
+	responses := make(chan int, 4)
+	for _, status := range []int{http.StatusBadRequest, http.StatusNoContent, http.StatusBadRequest, http.StatusBadRequest} {
+		responses <- status
+	}
+	received := make(chan string, 4)
+	receiver := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		received <- r.Header.Get("X-Multica-Delivery-ID")
+		w.WriteHeader(<-responses)
+	}))
+	defer receiver.Close()
+
+	box, _ := secretbox.New([]byte("0123456789abcdef0123456789abcdef"))
+	policy := outwebhook.DefaultDeliveryPolicy()
+	policy.PollInterval = 5 * time.Millisecond
+	policy.ConsecutiveFailureThreshold = 2
+	serviceUnderTest := outwebhook.New(db.New(testPool), testPool, box, []string{receiver.URL}, outwebhook.WithHTTPClient(receiver.Client()), outwebhook.WithDeliveryPolicy(policy))
+	bus := events.New()
+	serviceUnderTest.Register(bus)
+	t.Cleanup(func() {
+		serviceUnderTest.Close()
+		serviceUnderTest.WaitWithTimeout(time.Second)
+	})
+	h := New(db.New(testPool), testPool, testHandler.Hub, bus, service.NewEmailService(), nil, nil, analytics.NoopClient{}, Config{AllowSignup: true})
+	h.OutboundWebhooks = serviceUnderTest
+	subscription := createReliabilityWebhookSubscription(t, h, "Failure threshold receiver", receiver.URL+"/events")
+
+	checks := []struct {
+		wantDeliveryState string
+		wantFailures      int
+		wantStatus        string
+	}{
+		{wantDeliveryState: "failed", wantFailures: 1, wantStatus: "active"},
+		{wantDeliveryState: "succeeded", wantFailures: 0, wantStatus: "active"},
+		{wantDeliveryState: "failed", wantFailures: 1, wantStatus: "active"},
+		{wantDeliveryState: "failed", wantFailures: 2, wantStatus: "paused"},
+	}
+	for i, check := range checks {
+		createReliabilityWebhookIssue(t, h, fmt.Sprintf("Terminal outcome %d", i+1))
+		var deliveryID string
+		select {
+		case deliveryID = <-received:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("receiver did not observe outcome %d", i+1)
+		}
+		waitOutboundWebhookDeliveryState(t, deliveryID, check.wantDeliveryState)
+		var status string
+		var pauseReason *string
+		var failures int
+		if err := testPool.QueryRow(context.Background(), `
+			SELECT status, pause_reason, consecutive_terminal_failures
+			FROM outbound_webhook_subscription WHERE id = $1
+		`, subscription.ID).Scan(&status, &pauseReason, &failures); err != nil {
+			t.Fatal(err)
+		}
+		if status != check.wantStatus || failures != check.wantFailures {
+			t.Fatalf("outcome %d subscription = %s/%d, want %s/%d", i+1, status, failures, check.wantStatus, check.wantFailures)
+		}
+		if status == "paused" && (pauseReason == nil || *pauseReason != "failure_threshold") {
+			t.Fatalf("paused subscription reason = %v", pauseReason)
+		}
+	}
+
+	visible, err := serviceUnderTest.Get(context.Background(), mustParseOutboundWebhookUUID(t, testWorkspaceID), mustParseOutboundWebhookUUID(t, subscription.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if visible.Status != "paused" || visible.PauseReason == nil || *visible.PauseReason != "failure_threshold" {
+		t.Fatalf("automatic pause was not visible through the subscription API: %+v", visible)
+	}
+}
+
+func TestOutboundWebhookConcurrencyAndPendingGrowthAreBounded(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database unavailable")
+	}
+	started := make(chan string, 4)
+	release := make(chan struct{})
+	receiver := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		started <- r.Header.Get("X-Multica-Delivery-ID")
+		select {
+		case <-release:
+			w.WriteHeader(http.StatusNoContent)
+		case <-r.Context().Done():
+		}
+	}))
+	defer receiver.Close()
+
+	box, _ := secretbox.New([]byte("0123456789abcdef0123456789abcdef"))
+	policy := outwebhook.DefaultDeliveryPolicy()
+	policy.PollInterval = 5 * time.Millisecond
+	policy.GlobalConcurrency = 2
+	policy.SubscriptionConcurrency = 1
+	policy.MaxPendingPerSubscription = 3
+	serviceUnderTest := outwebhook.New(db.New(testPool), testPool, box, []string{receiver.URL}, outwebhook.WithHTTPClient(receiver.Client()), outwebhook.WithDeliveryPolicy(policy))
+	bus := events.New()
+	serviceUnderTest.Register(bus)
+	competingService := outwebhook.New(db.New(testPool), testPool, box, []string{receiver.URL}, outwebhook.WithHTTPClient(receiver.Client()), outwebhook.WithDeliveryPolicy(policy))
+	competingService.Register(events.New())
+	t.Cleanup(func() {
+		serviceUnderTest.Close()
+		serviceUnderTest.WaitWithTimeout(time.Second)
+		competingService.Close()
+		competingService.WaitWithTimeout(time.Second)
+	})
+	h := New(db.New(testPool), testPool, testHandler.Hub, bus, service.NewEmailService(), nil, nil, analytics.NoopClient{}, Config{AllowSignup: true})
+	h.OutboundWebhooks = serviceUnderTest
+	first := createReliabilityWebhookSubscription(t, h, "Bounded receiver A", receiver.URL+"/events")
+	second := createReliabilityWebhookSubscription(t, h, "Bounded receiver B", receiver.URL+"/events")
+
+	for i := 0; i < 4; i++ {
+		createReliabilityWebhookIssue(t, h, fmt.Sprintf("Bounded webhook %d", i+1))
+	}
+	for i := 0; i < 2; i++ {
+		select {
+		case <-started:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("only %d bounded workers started", i)
+		}
+	}
+	select {
+	case <-started:
+		t.Fatal("global concurrency exceeded two live deliveries")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	var live int
+	if err := testPool.QueryRow(context.Background(), `
+		SELECT count(*) FROM outbound_webhook_delivery
+		WHERE state = 'pending' AND lease_token IS NOT NULL AND lease_expires_at > now()
+	`).Scan(&live); err != nil {
+		t.Fatal(err)
+	}
+	if live != 2 {
+		t.Fatalf("live delivery leases = %d, want 2", live)
+	}
+	rows, err := testPool.Query(context.Background(), `
+		SELECT subscription_id, count(*) FILTER (WHERE lease_token IS NOT NULL AND lease_expires_at > now()), count(*)
+		FROM outbound_webhook_delivery
+		WHERE subscription_id = ANY($1::uuid[]) AND state = 'pending'
+		GROUP BY subscription_id
+	`, []string{first.ID, second.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	seen := 0
+	for rows.Next() {
+		var subscriptionID string
+		var liveForSubscription, pending int
+		if err := rows.Scan(&subscriptionID, &liveForSubscription, &pending); err != nil {
+			t.Fatal(err)
+		}
+		if liveForSubscription != 1 || pending != 3 {
+			t.Fatalf("subscription %s has live=%d pending=%d, want 1/3", subscriptionID, liveForSubscription, pending)
+		}
+		seen++
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if seen != 2 {
+		t.Fatalf("bounded subscriptions observed = %d, want 2", seen)
+	}
+
+	close(release)
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := testPool.QueryRow(context.Background(), `
+			SELECT count(*) FROM outbound_webhook_delivery
+			WHERE subscription_id = ANY($1::uuid[]) AND state = 'pending'
+		`, []string{first.ID, second.ID}).Scan(&live); err != nil {
+			t.Fatal(err)
+		}
+		if live == 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if live != 0 {
+		t.Fatalf("bounded delivery queue did not drain: %d pending", live)
+	}
+}
+
+func TestOutboundWebhookRetryAttemptsAreBounded(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database unavailable")
+	}
+	received := make(chan string, 3)
+	receiver := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		received <- r.Header.Get("X-Multica-Delivery-ID")
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer receiver.Close()
+
+	box, _ := secretbox.New([]byte("0123456789abcdef0123456789abcdef"))
+	policy := outwebhook.DefaultDeliveryPolicy()
+	policy.PollInterval = 5 * time.Millisecond
+	policy.InitialBackoff = 5 * time.Millisecond
+	policy.MaxBackoff = 5 * time.Millisecond
+	policy.MaxAttempts = 2
+	policy.ConsecutiveFailureThreshold = 10
+	serviceUnderTest := outwebhook.New(db.New(testPool), testPool, box, []string{receiver.URL}, outwebhook.WithHTTPClient(receiver.Client()), outwebhook.WithDeliveryPolicy(policy), outwebhook.WithRetryJitter(func(delay time.Duration) time.Duration { return delay }))
+	bus := events.New()
+	serviceUnderTest.Register(bus)
+	t.Cleanup(func() {
+		serviceUnderTest.Close()
+		serviceUnderTest.WaitWithTimeout(time.Second)
+	})
+	h := New(db.New(testPool), testPool, testHandler.Hub, bus, service.NewEmailService(), nil, nil, analytics.NoopClient{}, Config{AllowSignup: true})
+	h.OutboundWebhooks = serviceUnderTest
+	createReliabilityWebhookSubscription(t, h, "Attempt cap receiver", receiver.URL+"/events")
+	createReliabilityWebhookIssue(t, h, "Bound retry attempts")
+
+	var first, second string
+	select {
+	case first = <-received:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for initial delivery attempt")
+	}
+	select {
+	case second = <-received:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for retry delivery attempt")
+	}
+	if second != first {
+		t.Fatal("bounded retry changed the delivery identifier")
+	}
+	state, count := waitOutboundWebhookDeliveryState(t, first, "failed")
+	if state != "failed" || count != 2 {
+		t.Fatalf("bounded retry = %s after %d attempts, want failed after 2", state, count)
+	}
+	select {
+	case <-received:
+		t.Fatal("delivery exceeded its configured attempt cap")
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func mustParseOutboundWebhookUUID(t *testing.T, raw string) pgtype.UUID {
+	t.Helper()
+	parsed, err := util.ParseUUID(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return parsed
 }
 
 func TestMultiFieldIssueUpdatePersistsIndependentTypedProductEvents(t *testing.T) {
@@ -675,50 +1237,6 @@ func TestOutboundWebhookMutationPermissionsAndWorkspaceBoundary(t *testing.T) {
 	testutil.Call(t, h.GetOutboundWebhook, get).Want(http.StatusNotFound)
 }
 
-func TestOutboundWebhookEventSelectionCanBeEditedExplicitly(t *testing.T) {
-	if testHandler == nil || testPool == nil {
-		t.Skip("database unavailable")
-	}
-	box, _ := secretbox.New([]byte("0123456789abcdef0123456789abcdef"))
-	outbound := outwebhook.New(db.New(testPool), testPool, box, []string{"https://127.0.0.1:9443"})
-	h := *testHandler
-	h.OutboundWebhooks = outbound
-
-	var created struct {
-		Subscription outwebhook.Subscription `json:"subscription"`
-	}
-	testutil.Call(t, h.CreateOutboundWebhook,
-		withURLParam(newRequest(http.MethodPost, "/api/workspaces/"+testWorkspaceID+"/outbound-webhooks", map[string]any{
-			"name": "Explicit events", "destination": "https://127.0.0.1:9443/events",
-			"events": []string{outwebhook.EventIssueCreated, outwebhook.EventIssueStatusChanged}, "scope_mode": "workspace",
-		}), "id", testWorkspaceID)).Want(http.StatusCreated).JSON(&created)
-	t.Cleanup(func() {
-		subscriptionID, _ := util.ParseUUID(created.Subscription.ID)
-		workspaceID, _ := util.ParseUUID(testWorkspaceID)
-		_, _ = outbound.Delete(context.Background(), workspaceID, subscriptionID)
-	})
-
-	var updated outwebhook.Subscription
-	testutil.Call(t, h.UpdateOutboundWebhookEvents, withURLParams(
-		newRequest(http.MethodPatch, "/api/workspaces/"+testWorkspaceID+"/outbound-webhooks/"+created.Subscription.ID+"/events", map[string]any{
-			"events": []string{outwebhook.EventIssuePriorityChanged},
-		}),
-		"id", testWorkspaceID,
-		"subscriptionId", created.Subscription.ID,
-	)).Want(http.StatusOK).JSON(&updated)
-	if updated.EventCatalogVersion != outwebhook.CatalogVersion || len(updated.Events) != 1 || updated.Events[0] != outwebhook.EventIssuePriorityChanged {
-		t.Fatalf("event selection was implicitly widened: %+v", updated)
-	}
-
-	testutil.Call(t, h.UpdateOutboundWebhookEvents, withURLParams(
-		newRequest(http.MethodPatch, "/api/workspaces/"+testWorkspaceID+"/outbound-webhooks/"+created.Subscription.ID+"/events", map[string]any{
-			"events": []string{"issue.updated"},
-		}),
-		"id", testWorkspaceID,
-		"subscriptionId", created.Subscription.ID,
-	)).Want(http.StatusBadRequest)
-}
-
 func TestOutboundWebhookDeleteWaitsForCaptureAndSweepsItsDelivery(t *testing.T) {
 	if testHandler == nil || testPool == nil {
 		t.Skip("database unavailable")
@@ -757,14 +1275,17 @@ func TestOutboundWebhookDeleteWaitsForCaptureAndSweepsItsDelivery(t *testing.T) 
 	}
 	defer captureTx.Rollback(context.Background())
 	captureQueries := db.New(testPool).WithTx(captureTx)
-	rows, err := captureQueries.ListActiveOutboundWebhookSubscriptionsForEvent(context.Background(), db.ListActiveOutboundWebhookSubscriptionsForEventParams{WorkspaceID: workspaceID, EventType: outwebhook.EventIssueCreated})
+	rows, err := captureQueries.ListActiveOutboundWebhookSubscriptionsForEvent(context.Background(), db.ListActiveOutboundWebhookSubscriptionsForEventParams{
+		WorkspaceID: workspaceID,
+		EventType:   outwebhook.EventIssueCreated,
+	})
 	if err != nil || len(rows) != 1 {
 		t.Fatalf("lock subscription for capture: rows=%d err=%v", len(rows), err)
 	}
 	eventID, _ := util.ParseUUID(uuid.NewString())
 	if _, err := captureQueries.CreateOutboundWebhookDelivery(context.Background(), db.CreateOutboundWebhookDeliveryParams{
 		EventID: eventID, SubscriptionID: subscriptionID, WorkspaceID: workspaceID,
-		EventType: outwebhook.EventIssueCreated, RequestBody: []byte(`{"version":1}`),
+		EventType: outwebhook.EventIssueCreated, RequestBody: []byte(`{"version":1}`), MaxPending: 1,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -830,13 +1351,16 @@ func TestWorkspaceDeleteFencePreventsLateOutboundWebhookDelivery(t *testing.T) {
 	if _, err := captureQueries.LockWorkspaceForOutboundWebhookCapture(context.Background(), workspaceID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := captureQueries.ListActiveOutboundWebhookSubscriptionsForEvent(context.Background(), db.ListActiveOutboundWebhookSubscriptionsForEventParams{WorkspaceID: workspaceID, EventType: outwebhook.EventIssueCreated}); err != nil {
+	if _, err := captureQueries.ListActiveOutboundWebhookSubscriptionsForEvent(context.Background(), db.ListActiveOutboundWebhookSubscriptionsForEventParams{
+		WorkspaceID: workspaceID,
+		EventType:   outwebhook.EventIssueCreated,
+	}); err != nil {
 		t.Fatal(err)
 	}
 	eventID, _ := util.ParseUUID(uuid.NewString())
 	if _, err := captureQueries.CreateOutboundWebhookDelivery(context.Background(), db.CreateOutboundWebhookDeliveryParams{
 		EventID: eventID, SubscriptionID: subscriptionID, WorkspaceID: workspaceID,
-		EventType: outwebhook.EventIssueCreated, RequestBody: []byte(`{"version":1}`),
+		EventType: outwebhook.EventIssueCreated, RequestBody: []byte(`{"version":1}`), MaxPending: 1,
 	}); err != nil {
 		t.Fatal(err)
 	}

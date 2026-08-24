@@ -19,6 +19,9 @@ export interface OutboundWebhookSubscription {
   events: string[];
   eventCatalogVersion: number;
   scopeMode: "workspace";
+  status: "active" | "paused";
+  pauseReason: string | null;
+  consecutiveTerminalFailures: number;
   createdAt: string;
   updatedAt: string;
 }

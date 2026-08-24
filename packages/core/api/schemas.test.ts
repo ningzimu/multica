@@ -76,6 +76,44 @@ import {
 import { parseWithFallback } from "./schema";
 
 describe("outbound webhook schemas", () => {
+  const subscription = {
+    id: "sub-1",
+    workspace_id: "workspace-1",
+    name: "Receiver",
+    destination_hint: "https://receiver.example",
+    events: ["issue.created"],
+    event_catalog_version: 1,
+    scope_mode: "workspace",
+    created_at: "2026-08-25T00:00:00Z",
+    updated_at: "2026-08-25T00:00:00Z",
+  };
+
+  it("parses an automatic failure-threshold pause without breaking older responses", () => {
+    const active = ListOutboundWebhookSubscriptionsResponseSchema.parse({ subscriptions: [subscription] });
+    expect(active.subscriptions[0]).toMatchObject({ status: "active", pauseReason: null, consecutiveTerminalFailures: 0 });
+
+    const paused = ListOutboundWebhookSubscriptionsResponseSchema.parse({
+      subscriptions: [{
+        ...subscription,
+        status: "paused",
+        pause_reason: "failure_threshold",
+        consecutive_terminal_failures: 5,
+      }],
+    });
+    expect(paused.subscriptions[0]).toMatchObject({
+      status: "paused",
+      pauseReason: "failure_threshold",
+      consecutiveTerminalFailures: 5,
+    });
+  });
+
+  it("fails closed to paused for a newer subscription lifecycle status", () => {
+    const parsed = ListOutboundWebhookSubscriptionsResponseSchema.parse({
+      subscriptions: [{ ...subscription, status: "future_lifecycle_state" }],
+    });
+    expect(parsed.subscriptions[0]?.status).toBe("paused");
+  });
+
   it("fails closed to an empty list when a subscription response is malformed", () => {
     const parsed = parseWithFallback(
       { subscriptions: [{ id: 42, signing_secret: "must-not-pass" }] },

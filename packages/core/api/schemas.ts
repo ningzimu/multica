@@ -367,6 +367,9 @@ export const OutboundWebhookSubscriptionSchema = z
     events: z.array(z.string()).default([]),
     event_catalog_version: z.number().default(1),
     scope_mode: z.literal("workspace").default("workspace"),
+    status: z.enum(["active", "paused"]).catch("paused").default("active"),
+    pause_reason: z.string().nullable().default(null),
+    consecutive_terminal_failures: z.number().int().nonnegative().default(0),
     created_at: z.string(),
     updated_at: z.string(),
   })
@@ -380,6 +383,9 @@ export const OutboundWebhookSubscriptionSchema = z
       events: value.events,
       eventCatalogVersion: value.event_catalog_version,
       scopeMode: value.scope_mode,
+      status: value.status,
+      pauseReason: value.pause_reason,
+      consecutiveTerminalFailures: value.consecutive_terminal_failures,
       createdAt: value.created_at,
       updatedAt: value.updated_at,
     }),
@@ -404,7 +410,8 @@ export const CreateOutboundWebhookSubscriptionResponseSchema = z
 
 export const EMPTY_OUTBOUND_WEBHOOK_SUBSCRIPTION: OutboundWebhookSubscription = {
   id: "", workspaceId: "", name: "", destinationHint: "", events: [],
-  eventCatalogVersion: 1, scopeMode: "workspace", createdAt: "", updatedAt: "",
+  eventCatalogVersion: 1, scopeMode: "workspace", status: "active", pauseReason: null,
+  consecutiveTerminalFailures: 0, createdAt: "", updatedAt: "",
 };
 
 export const EMPTY_LIST_OUTBOUND_WEBHOOK_SUBSCRIPTIONS: ListOutboundWebhookSubscriptionsResponse = { subscriptions: [] };

@@ -972,21 +972,28 @@ type OutboundWebhookDelivery struct {
 	FailureReason  pgtype.Text        `json:"failure_reason"`
 	CreatedAt      pgtype.Timestamptz `json:"created_at"`
 	CompletedAt    pgtype.Timestamptz `json:"completed_at"`
+	NextAttemptAt  pgtype.Timestamptz `json:"next_attempt_at"`
+	LeaseToken     pgtype.UUID        `json:"lease_token"`
+	LeaseExpiresAt pgtype.Timestamptz `json:"lease_expires_at"`
+	LastAttemptAt  pgtype.Timestamptz `json:"last_attempt_at"`
 }
 
 type OutboundWebhookSubscription struct {
-	ID                    pgtype.UUID        `json:"id"`
-	WorkspaceID           pgtype.UUID        `json:"workspace_id"`
-	Name                  string             `json:"name"`
-	DestinationCiphertext []byte             `json:"destination_ciphertext"`
-	SecretCiphertext      []byte             `json:"secret_ciphertext"`
-	DestinationHint       string             `json:"destination_hint"`
-	Events                []byte             `json:"events"`
-	EventCatalogVersion   int32              `json:"event_catalog_version"`
-	ScopeMode             string             `json:"scope_mode"`
-	CreatedBy             pgtype.UUID        `json:"created_by"`
-	CreatedAt             pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt             pgtype.Timestamptz `json:"updated_at"`
+	ID                          pgtype.UUID        `json:"id"`
+	WorkspaceID                 pgtype.UUID        `json:"workspace_id"`
+	Name                        string             `json:"name"`
+	DestinationCiphertext       []byte             `json:"destination_ciphertext"`
+	SecretCiphertext            []byte             `json:"secret_ciphertext"`
+	DestinationHint             string             `json:"destination_hint"`
+	Events                      []byte             `json:"events"`
+	EventCatalogVersion         int32              `json:"event_catalog_version"`
+	ScopeMode                   string             `json:"scope_mode"`
+	CreatedBy                   pgtype.UUID        `json:"created_by"`
+	CreatedAt                   pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt                   pgtype.Timestamptz `json:"updated_at"`
+	Status                      string             `json:"status"`
+	PauseReason                 pgtype.Text        `json:"pause_reason"`
+	ConsecutiveTerminalFailures int32              `json:"consecutive_terminal_failures"`
 }
 
 type PersonalAccessToken struct {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -113,6 +114,59 @@ func TestDestinationPolicyRejectsUnsafeNetworkPaths(t *testing.T) {
 		if _, _, err := service.validateDestination(context.Background(), raw); err == nil {
 			t.Fatalf("unsafe destination %q was accepted", raw)
 		}
+	}
+}
+
+func TestRetryPolicyClassifiesAndBoundsReceiverResponses(t *testing.T) {
+	for _, status := range []int{http.StatusRequestTimeout, http.StatusTooEarly, http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusBadGateway} {
+		if !retryableStatus(status) {
+			t.Fatalf("status %d should retry", status)
+		}
+	}
+	for _, status := range []int{http.StatusOK, http.StatusBadRequest, http.StatusUnauthorized, http.StatusNotFound, 600} {
+		if retryableStatus(status) {
+			t.Fatalf("status %d should be terminal", status)
+		}
+	}
+
+	policy := DefaultDeliveryPolicy()
+	policy.InitialBackoff = 10 * time.Millisecond
+	policy.MaxBackoff = 100 * time.Millisecond
+	policy.MaxRetryAfter = 50 * time.Millisecond
+	service := New(nil, nil, nil, nil, WithDeliveryPolicy(policy), WithRetryJitter(func(delay time.Duration) time.Duration { return delay }))
+	if delay := service.retryDelay(1, "3600"); delay != 50*time.Millisecond {
+		t.Fatalf("bounded Retry-After delay = %s, want 50ms", delay)
+	}
+	if delay := service.retryDelay(20, "invalid"); delay != 100*time.Millisecond {
+		t.Fatalf("bounded exponential delay = %s, want 100ms", delay)
+	}
+}
+
+func TestRetryAfterAcceptsDeltaSecondsAndHTTPDate(t *testing.T) {
+	now := time.Date(2026, time.August, 25, 2, 0, 0, 0, time.UTC)
+	if delay, ok := parseRetryAfter("12", now); !ok || delay != 12*time.Second {
+		t.Fatalf("delta Retry-After = %s, ok=%v", delay, ok)
+	}
+	if delay, ok := parseRetryAfter(now.Add(30*time.Second).Format(http.TimeFormat), now); !ok || delay != 30*time.Second {
+		t.Fatalf("date Retry-After = %s, ok=%v", delay, ok)
+	}
+	for _, raw := range []string{"-1", "nonsense", now.Add(-time.Second).Format(http.TimeFormat)} {
+		if _, ok := parseRetryAfter(raw, now); ok {
+			t.Fatalf("invalid Retry-After %q accepted", raw)
+		}
+	}
+}
+
+func TestBoundedJitterStaysWithinTwentyPercent(t *testing.T) {
+	const delay = 100 * time.Millisecond
+	for range 100 {
+		got := boundedJitter(delay)
+		if got < 80*time.Millisecond || got > 120*time.Millisecond {
+			t.Fatalf("bounded jitter = %s, want within 80ms..120ms", got)
+		}
+	}
+	if got := boundedJitter(0); got != 0 {
+		t.Fatalf("zero delay jitter = %s", got)
 	}
 }
 

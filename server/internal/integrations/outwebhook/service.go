@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	mathrand "math/rand/v2"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -46,8 +47,12 @@ const (
 	maxCommentExcerptCodePoints = 500
 	maxResponseBytes            = 64 << 10
 	deliveryTimeout             = 10 * time.Second
-	dispatchWorkers             = 4
-	dispatchQueueSize           = 64
+	dispatchQueueSize           = 1
+	hardMaxAttempts             = 32
+	hardMaxWorkers              = 64
+	hardMaxPerSub               = 16
+	hardMaxPending              = 100_000
+	hardMaxFailures             = 100
 )
 
 var eventCatalog = []string{
@@ -76,16 +81,26 @@ type Service struct {
 	allowedOrigins map[string]struct{}
 	clientFor      func(*url.URL, bool) *http.Client
 	now            func() time.Time
-	dispatchQueue  chan pendingDispatch
+	policy         DeliveryPolicy
+	jitter         func(time.Duration) time.Duration
+	dispatchQueue  chan struct{}
 	dispatchCancel context.CancelFunc
 	dispatchWG     sync.WaitGroup
 	startOnce      sync.Once
 	closeOnce      sync.Once
 }
 
-type pendingDispatch struct {
-	subscription db.OutboundWebhookSubscription
-	delivery     db.OutboundWebhookDelivery
+type DeliveryPolicy struct {
+	PollInterval                time.Duration
+	LeaseDuration               time.Duration
+	InitialBackoff              time.Duration
+	MaxBackoff                  time.Duration
+	MaxRetryAfter               time.Duration
+	MaxAttempts                 int32
+	GlobalConcurrency           int64
+	SubscriptionConcurrency     int64
+	MaxPendingPerSubscription   int64
+	ConsecutiveFailureThreshold int32
 }
 
 type Option func(*Service)
@@ -98,6 +113,36 @@ func WithHTTPClient(client *http.Client) Option {
 	}
 }
 
+func WithDeliveryPolicy(policy DeliveryPolicy) Option {
+	return func(service *Service) {
+		service.policy = normalizeDeliveryPolicy(policy)
+	}
+}
+
+// WithRetryJitter makes retry scheduling deterministic in integration tests.
+func WithRetryJitter(jitter func(time.Duration) time.Duration) Option {
+	return func(service *Service) {
+		if jitter != nil {
+			service.jitter = jitter
+		}
+	}
+}
+
+func DefaultDeliveryPolicy() DeliveryPolicy {
+	return DeliveryPolicy{
+		PollInterval:                time.Second,
+		LeaseDuration:               2 * time.Minute,
+		InitialBackoff:              time.Second,
+		MaxBackoff:                  time.Hour,
+		MaxRetryAfter:               time.Hour,
+		MaxAttempts:                 8,
+		GlobalConcurrency:           4,
+		SubscriptionConcurrency:     1,
+		MaxPendingPerSubscription:   10_000,
+		ConsecutiveFailureThreshold: 5,
+	}
+}
+
 type CreateInput struct {
 	WorkspaceID pgtype.UUID
 	CreatedBy   pgtype.UUID
@@ -107,15 +152,18 @@ type CreateInput struct {
 }
 
 type Subscription struct {
-	ID                  string    `json:"id"`
-	WorkspaceID         string    `json:"workspace_id"`
-	Name                string    `json:"name"`
-	DestinationHint     string    `json:"destination_hint"`
-	Events              []string  `json:"events"`
-	EventCatalogVersion int32     `json:"event_catalog_version"`
-	ScopeMode           string    `json:"scope_mode"`
-	CreatedAt           time.Time `json:"created_at"`
-	UpdatedAt           time.Time `json:"updated_at"`
+	ID                          string    `json:"id"`
+	WorkspaceID                 string    `json:"workspace_id"`
+	Name                        string    `json:"name"`
+	DestinationHint             string    `json:"destination_hint"`
+	Events                      []string  `json:"events"`
+	EventCatalogVersion         int32     `json:"event_catalog_version"`
+	ScopeMode                   string    `json:"scope_mode"`
+	Status                      string    `json:"status"`
+	PauseReason                 *string   `json:"pause_reason"`
+	ConsecutiveTerminalFailures int32     `json:"consecutive_terminal_failures"`
+	CreatedAt                   time.Time `json:"created_at"`
+	UpdatedAt                   time.Time `json:"updated_at"`
 }
 
 type CreateResult struct {
@@ -152,7 +200,9 @@ func New(queries *db.Queries, txStarter interface {
 			return client
 		},
 		now:           time.Now,
-		dispatchQueue: make(chan pendingDispatch, dispatchQueueSize),
+		policy:        DefaultDeliveryPolicy(),
+		jitter:        boundedJitter,
+		dispatchQueue: make(chan struct{}, dispatchQueueSize),
 	}
 	for _, option := range options {
 		option(service)
@@ -180,29 +230,118 @@ func (s *Service) startDispatcher() {
 	s.startOnce.Do(func() {
 		ctx, cancel := context.WithCancel(context.Background())
 		s.dispatchCancel = cancel
-		for range dispatchWorkers {
+		for range int(s.policy.GlobalConcurrency) {
 			s.dispatchWG.Add(1)
 			go func() {
 				defer s.dispatchWG.Done()
-				for {
-					select {
-					case item := <-s.dispatchQueue:
-						if ctx.Err() != nil {
-							return
-						}
-						s.deliver(ctx, item.subscription, item.delivery)
-					case <-ctx.Done():
-						return
-					}
-				}
+				s.runDispatcher(ctx)
 			}()
 		}
+		s.wakeDispatcher()
 	})
 }
 
-// Close cancels queued and active immediate delivery work. Every queued item is
-// already durable; the leased recovery dispatcher introduced in #12 can resume
-// any row that remains pending after shutdown.
+func (s *Service) runDispatcher(ctx context.Context) {
+	for ctx.Err() == nil {
+		if s.dispatchOne(ctx) {
+			continue
+		}
+		timer := time.NewTimer(s.policy.PollInterval)
+		select {
+		case <-s.dispatchQueue:
+			stopTimer(timer)
+		case <-timer.C:
+		case <-ctx.Done():
+			stopTimer(timer)
+			return
+		}
+	}
+}
+
+func (s *Service) dispatchOne(ctx context.Context) bool {
+	if s.queries == nil || s.txStarter == nil {
+		return false
+	}
+	tx, err := s.txStarter.Begin(ctx)
+	if err != nil {
+		if ctx.Err() == nil {
+			slog.Error("outbound webhook delivery claim transaction failed", "error", err)
+		}
+		return false
+	}
+	defer tx.Rollback(context.Background())
+	if ctx.Err() != nil {
+		return false
+	}
+	queries := s.queries.WithTx(tx)
+	if err := queries.LockOutboundWebhookDeliveryClaim(ctx); err != nil {
+		if ctx.Err() == nil {
+			slog.Error("outbound webhook delivery claim lock failed", "error", err)
+		}
+		return false
+	}
+	delivery, err := queries.ClaimDueOutboundWebhookDelivery(ctx, db.ClaimDueOutboundWebhookDeliveryParams{
+		LeaseSeconds:               s.policy.LeaseDuration.Seconds(),
+		MaxAttempts:                s.policy.MaxAttempts,
+		MaxGlobalConcurrency:       s.policy.GlobalConcurrency,
+		MaxSubscriptionConcurrency: s.policy.SubscriptionConcurrency,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		rows, settleErr := queries.FailExhaustedOutboundWebhookDelivery(ctx, db.FailExhaustedOutboundWebhookDeliveryParams{
+			MaxAttempts:      s.policy.MaxAttempts,
+			FailureThreshold: s.policy.ConsecutiveFailureThreshold,
+		})
+		if settleErr != nil && ctx.Err() == nil {
+			slog.Error("outbound webhook exhausted delivery settlement failed", "error", settleErr)
+		}
+		if settleErr == nil && rows > 0 {
+			if err := tx.Commit(ctx); err != nil {
+				if ctx.Err() == nil {
+					slog.Error("outbound webhook exhausted delivery commit failed", "error", err)
+				}
+				return false
+			}
+			return true
+		}
+		return false
+	}
+	if ctx.Err() != nil {
+		return false
+	}
+	if err != nil {
+		slog.Error("outbound webhook delivery claim failed", "error", err)
+		return false
+	}
+	if err := tx.Commit(ctx); err != nil {
+		if ctx.Err() == nil {
+			slog.Error("outbound webhook delivery claim commit failed", "error", err)
+		}
+		return false
+	}
+	subscription, err := s.queries.GetActiveOutboundWebhookSubscription(ctx, db.GetActiveOutboundWebhookSubscriptionParams{
+		WorkspaceID: delivery.WorkspaceID,
+		ID:          delivery.SubscriptionID,
+	})
+	if err != nil {
+		if !errors.Is(err, pgx.ErrNoRows) {
+			slog.Error("outbound webhook claimed subscription lookup failed", "delivery_id", util.UUIDToString(delivery.ID), "error", err)
+		}
+		s.releaseClaim(delivery)
+		return true
+	}
+	s.deliver(ctx, subscription, delivery)
+	return true
+}
+
+func (s *Service) wakeDispatcher() {
+	select {
+	case s.dispatchQueue <- struct{}{}:
+	default:
+	}
+}
+
+// Close cancels claimed delivery work. The database remains authoritative, so
+// a released or expired lease is recovered after restart.
 func (s *Service) Close() {
 	if s == nil {
 		return
@@ -437,7 +576,7 @@ func (s *Service) captureProductEvents(event events.Event, productEvents []produ
 		}
 		return
 	}
-	pending := make([]pendingDispatch, 0)
+	inserted := false
 	for _, product := range productEvents {
 		rows, err := queries.ListActiveOutboundWebhookSubscriptionsForEvent(ctx, db.ListActiveOutboundWebhookSubscriptionsForEventParams{
 			WorkspaceID: workspaceID,
@@ -459,18 +598,23 @@ func (s *Service) captureProductEvents(event events.Event, productEvents []produ
 			return
 		}
 		for _, subscription := range rows {
-			delivery, err := queries.CreateOutboundWebhookDelivery(ctx, db.CreateOutboundWebhookDeliveryParams{
+			_, err := queries.CreateOutboundWebhookDelivery(ctx, db.CreateOutboundWebhookDeliveryParams{
 				EventID: pgtype.UUID{Bytes: eventID, Valid: true}, SubscriptionID: subscription.ID,
 				WorkspaceID: subscription.WorkspaceID, EventType: product.eventType, RequestBody: body,
+				MaxPending: s.policy.MaxPendingPerSubscription,
 			})
 			if err != nil {
+				if errors.Is(err, pgx.ErrNoRows) {
+					slog.Warn("outbound webhook pending delivery limit reached", "subscription_id", util.UUIDToString(subscription.ID), "event_type", product.eventType)
+					continue
+				}
 				slog.Error("outbound webhook delivery persistence failed", "event_type", product.eventType, "error", err)
 				return
 			}
-			pending = append(pending, pendingDispatch{subscription: subscription, delivery: delivery})
+			inserted = true
 		}
 	}
-	if len(pending) == 0 {
+	if !inserted {
 		_ = tx.Rollback(ctx)
 		return
 	}
@@ -478,13 +622,7 @@ func (s *Service) captureProductEvents(event events.Event, productEvents []produ
 		slog.Error("outbound webhook delivery commit failed", "event_type", event.Type, "error", err)
 		return
 	}
-	for _, item := range pending {
-		select {
-		case s.dispatchQueue <- item:
-		default:
-			slog.Warn("outbound webhook immediate dispatch queue full", "delivery_id", util.UUIDToString(item.delivery.ID), "event_type", item.delivery.EventType)
-		}
-	}
+	s.wakeDispatcher()
 }
 
 func (s *Service) captureComment(event events.Event, eventType string) {
@@ -862,27 +1000,28 @@ func optionalString(value any) *string {
 func (s *Service) deliver(ctx context.Context, subscription db.OutboundWebhookSubscription, delivery db.OutboundWebhookDelivery) {
 	destination, err := s.box.Open(subscription.DestinationCiphertext)
 	if err != nil {
-		s.markFailed(delivery, 0, "encrypted destination is unavailable")
+		s.failClaim(delivery, 0, "encrypted destination is unavailable")
 		return
 	}
 	secret, err := s.box.Open(subscription.SecretCiphertext)
 	if err != nil {
-		s.markFailed(delivery, 0, "encrypted signing secret is unavailable")
+		s.failClaim(delivery, 0, "encrypted signing secret is unavailable")
 		return
 	}
 	endpoint, operatorAllowed, err := s.validateDestination(ctx, string(destination))
 	if err != nil {
 		if ctx.Err() != nil {
+			s.releaseClaim(delivery)
 			return
 		}
-		s.markFailed(delivery, 0, "destination is no longer allowed")
+		s.failClaim(delivery, 0, "destination is no longer allowed")
 		return
 	}
 	callCtx, cancel := context.WithTimeout(ctx, deliveryTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(callCtx, http.MethodPost, endpoint.String(), bytes.NewReader(delivery.RequestBody))
 	if err != nil {
-		s.markFailed(delivery, 0, "request could not be created")
+		s.failClaim(delivery, 0, "request could not be created")
 		return
 	}
 	timestamp := strconv.FormatInt(s.now().Unix(), 10)
@@ -900,30 +1039,112 @@ func (s *Service) deliver(ctx context.Context, subscription db.OutboundWebhookSu
 	resp, err := s.clientFor(endpoint, operatorAllowed).Do(req)
 	if err != nil {
 		if ctx.Err() != nil {
+			s.releaseClaim(delivery)
 			return
 		}
-		s.markFailed(delivery, 0, "receiver did not answer")
+		s.retryOrFail(delivery, 0, "receiver did not answer", "")
 		return
 	}
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxResponseBytes))
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		s.markFailed(delivery, resp.StatusCode, fmt.Sprintf("receiver returned HTTP %d", resp.StatusCode))
+	if retryableStatus(resp.StatusCode) {
+		s.retryOrFail(delivery, resp.StatusCode, fmt.Sprintf("receiver returned HTTP %d", resp.StatusCode), resp.Header.Get("Retry-After"))
 		return
 	}
-	if err := s.queries.MarkOutboundWebhookDeliverySucceeded(context.Background(), db.MarkOutboundWebhookDeliverySucceededParams{ID: delivery.ID, ResponseStatus: pgtype.Int4{Int32: int32(resp.StatusCode), Valid: true}}); err != nil {
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		s.failClaim(delivery, resp.StatusCode, fmt.Sprintf("receiver returned HTTP %d", resp.StatusCode))
+		return
+	}
+	rows, err := s.queries.SucceedClaimedOutboundWebhookDelivery(context.Background(), db.SucceedClaimedOutboundWebhookDeliveryParams{
+		ID: delivery.ID, LeaseToken: delivery.LeaseToken,
+		ResponseStatus: pgtype.Int4{Int32: int32(resp.StatusCode), Valid: true},
+	})
+	if err != nil {
 		slog.Error("outbound webhook delivery state update failed", "delivery_id", util.UUIDToString(delivery.ID), "event_type", delivery.EventType, "error", err)
+	} else if rows == 0 {
+		slog.Warn("outbound webhook delivery success ignored after lease loss", "delivery_id", util.UUIDToString(delivery.ID), "event_type", delivery.EventType)
 	}
 }
 
-func (s *Service) markFailed(delivery db.OutboundWebhookDelivery, status int, reason string) {
-	params := db.MarkOutboundWebhookDeliveryFailedParams{ID: delivery.ID, FailureReason: pgtype.Text{String: reason, Valid: true}}
+func (s *Service) retryOrFail(delivery db.OutboundWebhookDelivery, status int, reason, retryAfter string) {
+	attempt := delivery.AttemptCount
+	if attempt >= s.policy.MaxAttempts {
+		s.failClaim(delivery, status, reason)
+		return
+	}
+	delay := s.retryDelay(attempt, retryAfter)
+	params := db.RetryClaimedOutboundWebhookDeliveryParams{
+		ID: delivery.ID, LeaseToken: delivery.LeaseToken,
+		FailureReason: pgtype.Text{String: reason, Valid: true},
+		NextAttemptAt: pgtype.Timestamptz{Time: s.now().Add(delay), Valid: true},
+	}
 	if status != 0 {
 		params.ResponseStatus = pgtype.Int4{Int32: int32(status), Valid: true}
 	}
-	if err := s.queries.MarkOutboundWebhookDeliveryFailed(context.Background(), params); err != nil {
+	rows, err := s.queries.RetryClaimedOutboundWebhookDelivery(context.Background(), params)
+	if err != nil {
 		slog.Error("outbound webhook delivery state update failed", "delivery_id", util.UUIDToString(delivery.ID), "event_type", delivery.EventType, "error", err)
+		return
 	}
+	if rows == 0 {
+		slog.Warn("outbound webhook delivery retry ignored after lease loss", "delivery_id", util.UUIDToString(delivery.ID), "event_type", delivery.EventType)
+		return
+	}
+	slog.Info("outbound webhook delivery scheduled for retry", "delivery_id", util.UUIDToString(delivery.ID), "event_type", delivery.EventType, "attempt", attempt, "retry_in", delay)
+	s.wakeDispatcher()
+}
+
+func (s *Service) failClaim(delivery db.OutboundWebhookDelivery, status int, reason string) {
+	params := db.FailClaimedOutboundWebhookDeliveryParams{
+		ID: delivery.ID, LeaseToken: delivery.LeaseToken,
+		FailureReason:    pgtype.Text{String: reason, Valid: true},
+		FailureThreshold: s.policy.ConsecutiveFailureThreshold,
+	}
+	if status != 0 {
+		params.ResponseStatus = pgtype.Int4{Int32: int32(status), Valid: true}
+	}
+	rows, err := s.queries.FailClaimedOutboundWebhookDelivery(context.Background(), params)
+	if err != nil {
+		slog.Error("outbound webhook delivery state update failed", "delivery_id", util.UUIDToString(delivery.ID), "event_type", delivery.EventType, "error", err)
+	} else if rows == 0 {
+		slog.Warn("outbound webhook terminal outcome ignored after lease loss", "delivery_id", util.UUIDToString(delivery.ID), "event_type", delivery.EventType)
+	}
+}
+
+func (s *Service) releaseClaim(delivery db.OutboundWebhookDelivery) {
+	if !delivery.LeaseToken.Valid {
+		return
+	}
+	if _, err := s.queries.ReleaseClaimedOutboundWebhookDelivery(context.Background(), db.ReleaseClaimedOutboundWebhookDeliveryParams{ID: delivery.ID, LeaseToken: delivery.LeaseToken}); err != nil {
+		slog.Error("outbound webhook delivery lease release failed", "delivery_id", util.UUIDToString(delivery.ID), "event_type", delivery.EventType, "error", err)
+	}
+	s.wakeDispatcher()
+}
+
+func (s *Service) retryDelay(attempt int32, rawRetryAfter string) time.Duration {
+	delay := s.policy.InitialBackoff
+	for i := int32(1); i < attempt && delay < s.policy.MaxBackoff; i++ {
+		if delay > s.policy.MaxBackoff/2 {
+			delay = s.policy.MaxBackoff
+			break
+		}
+		delay *= 2
+	}
+	if delay = s.jitter(delay); delay > s.policy.MaxBackoff {
+		delay = s.policy.MaxBackoff
+	}
+	if retryAfter, ok := parseRetryAfter(rawRetryAfter, s.now()); ok {
+		if retryAfter > s.policy.MaxRetryAfter {
+			retryAfter = s.policy.MaxRetryAfter
+		}
+		if retryAfter > delay {
+			delay = retryAfter
+		}
+	}
+	if delay > s.policy.MaxBackoff {
+		delay = s.policy.MaxBackoff
+	}
+	return delay
 }
 
 func (s *Service) validateDestination(ctx context.Context, raw string) (*url.URL, bool, error) {
@@ -949,7 +1170,17 @@ func (s *Service) validateDestination(ctx context.Context, raw string) (*url.URL
 func subscriptionResponse(row db.OutboundWebhookSubscription) Subscription {
 	events := []string{}
 	_ = json.Unmarshal(row.Events, &events)
-	return Subscription{ID: util.UUIDToString(row.ID), WorkspaceID: util.UUIDToString(row.WorkspaceID), Name: row.Name, DestinationHint: row.DestinationHint, Events: events, EventCatalogVersion: row.EventCatalogVersion, ScopeMode: row.ScopeMode, CreatedAt: row.CreatedAt.Time, UpdatedAt: row.UpdatedAt.Time}
+	var pauseReason *string
+	if row.PauseReason.Valid {
+		pauseReason = &row.PauseReason.String
+	}
+	return Subscription{
+		ID: util.UUIDToString(row.ID), WorkspaceID: util.UUIDToString(row.WorkspaceID), Name: row.Name,
+		DestinationHint: row.DestinationHint, Events: events, EventCatalogVersion: row.EventCatalogVersion,
+		ScopeMode: row.ScopeMode, Status: row.Status, PauseReason: pauseReason,
+		ConsecutiveTerminalFailures: row.ConsecutiveTerminalFailures,
+		CreatedAt:                   row.CreatedAt.Time, UpdatedAt: row.UpdatedAt.Time,
+	}
 }
 
 func safeDestinationHint(endpoint *url.URL) string { return endpoint.Scheme + "://" + endpoint.Host }
@@ -964,4 +1195,96 @@ func canonicalOrigin(raw string) string {
 
 func rejectRedirect(*http.Request, []*http.Request) error {
 	return errors.New("outbound webhook redirects are not allowed")
+}
+
+func normalizeDeliveryPolicy(policy DeliveryPolicy) DeliveryPolicy {
+	defaults := DefaultDeliveryPolicy()
+	if policy.PollInterval <= 0 {
+		policy.PollInterval = defaults.PollInterval
+	}
+	if policy.LeaseDuration <= 0 {
+		policy.LeaseDuration = defaults.LeaseDuration
+	}
+	if policy.InitialBackoff <= 0 {
+		policy.InitialBackoff = defaults.InitialBackoff
+	}
+	if policy.MaxBackoff < policy.InitialBackoff {
+		policy.MaxBackoff = defaults.MaxBackoff
+	}
+	if policy.MaxRetryAfter <= 0 {
+		policy.MaxRetryAfter = defaults.MaxRetryAfter
+	}
+	if policy.MaxAttempts <= 0 {
+		policy.MaxAttempts = defaults.MaxAttempts
+	} else if policy.MaxAttempts > hardMaxAttempts {
+		policy.MaxAttempts = hardMaxAttempts
+	}
+	if policy.GlobalConcurrency <= 0 {
+		policy.GlobalConcurrency = defaults.GlobalConcurrency
+	} else if policy.GlobalConcurrency > hardMaxWorkers {
+		policy.GlobalConcurrency = hardMaxWorkers
+	}
+	if policy.SubscriptionConcurrency > hardMaxPerSub {
+		policy.SubscriptionConcurrency = hardMaxPerSub
+	}
+	if policy.SubscriptionConcurrency <= 0 || policy.SubscriptionConcurrency > policy.GlobalConcurrency {
+		policy.SubscriptionConcurrency = min(defaults.SubscriptionConcurrency, policy.GlobalConcurrency)
+	}
+	if policy.MaxPendingPerSubscription <= 0 {
+		policy.MaxPendingPerSubscription = defaults.MaxPendingPerSubscription
+	} else if policy.MaxPendingPerSubscription > hardMaxPending {
+		policy.MaxPendingPerSubscription = hardMaxPending
+	}
+	if policy.ConsecutiveFailureThreshold <= 0 {
+		policy.ConsecutiveFailureThreshold = defaults.ConsecutiveFailureThreshold
+	} else if policy.ConsecutiveFailureThreshold > hardMaxFailures {
+		policy.ConsecutiveFailureThreshold = hardMaxFailures
+	}
+	return policy
+}
+
+func boundedJitter(delay time.Duration) time.Duration {
+	if delay <= 0 {
+		return 0
+	}
+	spread := delay / 5
+	if spread == 0 {
+		return delay
+	}
+	return delay - spread + time.Duration(mathrand.Int64N(int64(2*spread)+1))
+}
+
+func parseRetryAfter(raw string, now time.Time) (time.Duration, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0, false
+	}
+	if seconds, err := strconv.ParseInt(raw, 10, 64); err == nil {
+		if seconds < 0 {
+			return 0, false
+		}
+		if seconds > int64(time.Duration(1<<63-1)/time.Second) {
+			return time.Duration(1<<63 - 1), true
+		}
+		return time.Duration(seconds) * time.Second, true
+	}
+	when, err := http.ParseTime(raw)
+	if err != nil || !when.After(now) {
+		return 0, false
+	}
+	return when.Sub(now), true
+}
+
+func retryableStatus(status int) bool {
+	return status == http.StatusRequestTimeout || status == http.StatusTooEarly || status == http.StatusTooManyRequests || (status >= 500 && status < 600)
+}
+
+func stopTimer(timer *time.Timer) {
+	if timer.Stop() {
+		return
+	}
+	select {
+	case <-timer.C:
+	default:
+	}
 }

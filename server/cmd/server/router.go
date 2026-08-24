@@ -403,7 +403,13 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	} else if strings.TrimSpace(os.Getenv("MULTICA_OUTBOUND_WEBHOOK_SECRET_KEY")) != "" {
 		slog.Error("outbound webhooks disabled by invalid encryption configuration", "error", err)
 	}
-	h.OutboundWebhooks = outwebhook.New(queries, pool, outboundWebhookBox, splitAndTrim(os.Getenv("MULTICA_OUTBOUND_WEBHOOK_ALLOWED_ORIGINS")))
+	outboundWebhookPolicy := outwebhook.DefaultDeliveryPolicy()
+	outboundWebhookPolicy.MaxAttempts = int32(envPositiveInt("MULTICA_OUTBOUND_WEBHOOK_MAX_ATTEMPTS", int(outboundWebhookPolicy.MaxAttempts)))
+	outboundWebhookPolicy.GlobalConcurrency = int64(envPositiveInt("MULTICA_OUTBOUND_WEBHOOK_GLOBAL_CONCURRENCY", int(outboundWebhookPolicy.GlobalConcurrency)))
+	outboundWebhookPolicy.SubscriptionConcurrency = int64(envPositiveInt("MULTICA_OUTBOUND_WEBHOOK_SUBSCRIPTION_CONCURRENCY", int(outboundWebhookPolicy.SubscriptionConcurrency)))
+	outboundWebhookPolicy.MaxPendingPerSubscription = int64(envPositiveInt("MULTICA_OUTBOUND_WEBHOOK_MAX_PENDING_PER_SUBSCRIPTION", int(outboundWebhookPolicy.MaxPendingPerSubscription)))
+	outboundWebhookPolicy.ConsecutiveFailureThreshold = int32(envPositiveInt("MULTICA_OUTBOUND_WEBHOOK_FAILURE_THRESHOLD", int(outboundWebhookPolicy.ConsecutiveFailureThreshold)))
+	h.OutboundWebhooks = outwebhook.New(queries, pool, outboundWebhookBox, splitAndTrim(os.Getenv("MULTICA_OUTBOUND_WEBHOOK_ALLOWED_ORIGINS")), outwebhook.WithDeliveryPolicy(outboundWebhookPolicy))
 	h.OutboundWebhooks.Register(bus)
 	if apnsConfig, enabled, err := push.ConfigFromEnv(); err != nil {
 		slog.Error("APNs system notifications disabled by invalid configuration", "error", err)
