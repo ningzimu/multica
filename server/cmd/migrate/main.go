@@ -257,6 +257,10 @@ var concurrentIndexCleanups = map[string]string{
 	"404_recipient_device_installation_index":                   "idx_recipient_device_installation",
 	"405_recipient_device_active_user_index":                    "idx_recipient_device_active_user",
 	"406_recipient_device_token_index":                          "idx_recipient_device_token_active",
+	"409_outbound_webhook_subscription_id_index":                "outbound_webhook_subscription_id_idx",
+	"410_outbound_webhook_subscription_workspace_index":         "outbound_webhook_subscription_workspace_idx",
+	"411_outbound_webhook_delivery_id_index":                    "outbound_webhook_delivery_id_idx",
+	"412_outbound_webhook_delivery_subscription_index":          "outbound_webhook_delivery_subscription_idx",
 }
 
 // concurrentDownIndexCleanups covers every migration whose down direction

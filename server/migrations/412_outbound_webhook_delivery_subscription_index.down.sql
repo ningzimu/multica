@@ -1,1 +1,1 @@
-DROP INDEX IF EXISTS outbound_webhook_delivery_subscription_idx;
+DROP INDEX CONCURRENTLY IF EXISTS outbound_webhook_delivery_subscription_idx;

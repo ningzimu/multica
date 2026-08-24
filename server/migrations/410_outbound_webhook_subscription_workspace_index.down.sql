@@ -1,1 +1,1 @@
-DROP INDEX IF EXISTS outbound_webhook_subscription_workspace_idx;
+DROP INDEX CONCURRENTLY IF EXISTS outbound_webhook_subscription_workspace_idx;
