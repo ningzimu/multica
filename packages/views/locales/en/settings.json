@@ -1149,6 +1149,32 @@
       "checking": "Checking…"
     }
   },
+  "outbound_webhooks": {
+    "issue_created_event": "issue.created",
+    "section_title": "Outbound Webhooks",
+    "section_description": "Send selected workspace events to a generic HTTPS receiver.",
+    "name": "Name",
+    "destination": "Destination URL",
+    "event_selection": "Event selection",
+    "workspace_scope": "Workspace scope includes projected and unprojected issues.",
+    "workspace_scope_short": "Workspace scope",
+    "create": "Create webhook",
+    "created": "Webhook created",
+    "create_failed": "Failed to create webhook",
+    "create_partial_failure": "The webhook may have been created, but its signing secret could not be displayed. Delete it and create a new one.",
+    "delete": "Delete webhook",
+    "deleted": "Webhook deleted",
+    "delete_failed": "Failed to delete webhook",
+    "inspect": "Inspect",
+    "hide_details": "Hide details",
+    "destination_hint": "Destination",
+    "event_catalog_version": "Event catalog version",
+    "scope": "Scope",
+    "secret_once": "Copy this signing secret now. It will not be shown again.",
+    "secret_saved": "I saved it",
+    "load_failed": "Failed to load outbound webhooks.",
+    "empty": "No outbound webhooks yet."
+  },
   "members": {
     "section_title": "Members ({{count}})",
     "invite_title": "Invite member",

@@ -29,6 +29,7 @@ import (
 	"github.com/multica-ai/multica/server/internal/integrations/dingtalk"
 	"github.com/multica-ai/multica/server/internal/integrations/ghsnapshot"
 	"github.com/multica-ai/multica/server/internal/integrations/lark"
+	"github.com/multica-ai/multica/server/internal/integrations/outwebhook"
 	"github.com/multica-ai/multica/server/internal/integrations/slack"
 	"github.com/multica-ai/multica/server/internal/integrations/telegram"
 	"github.com/multica-ai/multica/server/internal/integrations/wecom"
@@ -332,6 +333,10 @@ type Handler struct {
 	// The process owner starts and joins it; the synchronous event bus only
 	// enqueues EventChatDone work.
 	TelegramOutbound *telegram.Outbound
+	// OutboundWebhooks owns receiver-neutral subscription management and the
+	// synchronous post-commit capture path. Nil or unavailable keeps unrelated
+	// server features running while its handlers fail closed with 503.
+	OutboundWebhooks *outwebhook.Service
 
 	// channelFileDelivery names the channel types that can, IN THIS
 	// DEPLOYMENT, carry a file the agent produced the last hop into the

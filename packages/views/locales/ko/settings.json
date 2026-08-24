@@ -884,6 +884,32 @@
       "checking": "확인 중..."
     }
   },
+  "outbound_webhooks": {
+    "issue_created_event": "issue.created",
+    "section_title": "아웃바운드 Webhook",
+    "section_description": "선택한 워크스페이스 이벤트를 범용 HTTPS 수신기로 전송합니다.",
+    "name": "이름",
+    "destination": "대상 URL",
+    "event_selection": "이벤트 선택",
+    "workspace_scope": "워크스페이스 범위에는 프로젝트에 속한 태스크와 속하지 않은 태스크가 모두 포함됩니다.",
+    "workspace_scope_short": "워크스페이스 범위",
+    "create": "Webhook 만들기",
+    "created": "Webhook을 만들었습니다",
+    "create_failed": "Webhook을 만들지 못했습니다",
+    "create_partial_failure": "Webhook이 생성되었을 수 있지만 서명 시크릿을 표시하지 못했습니다. 삭제한 뒤 다시 생성하세요.",
+    "delete": "Webhook 삭제",
+    "deleted": "Webhook을 삭제했습니다",
+    "delete_failed": "Webhook을 삭제하지 못했습니다",
+    "inspect": "상세 보기",
+    "hide_details": "상세 숨기기",
+    "destination_hint": "대상",
+    "event_catalog_version": "이벤트 카탈로그 버전",
+    "scope": "범위",
+    "secret_once": "서명 시크릿을 지금 복사하세요. 다시 표시되지 않습니다.",
+    "secret_saved": "저장했습니다",
+    "load_failed": "아웃바운드 Webhook을 불러오지 못했습니다.",
+    "empty": "아웃바운드 Webhook이 없습니다."
+  },
   "members": {
     "section_title": "멤버 ({{count}})",
     "invite_title": "멤버 초대",

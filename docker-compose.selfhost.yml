@@ -192,6 +192,10 @@ services:
       MULTICA_VCS_INTEGRATION_ENABLED: ${MULTICA_VCS_INTEGRATION_ENABLED:-true}
       # VCS integration at-rest encryption key for token-based providers
       MULTICA_VCS_SECRET_KEY: ${MULTICA_VCS_SECRET_KEY:-}
+      # Outbound Webhook destinations and signing secrets use their own key.
+      # Without it the feature fails closed and the rest of the server runs.
+      MULTICA_OUTBOUND_WEBHOOK_SECRET_KEY: ${MULTICA_OUTBOUND_WEBHOOK_SECRET_KEY:-}
+      MULTICA_OUTBOUND_WEBHOOK_ALLOWED_ORIGINS: ${MULTICA_OUTBOUND_WEBHOOK_ALLOWED_ORIGINS:-}
       # WeCom smart-bot integration. MULTICA_WECOM_SECRET_KEY is the
       # opt-in: unset = integration disabled. It encrypts each installation's
       # smart-bot secret at rest. The server needs it to unseal a bot's

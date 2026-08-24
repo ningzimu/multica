@@ -31,6 +31,7 @@ import (
 	composiointeg "github.com/multica-ai/multica/server/internal/integrations/composio"
 	"github.com/multica-ai/multica/server/internal/integrations/dingtalk"
 	"github.com/multica-ai/multica/server/internal/integrations/lark"
+	"github.com/multica-ai/multica/server/internal/integrations/outwebhook"
 	"github.com/multica-ai/multica/server/internal/integrations/slack"
 	"github.com/multica-ai/multica/server/internal/integrations/telegram"
 	"github.com/multica-ai/multica/server/internal/integrations/wecom"
@@ -393,6 +394,17 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 		ServerVersion:            normalizeServerVersion(version),
 	}
 	h := handler.New(queries, pool, hub, bus, emailSvc, store, cfSigner, analyticsClient, signupConfig, daemonHub)
+	var outboundWebhookBox *secretbox.Box
+	if key, err := secretbox.LoadKey("MULTICA_OUTBOUND_WEBHOOK_SECRET_KEY"); err == nil {
+		outboundWebhookBox, err = secretbox.New(key)
+		if err != nil {
+			slog.Error("outbound webhooks disabled by invalid encryption configuration", "error", err)
+		}
+	} else if strings.TrimSpace(os.Getenv("MULTICA_OUTBOUND_WEBHOOK_SECRET_KEY")) != "" {
+		slog.Error("outbound webhooks disabled by invalid encryption configuration", "error", err)
+	}
+	h.OutboundWebhooks = outwebhook.New(queries, pool, outboundWebhookBox, splitAndTrim(os.Getenv("MULTICA_OUTBOUND_WEBHOOK_ALLOWED_ORIGINS")))
+	h.OutboundWebhooks.Register(bus)
 	if apnsConfig, enabled, err := push.ConfigFromEnv(); err != nil {
 		slog.Error("APNs system notifications disabled by invalid configuration", "error", err)
 	} else if enabled {
@@ -1527,6 +1539,8 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					// see what is mounted in their workspace and which scopes
 					// it holds; install / configure / remove stay admin-only.
 					r.Get("/plugins", h.ListPlugins)
+					r.Get("/outbound-webhooks", h.ListOutboundWebhooks)
+					r.Get("/outbound-webhooks/{subscriptionId}", h.GetOutboundWebhook)
 					// One short-lived hosted surface launch. Member-visible
 					// because opening an issue is what asks for it; executable
 					// bytes stay off the authenticated app/API origin.
@@ -1584,6 +1598,8 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					r.Post("/plugins/{installationId}/enable", h.EnablePlugin)
 					r.Post("/plugins/{installationId}/disable", h.DisablePlugin)
 					r.Delete("/plugins/{installationId}", h.UninstallPlugin)
+					r.Post("/outbound-webhooks", h.CreateOutboundWebhook)
+					r.Delete("/outbound-webhooks/{subscriptionId}", h.DeleteOutboundWebhook)
 				})
 				// Owner-only access
 				r.With(middleware.RequireWorkspaceRoleFromURL(queries, "id", "owner")).Delete("/", h.DeleteWorkspace)

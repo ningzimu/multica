@@ -61,6 +61,10 @@ import {
   PluginPreviewSchema,
   EMPTY_PLUGIN_INSTALLATION_LIST,
   EMPTY_PLUGIN_PREVIEW,
+  ListOutboundWebhookSubscriptionsResponseSchema,
+  EMPTY_LIST_OUTBOUND_WEBHOOK_SUBSCRIPTIONS,
+  CreateOutboundWebhookSubscriptionResponseSchema,
+  EMPTY_CREATE_OUTBOUND_WEBHOOK_SUBSCRIPTION,
 } from "./schemas";
 import { IssueViewSchema, IssueViewListSchema } from "./schemas";
 import {
@@ -70,6 +74,28 @@ import {
   EMPTY_ISSUE_STATUS_ENTRY,
 } from "./schemas";
 import { parseWithFallback } from "./schema";
+
+describe("outbound webhook schemas", () => {
+  it("fails closed to an empty list when a subscription response is malformed", () => {
+    const parsed = parseWithFallback(
+      { subscriptions: [{ id: 42, signing_secret: "must-not-pass" }] },
+      ListOutboundWebhookSubscriptionsResponseSchema,
+      EMPTY_LIST_OUTBOUND_WEBHOOK_SUBSCRIPTIONS,
+      { endpoint: "GET /api/workspaces/:id/outbound-webhooks" },
+    );
+    expect(parsed).toEqual(EMPTY_LIST_OUTBOUND_WEBHOOK_SUBSCRIPTIONS);
+  });
+
+  it("fails closed when a create response omits the one-time secret", () => {
+    const parsed = parseWithFallback(
+      { subscription: { id: "sub-1" } },
+      CreateOutboundWebhookSubscriptionResponseSchema,
+      EMPTY_CREATE_OUTBOUND_WEBHOOK_SUBSCRIPTION,
+      { endpoint: "POST /api/workspaces/:id/outbound-webhooks" },
+    );
+    expect(parsed).toEqual(EMPTY_CREATE_OUTBOUND_WEBHOOK_SUBSCRIPTION);
+  });
+});
 
 const baseIssue = {
   id: "11111111-1111-1111-1111-111111111111",

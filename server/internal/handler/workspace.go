@@ -1302,6 +1302,10 @@ func (h *Handler) DeleteWorkspace(w http.ResponseWriter, r *http.Request) {
 			run:  func() error { return qtx.DeleteWorkspacePluginData(ctx, requester.WorkspaceID) },
 		},
 		{
+			name: "delete outbound webhooks",
+			run:  func() error { return qtx.DeleteWorkspaceOutboundWebhooks(ctx, requester.WorkspaceID) },
+		},
+		{
 			name: "delete agents",
 			run:  func() error { return qtx.DeleteWorkspaceAgents(ctx, requester.WorkspaceID) },
 		},

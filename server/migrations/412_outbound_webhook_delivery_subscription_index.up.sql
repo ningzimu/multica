@@ -1,0 +1,1 @@
+CREATE INDEX CONCURRENTLY outbound_webhook_delivery_subscription_idx ON outbound_webhook_delivery (subscription_id, created_at);

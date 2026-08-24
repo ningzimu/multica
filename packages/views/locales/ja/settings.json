@@ -1146,6 +1146,32 @@
       "checking": "確認中…"
     }
   },
+  "outbound_webhooks": {
+    "issue_created_event": "issue.created",
+    "section_title": "送信 Webhook",
+    "section_description": "選択したワークスペースイベントを汎用 HTTPS 受信先へ送信します。",
+    "name": "名前",
+    "destination": "送信先 URL",
+    "event_selection": "イベント選択",
+    "workspace_scope": "ワークスペース範囲にはプロジェクト内と未分類のタスクが含まれます。",
+    "workspace_scope_short": "ワークスペース範囲",
+    "create": "Webhook を作成",
+    "created": "Webhook を作成しました",
+    "create_failed": "Webhook の作成に失敗しました",
+    "create_partial_failure": "Webhook は作成された可能性がありますが、署名シークレットを表示できませんでした。削除して再作成してください。",
+    "delete": "Webhook を削除",
+    "deleted": "Webhook を削除しました",
+    "delete_failed": "Webhook の削除に失敗しました",
+    "inspect": "詳細",
+    "hide_details": "詳細を閉じる",
+    "destination_hint": "送信先",
+    "event_catalog_version": "イベントカタログバージョン",
+    "scope": "範囲",
+    "secret_once": "署名シークレットを今すぐコピーしてください。再表示されません。",
+    "secret_saved": "保存しました",
+    "load_failed": "送信 Webhook の読み込みに失敗しました。",
+    "empty": "送信 Webhook はまだありません。"
+  },
   "members": {
     "section_title": "メンバー（{{count}}）",
     "invite_title": "メンバーを招待",

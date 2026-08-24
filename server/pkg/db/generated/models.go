@@ -959,6 +959,36 @@ type NotificationPreference struct {
 	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
 }
 
+type OutboundWebhookDelivery struct {
+	ID             pgtype.UUID        `json:"id"`
+	EventID        pgtype.UUID        `json:"event_id"`
+	SubscriptionID pgtype.UUID        `json:"subscription_id"`
+	WorkspaceID    pgtype.UUID        `json:"workspace_id"`
+	EventType      string             `json:"event_type"`
+	RequestBody    []byte             `json:"request_body"`
+	State          string             `json:"state"`
+	AttemptCount   int32              `json:"attempt_count"`
+	ResponseStatus pgtype.Int4        `json:"response_status"`
+	FailureReason  pgtype.Text        `json:"failure_reason"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+	CompletedAt    pgtype.Timestamptz `json:"completed_at"`
+}
+
+type OutboundWebhookSubscription struct {
+	ID                    pgtype.UUID        `json:"id"`
+	WorkspaceID           pgtype.UUID        `json:"workspace_id"`
+	Name                  string             `json:"name"`
+	DestinationCiphertext []byte             `json:"destination_ciphertext"`
+	SecretCiphertext      []byte             `json:"secret_ciphertext"`
+	DestinationHint       string             `json:"destination_hint"`
+	Events                []byte             `json:"events"`
+	EventCatalogVersion   int32              `json:"event_catalog_version"`
+	ScopeMode             string             `json:"scope_mode"`
+	CreatedBy             pgtype.UUID        `json:"created_by"`
+	CreatedAt             pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt             pgtype.Timestamptz `json:"updated_at"`
+}
+
 type PersonalAccessToken struct {
 	ID          pgtype.UUID        `json:"id"`
 	UserID      pgtype.UUID        `json:"user_id"`

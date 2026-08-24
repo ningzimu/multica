@@ -1,0 +1,1 @@
+CREATE UNIQUE INDEX CONCURRENTLY outbound_webhook_subscription_id_idx ON outbound_webhook_subscription (id);

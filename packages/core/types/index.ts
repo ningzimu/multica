@@ -110,6 +110,12 @@ export type {
 } from "./plugin";
 export type { InboxItem, InboxSeverity, InboxItemType, InboxWorkspaceUnread } from "./inbox";
 export type { NotificationGroupKey, NotificationGroupValue, NotificationPreferences, NotificationPreferenceResponse } from "./notification-preference";
+export type {
+  OutboundWebhookSubscription,
+  ListOutboundWebhookSubscriptionsResponse,
+  CreateOutboundWebhookSubscriptionRequest,
+  CreateOutboundWebhookSubscriptionResponse,
+} from "./outbound-webhook";
 export type { Comment, CommentType, CommentAuthorType, CommentTriggerPreview, CommentTriggerPreviewAgent, CommentTriggerSource, CommentTriggerOutcome, CommentTriggerStatus, Reaction } from "./comment";
 export type { Label, LabelResourceType, CreateLabelRequest, UpdateLabelRequest, ListLabelsResponse, IssueLabelsResponse, ResourceLabelsResponse } from "./label";
 export type { IssueProperty, IssuePropertyType, IssuePropertyOption, IssuePropertyConfig, IssuePropertyValue, IssuePropertyValues, CreatePropertyRequest, UpdatePropertyRequest, ListPropertiesResponse, IssuePropertiesResponse, IssuePropertyActorKind, IssuePropertyActorRef } from "./property";

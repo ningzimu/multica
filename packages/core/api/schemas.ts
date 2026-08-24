@@ -83,6 +83,9 @@ import type {
   User,
   WebhookDelivery,
   WorkspaceMcpServer,
+  OutboundWebhookSubscription,
+  ListOutboundWebhookSubscriptionsResponse,
+  CreateOutboundWebhookSubscriptionResponse,
 } from "../types";
 import type { CloudRuntimeNode } from "../runtimes/cloud-runtime";
 import type { CreateFeedbackResponse } from "../feedback/types";
@@ -353,6 +356,61 @@ export const EMPTY_LIST_GITHUB_INSTALLATIONS_RESPONSE: ListGitHubInstallationsRe
   configured: false,
   repository_browse_configured: false,
   can_manage: false,
+};
+
+export const OutboundWebhookSubscriptionSchema = z
+  .object({
+    id: z.string(),
+    workspace_id: z.string(),
+    name: z.string(),
+    destination_hint: z.string(),
+    events: z.array(z.string()).default([]),
+    event_catalog_version: z.number().default(1),
+    scope_mode: z.literal("workspace").default("workspace"),
+    created_at: z.string(),
+    updated_at: z.string(),
+  })
+  .loose()
+  .transform(
+    (value): OutboundWebhookSubscription => ({
+      id: value.id,
+      workspaceId: value.workspace_id,
+      name: value.name,
+      destinationHint: value.destination_hint,
+      events: value.events,
+      eventCatalogVersion: value.event_catalog_version,
+      scopeMode: value.scope_mode,
+      createdAt: value.created_at,
+      updatedAt: value.updated_at,
+    }),
+  );
+
+export const ListOutboundWebhookSubscriptionsResponseSchema = z.object({
+  subscriptions: z.array(OutboundWebhookSubscriptionSchema).default([]),
+}).loose();
+
+export const CreateOutboundWebhookSubscriptionResponseSchema = z
+  .object({
+    subscription: OutboundWebhookSubscriptionSchema,
+    signing_secret: z.string(),
+  })
+  .loose()
+  .transform(
+    (value): CreateOutboundWebhookSubscriptionResponse => ({
+      subscription: value.subscription,
+      signingSecret: value.signing_secret,
+    }),
+  );
+
+export const EMPTY_OUTBOUND_WEBHOOK_SUBSCRIPTION: OutboundWebhookSubscription = {
+  id: "", workspaceId: "", name: "", destinationHint: "", events: [],
+  eventCatalogVersion: 1, scopeMode: "workspace", createdAt: "", updatedAt: "",
+};
+
+export const EMPTY_LIST_OUTBOUND_WEBHOOK_SUBSCRIPTIONS: ListOutboundWebhookSubscriptionsResponse = { subscriptions: [] };
+export const EMPTY_CREATE_OUTBOUND_WEBHOOK_SUBSCRIPTION: CreateOutboundWebhookSubscriptionResponse = {
+  subscription: EMPTY_OUTBOUND_WEBHOOK_SUBSCRIPTION,
+  signingSecret: "",
 };
 
 export const GitHubConnectResponseSchema = z.object({

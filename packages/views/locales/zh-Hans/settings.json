@@ -1146,6 +1146,32 @@
       "checking": "检查中..."
     }
   },
+  "outbound_webhooks": {
+    "issue_created_event": "issue.created",
+    "section_title": "出站 Webhook",
+    "section_description": "将选定的工作区事件发送到通用 HTTPS 接收端。",
+    "name": "名称",
+    "destination": "目标 URL",
+    "event_selection": "事件选择",
+    "workspace_scope": "工作区范围包含所有项目内及未归属项目的任务。",
+    "workspace_scope_short": "工作区范围",
+    "create": "创建 Webhook",
+    "created": "Webhook 已创建",
+    "create_failed": "创建 Webhook 失败",
+    "create_partial_failure": "Webhook 可能已创建，但签名密钥无法显示。请删除后重新创建。",
+    "delete": "删除 Webhook",
+    "deleted": "Webhook 已删除",
+    "delete_failed": "删除 Webhook 失败",
+    "inspect": "查看",
+    "hide_details": "收起详情",
+    "destination_hint": "目标地址",
+    "event_catalog_version": "事件目录版本",
+    "scope": "范围",
+    "secret_once": "请立即复制签名密钥，之后不会再次显示。",
+    "secret_saved": "已保存",
+    "load_failed": "加载出站 Webhook 失败。",
+    "empty": "暂无出站 Webhook。"
+  },
   "members": {
     "section_title": "成员（{{count}}）",
     "invite_title": "邀请成员",

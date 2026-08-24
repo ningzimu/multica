@@ -489,6 +489,22 @@ func (q *Queries) DeleteWorkspaceLeafData(ctx context.Context, workspaceID pgtyp
 	return err
 }
 
+const deleteWorkspaceOutboundWebhooks = `-- name: DeleteWorkspaceOutboundWebhooks :exec
+WITH deleted_deliveries AS (
+    DELETE FROM outbound_webhook_delivery
+    WHERE outbound_webhook_delivery.workspace_id = $1
+)
+DELETE FROM outbound_webhook_subscription
+WHERE outbound_webhook_subscription.workspace_id = $1
+`
+
+// Deliveries carry workspace_id because relationships have no foreign keys;
+// deleting by that ownership key also sweeps any pre-existing orphan.
+func (q *Queries) DeleteWorkspaceOutboundWebhooks(ctx context.Context, workspaceID pgtype.UUID) error {
+	_, err := q.db.Exec(ctx, deleteWorkspaceOutboundWebhooks, workspaceID)
+	return err
+}
+
 const deleteWorkspacePluginData = `-- name: DeleteWorkspacePluginData :exec
 WITH installations AS MATERIALIZED (
     SELECT plugin_installation.id
