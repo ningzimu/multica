@@ -37,25 +37,34 @@ const (
 	EventIssueAssigneeChanged = "issue.assignee_changed"
 	EventIssuePriorityChanged = "issue.priority_changed"
 	EventIssueProjectChanged  = "issue.project_changed"
+	EventCommentCreated       = "comment.created"
+	EventCommentUpdated       = "comment.updated"
+	EventCommentDeleted       = "comment.deleted"
 	ScopeWorkspace            = "workspace"
 	CatalogVersion            = 1
-	maxResponseBytes          = 64 << 10
-	deliveryTimeout           = 10 * time.Second
-	dispatchWorkers           = 4
-	dispatchQueueSize         = 64
+
+	maxCommentExcerptCodePoints = 500
+	maxResponseBytes            = 64 << 10
+	deliveryTimeout             = 10 * time.Second
+	dispatchWorkers             = 4
+	dispatchQueueSize           = 64
 )
 
-var issueEventCatalog = []string{
+var eventCatalog = []string{
 	EventIssueCreated,
 	EventIssueStatusChanged,
 	EventIssueAssigneeChanged,
 	EventIssuePriorityChanged,
 	EventIssueProjectChanged,
+	EventCommentCreated,
+	EventCommentUpdated,
+	EventCommentDeleted,
 }
 
 var (
-	ErrUnavailable  = errors.New("outbound webhooks are unavailable")
-	ErrInvalidInput = errors.New("invalid outbound webhook input")
+	ErrUnavailable          = errors.New("outbound webhooks are unavailable")
+	ErrInvalidInput         = errors.New("invalid outbound webhook input")
+	errCommentBodyUnchanged = errors.New("comment body is unchanged")
 )
 
 type Service struct {
@@ -162,6 +171,9 @@ func (s *Service) Register(bus *events.Bus) {
 	}
 	bus.Subscribe(protocol.EventIssueCreated, s.captureIssueCreated)
 	bus.Subscribe(protocol.EventIssueUpdated, s.captureIssueUpdated)
+	bus.Subscribe(protocol.EventCommentCreated, func(event events.Event) { s.captureComment(event, EventCommentCreated) })
+	bus.Subscribe(protocol.EventCommentUpdated, func(event events.Event) { s.captureComment(event, EventCommentUpdated) })
+	bus.Subscribe(protocol.EventCommentDeleted, func(event events.Event) { s.captureComment(event, EventCommentDeleted) })
 }
 
 func (s *Service) startDispatcher() {
@@ -282,8 +294,8 @@ func validateEventSelection(selected []string) error {
 	if len(selected) == 0 {
 		return fmt.Errorf("%w: select at least one event", ErrInvalidInput)
 	}
-	known := make(map[string]struct{}, len(issueEventCatalog))
-	for _, eventType := range issueEventCatalog {
+	known := make(map[string]struct{}, len(eventCatalog))
+	for _, eventType := range eventCatalog {
 		known[eventType] = struct{}{}
 	}
 	seen := make(map[string]struct{}, len(selected))
@@ -439,9 +451,11 @@ func (s *Service) captureProductEvents(event events.Event, productEvents []produ
 			continue
 		}
 		eventID := uuid.New()
-		body, err := s.issueEventBody(ctx, event, eventID, product)
+		body, err := s.productEventBody(ctx, queries, workspaceID, event, eventID, product)
 		if err != nil {
-			slog.Error("outbound webhook canonicalization failed", "event_type", product.eventType, "error", err)
+			if !errors.Is(err, errCommentBodyUnchanged) {
+				slog.Error("outbound webhook canonicalization failed", "event_type", product.eventType, "error", err)
+			}
 			return
 		}
 		for _, subscription := range rows {
@@ -470,6 +484,31 @@ func (s *Service) captureProductEvents(event events.Event, productEvents []produ
 		default:
 			slog.Warn("outbound webhook immediate dispatch queue full", "delivery_id", util.UUIDToString(item.delivery.ID), "event_type", item.delivery.EventType)
 		}
+	}
+}
+
+func (s *Service) captureComment(event events.Event, eventType string) {
+	s.captureProductEvents(event, []productEvent{{eventType: eventType}})
+}
+
+func (s *Service) productEventBody(ctx context.Context, queries *db.Queries, workspaceID pgtype.UUID, event events.Event, eventID uuid.UUID, product productEvent) ([]byte, error) {
+	switch product.eventType {
+	case EventCommentCreated, EventCommentUpdated, EventCommentDeleted:
+		issueID, err := commentEventIssueID(event.Payload, product.eventType)
+		if err != nil {
+			return nil, err
+		}
+		parsedIssueID, err := util.ParseUUID(issueID)
+		if err != nil {
+			return nil, errors.New("comment payload has an invalid issue id")
+		}
+		issue, err := queries.GetIssueInWorkspace(ctx, db.GetIssueInWorkspaceParams{ID: parsedIssueID, WorkspaceID: workspaceID})
+		if err != nil {
+			return nil, fmt.Errorf("load parent issue: %w", err)
+		}
+		return s.commentBody(event, eventID, issue, product.eventType)
+	default:
+		return s.issueEventBody(ctx, event, eventID, product)
 	}
 }
 
@@ -665,6 +704,159 @@ func (s *Service) resolveAssignee(ctx context.Context, workspaceID string, assig
 		return nil, fmt.Errorf("unsupported issue assignee type %q", *assigneeType)
 	}
 	return snapshot, nil
+}
+
+func commentEventIssueID(payload any, eventType string) (string, error) {
+	object, ok := payload.(map[string]any)
+	if !ok {
+		return "", errors.New("comment payload is not an object")
+	}
+	if eventType == EventCommentDeleted {
+		issueID, _ := object["issue_id"].(string)
+		if issueID == "" {
+			return "", errors.New("comment deletion payload has no issue id")
+		}
+		return issueID, nil
+	}
+	rawComment, ok := object["comment"]
+	if !ok {
+		return "", errors.New("comment payload has no comment")
+	}
+	encoded, err := json.Marshal(rawComment)
+	if err != nil {
+		return "", err
+	}
+	var comment struct {
+		IssueID string `json:"issue_id"`
+	}
+	if err := json.Unmarshal(encoded, &comment); err != nil || comment.IssueID == "" {
+		return "", errors.New("comment payload has no issue id")
+	}
+	return comment.IssueID, nil
+}
+
+type publicCommentSnapshot struct {
+	ID       string  `json:"id"`
+	IssueID  string  `json:"issue_id"`
+	ParentID *string `json:"parent_id"`
+	Author   struct {
+		Type string `json:"type"`
+		ID   string `json:"id"`
+	} `json:"author"`
+	Type      string `json:"type"`
+	Excerpt   string `json:"excerpt,omitempty"`
+	Truncated *bool  `json:"truncated,omitempty"`
+	CreatedAt string `json:"created_at,omitempty"`
+	UpdatedAt string `json:"updated_at,omitempty"`
+	DeletedAt string `json:"deleted_at,omitempty"`
+}
+
+type publicParentIssueSnapshot struct {
+	ID        string  `json:"id"`
+	Title     string  `json:"title"`
+	Status    string  `json:"status"`
+	Priority  string  `json:"priority"`
+	ProjectID *string `json:"project_id"`
+}
+
+func (s *Service) commentBody(event events.Event, eventID uuid.UUID, issue db.Issue, eventType string) ([]byte, error) {
+	payload, ok := event.Payload.(map[string]any)
+	if !ok {
+		return nil, errors.New("comment payload is not an object")
+	}
+
+	comment := publicCommentSnapshot{}
+	if eventType == EventCommentDeleted {
+		comment.ID, _ = payload["comment_id"].(string)
+		comment.IssueID, _ = payload["issue_id"].(string)
+		comment.ParentID = optionalString(payload["parent_id"])
+		comment.Author.Type, _ = payload["author_type"].(string)
+		comment.Author.ID, _ = payload["author_id"].(string)
+		comment.Type, _ = payload["comment_type"].(string)
+		comment.DeletedAt = s.now().UTC().Format(time.RFC3339)
+	} else {
+		if eventType == EventCommentUpdated {
+			bodyChanged, _ := payload["body_changed"].(bool)
+			if !bodyChanged {
+				return nil, errCommentBodyUnchanged
+			}
+		}
+		rawComment, ok := payload["comment"]
+		if !ok {
+			return nil, errors.New("comment payload has no comment")
+		}
+		encoded, err := json.Marshal(rawComment)
+		if err != nil {
+			return nil, err
+		}
+		var source struct {
+			ID         string  `json:"id"`
+			IssueID    string  `json:"issue_id"`
+			ParentID   *string `json:"parent_id"`
+			AuthorType string  `json:"author_type"`
+			AuthorID   string  `json:"author_id"`
+			Content    string  `json:"content"`
+			Type       string  `json:"type"`
+			CreatedAt  string  `json:"created_at"`
+			UpdatedAt  string  `json:"updated_at"`
+		}
+		if err := json.Unmarshal(encoded, &source); err != nil {
+			return nil, err
+		}
+		comment.ID, comment.IssueID, comment.ParentID = source.ID, source.IssueID, source.ParentID
+		comment.Author.Type, comment.Author.ID = source.AuthorType, source.AuthorID
+		comment.Type, comment.CreatedAt, comment.UpdatedAt = source.Type, source.CreatedAt, source.UpdatedAt
+		excerptRunes := []rune(source.Content)
+		truncated := len(excerptRunes) > maxCommentExcerptCodePoints
+		if truncated {
+			excerptRunes = excerptRunes[:maxCommentExcerptCodePoints]
+		}
+		comment.Excerpt = string(excerptRunes)
+		comment.Truncated = &truncated
+	}
+	if comment.ID == "" || comment.IssueID == "" || comment.IssueID != util.UUIDToString(issue.ID) || comment.Author.Type == "" || comment.Type == "" {
+		return nil, errors.New("comment payload is incomplete")
+	}
+
+	envelope := struct {
+		Version    int       `json:"version"`
+		ID         string    `json:"id"`
+		Type       string    `json:"type"`
+		OccurredAt time.Time `json:"occurred_at"`
+		Workspace  struct {
+			ID string `json:"id"`
+		} `json:"workspace"`
+		Actor struct {
+			Type string `json:"type"`
+			ID   string `json:"id"`
+		} `json:"actor"`
+		Data struct {
+			Comment publicCommentSnapshot     `json:"comment"`
+			Issue   publicParentIssueSnapshot `json:"issue"`
+		} `json:"data"`
+	}{Version: 1, ID: eventID.String(), Type: eventType, OccurredAt: s.now().UTC()}
+	envelope.Workspace.ID = event.WorkspaceID
+	envelope.Actor.Type, envelope.Actor.ID = event.ActorType, event.ActorID
+	envelope.Data.Comment = comment
+	envelope.Data.Issue = publicParentIssueSnapshot{
+		ID: util.UUIDToString(issue.ID), Title: issue.Title, Status: issue.Status,
+		Priority: issue.Priority, ProjectID: util.UUIDToPtr(issue.ProjectID),
+	}
+	return json.Marshal(envelope)
+}
+
+func optionalString(value any) *string {
+	if value == nil {
+		return nil
+	}
+	if raw, ok := value.(string); ok && raw != "" {
+		return &raw
+	}
+	if raw, ok := value.(*string); ok && raw != nil && *raw != "" {
+		copy := *raw
+		return &copy
+	}
+	return nil
 }
 
 func (s *Service) deliver(ctx context.Context, subscription db.OutboundWebhookSubscription, delivery db.OutboundWebhookDelivery) {

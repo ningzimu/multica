@@ -98,6 +98,26 @@ describe("OutboundWebhooksTab", () => {
     }));
   });
 
+  it("selects Comment events independently", async () => {
+    const user = userEvent.setup();
+    render(<OutboundWebhooksTab />, { wrapper: Wrapper });
+
+    await user.type(screen.getByLabelText("Name"), "Comment receiver");
+    await user.type(screen.getByLabelText("Destination URL"), "https://example.com/events");
+    await user.click(screen.getByRole("checkbox", { name: "issue.created" }));
+    await user.click(screen.getByRole("checkbox", { name: "comment.created" }));
+    await user.click(screen.getByRole("checkbox", { name: "comment.deleted" }));
+    expect(screen.getByRole("checkbox", { name: "comment.updated" })).not.toBeChecked();
+    await user.click(screen.getByRole("button", { name: "Create webhook" }));
+
+    await waitFor(() => expect(mockCreate).toHaveBeenCalledWith("workspace-1", {
+      name: "Comment receiver",
+      destination: "https://example.com/events",
+      events: ["comment.created", "comment.deleted"],
+      scopeMode: "workspace",
+    }));
+  });
+
   it("loads a safe detail view for inspection", async () => {
     mockList.mockResolvedValue({ subscriptions: [
       { id: "sub-1", workspaceId: "workspace-1", name: "Receiver", destinationHint: "https://example.com", events: ["issue.created"], eventCatalogVersion: 1, scopeMode: "workspace", createdAt: "now", updatedAt: "now" },

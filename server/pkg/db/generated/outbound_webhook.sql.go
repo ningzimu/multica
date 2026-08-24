@@ -218,7 +218,8 @@ func (q *Queries) GetOutboundWebhookSubscriptionForUpdate(ctx context.Context, a
 
 const listActiveOutboundWebhookSubscriptionsForEvent = `-- name: ListActiveOutboundWebhookSubscriptionsForEvent :many
 SELECT id, workspace_id, name, destination_ciphertext, secret_ciphertext, destination_hint, events, event_catalog_version, scope_mode, created_by, created_at, updated_at FROM outbound_webhook_subscription
-WHERE workspace_id = $1 AND events ? $2::text
+WHERE workspace_id = $1
+  AND events ? $2::text
 ORDER BY created_at ASC
 FOR SHARE
 `

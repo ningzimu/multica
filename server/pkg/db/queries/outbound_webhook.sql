@@ -12,7 +12,8 @@ ORDER BY created_at ASC;
 
 -- name: ListActiveOutboundWebhookSubscriptionsForEvent :many
 SELECT * FROM outbound_webhook_subscription
-WHERE workspace_id = $1 AND events ? sqlc.arg('event_type')::text
+WHERE workspace_id = sqlc.arg('workspace_id')
+  AND events ? sqlc.arg('event_type')::text
 ORDER BY created_at ASC
 FOR SHARE;
 

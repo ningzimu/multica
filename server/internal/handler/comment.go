@@ -3462,7 +3462,10 @@ func (h *Handler) UpdateComment(w http.ResponseWriter, r *http.Request) {
 	resp := commentToResponse(comment, grouped[cid], groupedAtt[cid])
 	resp.IssueRevision = issueRevision
 	slog.Info("comment updated", append(logger.RequestAttrs(r), "comment_id", commentId)...)
-	eventPayload := map[string]any{"comment": resp}
+	eventPayload := map[string]any{
+		"comment":      resp,
+		"body_changed": oldContent != comment.Content,
+	}
 	if issueRevision > 0 {
 		eventPayload["issue_revision"] = issueRevision
 	}
@@ -3564,8 +3567,12 @@ func (h *Handler) DeleteComment(w http.ResponseWriter, r *http.Request) {
 	h.deleteS3Objects(r.Context(), attachmentURLs)
 	slog.Info("comment deleted", append(logger.RequestAttrs(r), "comment_id", commentId, "issue_id", uuidToString(comment.IssueID))...)
 	eventPayload := map[string]any{
-		"comment_id": uuidToString(comment.ID),
-		"issue_id":   uuidToString(comment.IssueID),
+		"comment_id":   uuidToString(comment.ID),
+		"issue_id":     uuidToString(comment.IssueID),
+		"parent_id":    uuidToPtr(comment.ParentID),
+		"author_type":  comment.AuthorType,
+		"author_id":    uuidToString(comment.AuthorID),
+		"comment_type": comment.Type,
 	}
 	if deleted.IssueRevision > 0 {
 		eventPayload["issue_revision"] = deleted.IssueRevision

@@ -7,8 +7,8 @@ import { toast } from "sonner";
 import { useCurrentWorkspace } from "@multica/core/paths";
 import { useCurrentMember } from "@multica/core/permissions";
 import {
-  OUTBOUND_WEBHOOK_ISSUE_EVENTS,
-  type OutboundWebhookIssueEvent,
+  outboundWebhookEventTypes,
+  type OutboundWebhookEventType,
 } from "@multica/core/types";
 import {
   outboundWebhookSubscriptionOptions,
@@ -33,7 +33,7 @@ export function OutboundWebhooksTab() {
   const subscriptions = useQuery(outboundWebhookSubscriptionsOptions(wsId));
   const [name, setName] = useState("");
   const [destination, setDestination] = useState("");
-  const [selectedEvents, setSelectedEvents] = useState<OutboundWebhookIssueEvent[]>([
+  const [selectedEvents, setSelectedEvents] = useState<OutboundWebhookEventType[]>([
     "issue.created",
   ]);
   const [disclosedSecret, setDisclosedSecret] = useState<string | null>(null);
@@ -72,6 +72,7 @@ export function OutboundWebhooksTab() {
                     setDisclosedSecret(result.signingSecret);
                     setName("");
                     setDestination("");
+                    setSelectedEvents(["issue.created"]);
                     toast.success(t(($) => $.outbound_webhooks.created));
                   },
                   onError: (error) =>
@@ -94,23 +95,21 @@ export function OutboundWebhooksTab() {
             </div>
             <div className="space-y-2">
               <p className="text-body font-medium">{t(($) => $.outbound_webhooks.event_selection)}</p>
-              {OUTBOUND_WEBHOOK_ISSUE_EVENTS.map((eventName) => (
-                <Label key={eventName} className="flex items-center gap-2 font-normal">
+              {outboundWebhookEventTypes.map((eventType) => (
+                <Label key={eventType} className="flex items-center gap-2 font-normal">
                   <Checkbox
-                    checked={selectedEvents.includes(eventName)}
+                    checked={selectedEvents.includes(eventType)}
                     onCheckedChange={(checked) =>
                       setSelectedEvents((current) =>
                         checked === true
-                          ? [...current, eventName].sort(
-                              (left, right) =>
-                                OUTBOUND_WEBHOOK_ISSUE_EVENTS.indexOf(left) -
-                                OUTBOUND_WEBHOOK_ISSUE_EVENTS.indexOf(right),
-                            )
-                          : current.filter((candidate) => candidate !== eventName),
+                          ? current.includes(eventType)
+                            ? current
+                            : [...current, eventType]
+                          : current.filter((candidate) => candidate !== eventType),
                       )
                     }
                   />
-                  <code>{eventName}</code>
+                  <code>{eventType}</code>
                 </Label>
               ))}
             </div>
@@ -184,7 +183,7 @@ export function OutboundWebhooksTab() {
                     <div><dt className="text-muted-foreground">{t(($) => $.outbound_webhooks.scope)}</dt><dd>{t(($) => $.outbound_webhooks.workspace_scope_short)}</dd></div>
                     {canManage && (
                       <div className="space-y-2 sm:col-span-2">
-                        {OUTBOUND_WEBHOOK_ISSUE_EVENTS.map((eventName) => (
+                        {outboundWebhookEventTypes.map((eventName) => (
                           <Label key={eventName} className="flex items-center gap-2 font-normal">
                             <Checkbox
                               checked={editingEvents.includes(eventName)}

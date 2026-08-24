@@ -1,12 +1,15 @@
-export const OUTBOUND_WEBHOOK_ISSUE_EVENTS = [
+export const outboundWebhookEventTypes = [
   "issue.created",
   "issue.status_changed",
   "issue.assignee_changed",
   "issue.priority_changed",
   "issue.project_changed",
+  "comment.created",
+  "comment.updated",
+  "comment.deleted",
 ] as const;
 
-export type OutboundWebhookIssueEvent = (typeof OUTBOUND_WEBHOOK_ISSUE_EVENTS)[number];
+export type OutboundWebhookEventType = (typeof outboundWebhookEventTypes)[number];
 
 export interface OutboundWebhookSubscription {
   id: string;
@@ -27,7 +30,7 @@ export interface ListOutboundWebhookSubscriptionsResponse {
 export interface CreateOutboundWebhookSubscriptionRequest {
   name: string;
   destination: string;
-  events: OutboundWebhookIssueEvent[];
+  events: OutboundWebhookEventType[];
   scopeMode: "workspace";
 }
 

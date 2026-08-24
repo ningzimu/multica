@@ -23,6 +23,7 @@ import (
 	"github.com/multica-ai/multica/server/internal/util"
 	"github.com/multica-ai/multica/server/internal/util/secretbox"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
+	"github.com/multica-ai/multica/server/pkg/protocol"
 )
 
 type receivedOutboundWebhook struct {
@@ -446,6 +447,179 @@ func TestIssueAssigneeEventsPreserveVariantsAndExplicitNulls(t *testing.T) {
 	transferChange := transferEnvelope["data"].(map[string]any)["change"].(map[string]any)
 	if transferChange["previous"].(map[string]any)["type"] != "squad" || transferChange["current"].(map[string]any)["type"] != "agent" {
 		t.Fatalf("bulk squad assignee transfer = %#v", transferChange)
+	}
+}
+
+func TestCommentLifecyclePersistsAndDeliversSelectedWorkspaceWebhooks(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database unavailable")
+	}
+	received := make(chan receivedOutboundWebhook, 8)
+	receiver := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		observed := receivedOutboundWebhook{body: body, header: r.Header.Clone()}
+		observed.persistenceError = testPool.QueryRow(context.Background(),
+			`SELECT state, request_body FROM outbound_webhook_delivery WHERE id = $1`,
+			r.Header.Get("X-Multica-Delivery-ID"),
+		).Scan(&observed.persistedState, &observed.persistedBody)
+		received <- observed
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer receiver.Close()
+
+	box, err := secretbox.New([]byte("0123456789abcdef0123456789abcdef"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	queries := db.New(testPool)
+	bus := events.New()
+	outbound := outwebhook.New(queries, testPool, box, []string{receiver.URL}, outwebhook.WithHTTPClient(receiver.Client()))
+	outbound.Register(bus)
+	t.Cleanup(func() {
+		outbound.Close()
+		if !outbound.WaitWithTimeout(time.Second) {
+			t.Error("outbound webhook dispatcher did not stop")
+		}
+	})
+	h := New(queries, testPool, testHandler.Hub, bus, service.NewEmailService(), nil, nil, analytics.NoopClient{}, Config{AllowSignup: true})
+	h.OutboundWebhooks = outbound
+
+	create := testutil.Call(t, h.CreateOutboundWebhook,
+		withURLParam(newRequest(http.MethodPost, "/api/workspaces/"+testWorkspaceID+"/outbound-webhooks", map[string]any{
+			"name": "Comment receiver", "destination": receiver.URL + "/events",
+			"events": []string{"comment.created", "comment.updated", "comment.deleted"}, "scope_mode": "workspace",
+		}), "id", testWorkspaceID)).Want(http.StatusCreated)
+	var subscription struct {
+		Subscription outwebhook.Subscription `json:"subscription"`
+	}
+	create.JSON(&subscription)
+	t.Cleanup(func() {
+		_, _ = testPool.Exec(context.Background(), `DELETE FROM outbound_webhook_delivery WHERE subscription_id = $1`, subscription.Subscription.ID)
+		_, _ = testPool.Exec(context.Background(), `DELETE FROM outbound_webhook_subscription WHERE id = $1`, subscription.Subscription.ID)
+	})
+
+	projectID := dbfx.Project(t, "Comment webhook project")
+	issueID := dbfx.Issue(t, "Comment webhook parent", testutil.Cols{"project_id": projectID})
+	createComment := func(content string, parentID *string) CommentResponse {
+		t.Helper()
+		body := map[string]any{"content": content}
+		if parentID != nil {
+			body["parent_id"] = *parentID
+		}
+		var comment CommentResponse
+		testutil.Call(t, h.CreateComment,
+			withURLParam(newRequest(http.MethodPost, "/api/issues/"+issueID+"/comments", body), "id", issueID)).Want(http.StatusCreated).JSON(&comment)
+		return comment
+	}
+	receive := func(wantType string) map[string]any {
+		t.Helper()
+		select {
+		case got := <-received:
+			if got.persistenceError != nil || got.persistedState != "pending" || string(got.persistedBody) != string(got.body) {
+				t.Fatalf("%s was not persisted before receiver I/O: state=%q err=%v", wantType, got.persistedState, got.persistenceError)
+			}
+			if got.header.Get("X-Multica-Event") != wantType {
+				t.Fatalf("event header = %q, want %q", got.header.Get("X-Multica-Event"), wantType)
+			}
+			var envelope map[string]any
+			if err := json.Unmarshal(got.body, &envelope); err != nil {
+				t.Fatal(err)
+			}
+			return envelope
+		case <-time.After(5 * time.Second):
+			t.Fatalf("controlled receiver did not observe %s", wantType)
+			return nil
+		}
+	}
+
+	root := createComment(strings.Repeat("界", 500)+"🙂", nil)
+	createdEnvelope := receive("comment.created")
+	createdJSON, _ := json.Marshal(createdEnvelope)
+	if strings.Contains(string(createdJSON), "attachments") || strings.Contains(string(createdJSON), "reactions") || strings.Contains(string(createdJSON), `"content"`) {
+		t.Fatalf("internal comment fields leaked: %s", createdJSON)
+	}
+	createdData := createdEnvelope["data"].(map[string]any)
+	createdComment := createdData["comment"].(map[string]any)
+	if len([]rune(createdComment["excerpt"].(string))) != 500 || createdComment["truncated"] != true {
+		t.Fatalf("created excerpt contract failed: %#v", createdComment)
+	}
+	if createdEnvelope["actor"].(map[string]any)["type"] != "member" || createdComment["author"].(map[string]any)["type"] != "member" {
+		t.Fatalf("member actor/author context missing: %#v", createdEnvelope)
+	}
+	issueSnapshot := createdData["issue"].(map[string]any)
+	if issueSnapshot["id"] != issueID || issueSnapshot["title"] != "Comment webhook parent" || issueSnapshot["project_id"] != projectID {
+		t.Fatalf("parent issue snapshot missing: %#v", issueSnapshot)
+	}
+
+	reply := createComment("reply body", &root.ID)
+	replyEnvelope := receive("comment.created")
+	if got := replyEnvelope["data"].(map[string]any)["comment"].(map[string]any)["parent_id"]; got != root.ID {
+		t.Fatalf("reply parent = %v, want %s", got, root.ID)
+	}
+
+	testutil.Call(t, h.UpdateComment,
+		withURLParam(newRequest(http.MethodPut, "/api/comments/"+reply.ID, map[string]any{"content": "edited reply"}), "commentId", reply.ID)).Want(http.StatusOK)
+	updatedEnvelope := receive("comment.updated")
+	if got := updatedEnvelope["data"].(map[string]any)["comment"].(map[string]any)["excerpt"]; got != "edited reply" {
+		t.Fatalf("updated excerpt = %v", got)
+	}
+
+	bus.Publish(events.Event{
+		Type: protocol.EventCommentUpdated, WorkspaceID: testWorkspaceID, ActorType: "member", ActorID: testUserID,
+		Payload: map[string]any{"body_changed": false, "comment": map[string]any{
+			"id": reply.ID, "issue_id": issueID, "author_type": "member", "author_id": testUserID,
+			"type": "comment", "content": "edited reply",
+		}},
+	})
+	select {
+	case got := <-received:
+		t.Fatalf("attachment-only update unexpectedly delivered %s", got.header.Get("X-Multica-Event"))
+	case <-time.After(200 * time.Millisecond):
+	}
+	if count := dbfx.Count(t, `SELECT count(*) FROM outbound_webhook_delivery WHERE subscription_id = $1 AND event_type = 'comment.updated'`, subscription.Subscription.ID); count != 1 {
+		t.Fatalf("attachment-only update changed persisted delivery count to %d, want 1", count)
+	}
+
+	testutil.Call(t, h.DeleteComment,
+		withURLParam(newRequest(http.MethodDelete, "/api/comments/"+reply.ID, nil), "commentId", reply.ID)).Want(http.StatusNoContent)
+	deletedEnvelope := receive("comment.deleted")
+	deletedJSON, _ := json.Marshal(deletedEnvelope)
+	if strings.Contains(string(deletedJSON), "edited reply") || strings.Contains(string(deletedJSON), "excerpt") || strings.Contains(string(deletedJSON), "content") {
+		t.Fatalf("deleted body leaked: %s", deletedJSON)
+	}
+	deletedComment := deletedEnvelope["data"].(map[string]any)["comment"].(map[string]any)
+	if deletedComment["id"] != reply.ID || deletedComment["parent_id"] != root.ID || deletedComment["deleted_at"] == "" {
+		t.Fatalf("deletion identity/context missing: %#v", deletedComment)
+	}
+
+	for _, variant := range []struct {
+		authorType string
+		parentID   *string
+	}{
+		{authorType: "agent"},
+		{authorType: "system", parentID: &root.ID},
+	} {
+		authorID := uuid.NewString()
+		if variant.authorType == "system" {
+			authorID = "00000000-0000-0000-0000-000000000000"
+		}
+		bus.Publish(events.Event{
+			Type: protocol.EventCommentCreated, WorkspaceID: testWorkspaceID,
+			ActorType: variant.authorType, ActorID: authorID,
+			Payload: map[string]any{"comment": map[string]any{
+				"id": uuid.NewString(), "issue_id": issueID, "parent_id": variant.parentID,
+				"author_type": variant.authorType, "author_id": authorID,
+				"type": "comment", "content": variant.authorType + " body",
+			}},
+		})
+		envelope := receive("comment.created")
+		comment := envelope["data"].(map[string]any)["comment"].(map[string]any)
+		if envelope["actor"].(map[string]any)["type"] != variant.authorType || comment["author"].(map[string]any)["type"] != variant.authorType {
+			t.Fatalf("%s actor/author contract missing: %#v", variant.authorType, envelope)
+		}
+		if variant.parentID != nil && comment["parent_id"] != *variant.parentID {
+			t.Fatalf("%s reply parent missing: %#v", variant.authorType, comment)
+		}
 	}
 }
 
