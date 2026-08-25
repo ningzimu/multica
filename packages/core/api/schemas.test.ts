@@ -68,6 +68,9 @@ import {
   RotateOutboundWebhookSecretResponseSchema,
   TestOutboundWebhookSubscriptionResponseSchema,
   EMPTY_CREATE_OUTBOUND_WEBHOOK_SUBSCRIPTION,
+  OutboundWebhookDeliverySchema,
+  ListOutboundWebhookDeliveriesResponseSchema,
+  EMPTY_OUTBOUND_WEBHOOK_DELIVERY,
 } from "./schemas";
 import { IssueViewSchema, IssueViewListSchema } from "./schemas";
 import {
@@ -204,6 +207,33 @@ describe("outbound webhook schemas", () => {
     );
     expect(parsed).toEqual(fallback);
     expect(parsed.deliveryId).toBe("");
+  });
+
+  it("parses redacted delivery history without exposing transport internals", () => {
+    const parsed = ListOutboundWebhookDeliveriesResponseSchema.parse({
+      deliveries: [{
+        id: "delivery-1", event_id: "event-1", subscription_id: "sub-1",
+        event_type: "issue.created", state: "failed", attempt_count: 2,
+        response_status: 503, response_excerpt: "temporarily unavailable",
+        failure_reason: "receiver returned HTTP 503", redelivery_of: null,
+        created_at: "2026-08-25T00:00:00Z", last_attempt_at: null, completed_at: null,
+        request_body: "must be ignored", destination_ciphertext: "must be ignored",
+      }],
+      total: 30, next_offset: 25,
+    });
+    expect(parsed.nextOffset).toBe(25);
+    expect(parsed.deliveries[0]).toMatchObject({ id: "delivery-1", responseStatus: 503 });
+    expect(parsed.deliveries[0]).not.toHaveProperty("requestBody");
+  });
+
+  it("fails closed when delivery detail is malformed", () => {
+    const parsed = parseWithFallback(
+      { id: "delivery-1", request_body: "private" },
+      OutboundWebhookDeliverySchema,
+      EMPTY_OUTBOUND_WEBHOOK_DELIVERY,
+      { endpoint: "GET delivery detail" },
+    );
+    expect(parsed).toEqual(EMPTY_OUTBOUND_WEBHOOK_DELIVERY);
   });
 });
 

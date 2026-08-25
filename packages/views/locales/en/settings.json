@@ -1204,7 +1204,11 @@
     "load_failed": "Failed to load outbound webhooks.",
     "unavailable": "Outbound Webhooks unavailable",
     "unavailable_description": "Configure the outbound webhook encryption key on this deployment to manage or deliver webhooks.",
-    "empty": "No outbound webhooks yet."
+    "empty": "No outbound webhooks yet.",
+    "delivery_history": "Delivery history", "history_failed": "Failed to load delivery history.",
+    "attempts": "Attempts", "redeliver": "Redeliver", "redelivery_queued": "Redelivery queued", "redelivery_failed": "Failed to redeliver",
+    "delivery_id": "Delivery ID", "event_id": "Event ID", "redelivery_of": "Redelivery of", "failure_reason": "Failure reason", "response_excerpt": "Response excerpt",
+    "previous": "Previous", "next": "Next", "deliveries_one": "{{count}} delivery", "deliveries_other": "{{count}} deliveries", "no_deliveries": "No deliveries yet."
   },
   "members": {
     "section_title": "Members ({{count}})",

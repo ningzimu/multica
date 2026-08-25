@@ -52,10 +52,17 @@ WHERE workspace_id = $1 AND id = $2
 RETURNING *;
 
 -- name: PauseOutboundWebhookSubscription :one
-UPDATE outbound_webhook_subscription
+WITH locked AS MATERIALIZED (
+    SELECT subscription.id, subscription.status
+    FROM outbound_webhook_subscription AS subscription
+    WHERE subscription.workspace_id = $1 AND subscription.id = $2
+    FOR UPDATE OF subscription
+)
+UPDATE outbound_webhook_subscription AS subscription
 SET status = 'paused', pause_reason = 'manual', updated_at = now()
-WHERE workspace_id = $1 AND id = $2
-RETURNING *;
+FROM locked
+WHERE subscription.id = locked.id
+RETURNING sqlc.embed(subscription), locked.status <> 'paused' AS newly_paused;
 
 -- name: ResumeOutboundWebhookSubscription :one
 UPDATE outbound_webhook_subscription
@@ -81,21 +88,30 @@ SET scope_mode = sqlc.arg('scope_mode'),
 WHERE workspace_id = sqlc.arg('workspace_id') AND id = sqlc.arg('id')
 RETURNING *;
 
--- name: RemoveProjectFromOutboundWebhookScopes :execrows
-UPDATE outbound_webhook_subscription
-SET project_ids = array_remove(project_ids, sqlc.arg('project_id')::uuid),
+-- name: RemoveProjectFromOutboundWebhookScopes :many
+WITH locked AS MATERIALIZED (
+    SELECT subscription.id, subscription.status,
+           cardinality(array_remove(subscription.project_ids, sqlc.arg('project_id')::uuid)) = 0 AS scope_empty
+    FROM outbound_webhook_subscription AS subscription
+    WHERE subscription.workspace_id = sqlc.arg('workspace_id')
+      AND subscription.scope_mode = 'project'
+      AND subscription.project_ids @> ARRAY[sqlc.arg('project_id')::uuid]
+    FOR UPDATE OF subscription
+)
+UPDATE outbound_webhook_subscription AS subscription
+SET project_ids = array_remove(subscription.project_ids, sqlc.arg('project_id')::uuid),
     status = CASE
-        WHEN cardinality(array_remove(project_ids, sqlc.arg('project_id')::uuid)) = 0 THEN 'paused'
-        ELSE status
+        WHEN locked.scope_empty THEN 'paused'
+        ELSE subscription.status
     END,
     pause_reason = CASE
-        WHEN cardinality(array_remove(project_ids, sqlc.arg('project_id')::uuid)) = 0 THEN 'scope_empty'
-        ELSE pause_reason
+        WHEN locked.scope_empty THEN 'scope_empty'
+        ELSE subscription.pause_reason
     END,
     updated_at = now()
-WHERE workspace_id = sqlc.arg('workspace_id')
-  AND scope_mode = 'project'
-  AND project_ids @> ARRAY[sqlc.arg('project_id')::uuid];
+FROM locked
+WHERE subscription.id = locked.id
+RETURNING subscription.id, locked.scope_empty AND locked.status <> 'paused' AS newly_paused;
 
 -- name: DeleteOutboundWebhookDeliveriesBySubscription :exec
 DELETE FROM outbound_webhook_delivery
@@ -125,7 +141,7 @@ SELECT pg_advisory_xact_lock(hashtext('outbound_webhook'), hashtext('delivery_cl
 
 -- name: ClaimDueOutboundWebhookDelivery :one
 WITH candidate AS (
-    SELECT delivery.id
+    SELECT delivery.id, delivery.lease_token IS NOT NULL AS lease_recovered
     FROM outbound_webhook_delivery AS delivery
     JOIN outbound_webhook_subscription AS subscription
       ON subscription.id = delivery.subscription_id
@@ -158,9 +174,9 @@ SET lease_token = gen_random_uuid(),
     last_attempt_at = now()
 FROM candidate
 WHERE delivery.id = candidate.id
-RETURNING delivery.*;
+RETURNING sqlc.embed(delivery), candidate.lease_recovered;
 
--- name: FailExhaustedOutboundWebhookDelivery :execrows
+-- name: FailExhaustedOutboundWebhookDelivery :one
 WITH target AS MATERIALIZED (
     SELECT delivery.id, delivery.subscription_id
     FROM outbound_webhook_delivery AS delivery
@@ -174,7 +190,7 @@ WITH target AS MATERIALIZED (
     ORDER BY delivery.next_attempt_at, delivery.created_at
     LIMIT 1
 ), locked_subscription AS MATERIALIZED (
-    SELECT subscription.id
+    SELECT subscription.id, subscription.status
     FROM outbound_webhook_subscription AS subscription
     JOIN target ON target.subscription_id = subscription.id
     WHERE subscription.status = 'active'
@@ -206,7 +222,11 @@ SET consecutive_terminal_failures = subscription.consecutive_terminal_failures +
         ELSE subscription.pause_reason
     END,
     updated_at = now()
-WHERE id = (SELECT subscription_id FROM completed);
+FROM locked_subscription
+WHERE subscription.id = (SELECT subscription_id FROM completed)
+  AND subscription.id = locked_subscription.id
+RETURNING subscription.id,
+          locked_subscription.status <> 'paused' AND subscription.status = 'paused' AS newly_paused;
 
 -- name: ReleaseClaimedOutboundWebhookDelivery :execrows
 UPDATE outbound_webhook_delivery
@@ -217,7 +237,8 @@ WHERE id = $1 AND lease_token = $2 AND state = 'pending';
 UPDATE outbound_webhook_delivery
 SET response_status = $3,
     failure_reason = $4,
-    next_attempt_at = $5,
+    response_excerpt = sqlc.arg('response_excerpt'),
+    next_attempt_at = sqlc.arg('next_attempt_at'),
     lease_token = NULL,
     lease_expires_at = NULL
 WHERE id = $1 AND lease_token = $2 AND state = 'pending';
@@ -234,6 +255,7 @@ WITH locked_subscription AS MATERIALIZED (
     UPDATE outbound_webhook_delivery AS delivery
     SET state = 'succeeded',
         response_status = $3,
+        response_excerpt = sqlc.arg('response_excerpt'),
         failure_reason = NULL,
         completed_at = now(),
         lease_token = NULL,
@@ -250,9 +272,9 @@ SET consecutive_terminal_failures = 0,
     updated_at = now()
 WHERE id = (SELECT subscription_id FROM completed);
 
--- name: FailClaimedOutboundWebhookDelivery :execrows
+-- name: FailClaimedOutboundWebhookDelivery :one
 WITH locked_subscription AS MATERIALIZED (
-    SELECT subscription.id
+    SELECT subscription.id, subscription.status
     FROM outbound_webhook_subscription AS subscription
     JOIN outbound_webhook_delivery AS delivery
       ON delivery.subscription_id = subscription.id
@@ -263,6 +285,7 @@ WITH locked_subscription AS MATERIALIZED (
     SET state = 'failed',
         response_status = $3,
         failure_reason = $4,
+        response_excerpt = sqlc.arg('response_excerpt'),
         completed_at = now(),
         lease_token = NULL,
         lease_expires_at = NULL
@@ -284,7 +307,58 @@ SET consecutive_terminal_failures = subscription.consecutive_terminal_failures +
         ELSE subscription.pause_reason
     END,
     updated_at = now()
-WHERE id = (SELECT subscription_id FROM completed);
+FROM locked_subscription
+WHERE subscription.id = (SELECT subscription_id FROM completed)
+  AND subscription.id = locked_subscription.id
+RETURNING subscription.id,
+          locked_subscription.status <> 'paused' AND subscription.status = 'paused' AS newly_paused;
 
 -- name: GetOutboundWebhookDelivery :one
 SELECT * FROM outbound_webhook_delivery WHERE id = $1;
+
+-- name: ListOutboundWebhookDeliveries :many
+SELECT * FROM outbound_webhook_delivery
+WHERE workspace_id = sqlc.arg('workspace_id')
+  AND subscription_id = sqlc.arg('subscription_id')
+ORDER BY created_at DESC, id DESC
+LIMIT sqlc.arg('page_limit') OFFSET sqlc.arg('page_offset');
+
+-- name: CountOutboundWebhookDeliveries :one
+SELECT count(*) FROM outbound_webhook_delivery
+WHERE workspace_id = sqlc.arg('workspace_id')
+  AND subscription_id = sqlc.arg('subscription_id');
+
+-- name: GetOutboundWebhookDeliveryForHistory :one
+SELECT * FROM outbound_webhook_delivery
+WHERE workspace_id = sqlc.arg('workspace_id')
+  AND subscription_id = sqlc.arg('subscription_id')
+  AND id = sqlc.arg('id');
+
+-- name: CreateOutboundWebhookRedelivery :one
+INSERT INTO outbound_webhook_delivery (
+    event_id, subscription_id, workspace_id, event_type, request_body,
+    signing_secret_ciphertext, destination_ciphertext, secret_version,
+    redelivery_of_id
+)
+SELECT original.event_id, original.subscription_id, original.workspace_id,
+       original.event_type, original.request_body, subscription.secret_ciphertext,
+       subscription.destination_ciphertext, subscription.secret_version, original.id
+FROM outbound_webhook_delivery AS original
+JOIN outbound_webhook_subscription AS subscription
+  ON subscription.id = original.subscription_id
+ AND subscription.workspace_id = original.workspace_id
+WHERE original.workspace_id = sqlc.arg('workspace_id')
+  AND original.subscription_id = sqlc.arg('subscription_id')
+  AND original.id = sqlc.arg('delivery_id')
+  AND subscription.status = 'active'
+RETURNING outbound_webhook_delivery.*;
+
+-- name: CleanupExpiredOutboundWebhookDeliveries :execrows
+DELETE FROM outbound_webhook_delivery
+WHERE (state IN ('succeeded', 'failed') AND completed_at < sqlc.arg('cutoff'))
+   OR (state = 'pending' AND created_at < sqlc.arg('cutoff'));
+
+-- name: OldestPendingOutboundWebhookDelivery :one
+SELECT COALESCE(EXTRACT(EPOCH FROM (now() - min(created_at))), 0)::double precision AS age_seconds
+FROM outbound_webhook_delivery
+WHERE state = 'pending';

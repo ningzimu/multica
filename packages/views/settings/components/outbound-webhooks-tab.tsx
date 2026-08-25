@@ -11,6 +11,8 @@ import type { OutboundWebhookEvent, OutboundWebhookScopeMode, OutboundWebhookSub
 import {
   outboundWebhookSubscriptionOptions,
   outboundWebhookSubscriptionsOptions,
+  outboundWebhookDeliveriesOptions,
+  outboundWebhookDeliveryOptions,
   useCreateOutboundWebhookSubscription,
   useDeleteOutboundWebhookSubscription,
   usePauseOutboundWebhookSubscription,
@@ -18,6 +20,7 @@ import {
   useRotateOutboundWebhookSecret,
   useTestOutboundWebhookSubscription,
   useUpdateOutboundWebhookSubscription,
+  useRedeliverOutboundWebhookDelivery,
 } from "@multica/core/outbound-webhooks";
 import { Button } from "@multica/ui/components/ui/button";
 import { Checkbox } from "@multica/ui/components/ui/checkbox";
@@ -78,6 +81,70 @@ function ProjectSelection({ projects, selected, onChange, requiredLabel }: {
         </Label>
       ))}
       {selected.length === 0 && <p className="text-caption text-destructive">{requiredLabel}</p>}
+    </div>
+  );
+}
+
+function DeliveryHistory({ wsId, subscription, canManage }: { wsId: string; subscription: OutboundWebhookSubscription; canManage: boolean }) {
+  const { t } = useT("settings");
+  const [offset, setOffset] = useState(0);
+  const [selectedDeliveryId, setSelectedDeliveryId] = useState("");
+  const history = useQuery(outboundWebhookDeliveriesOptions(wsId, subscription.id, offset));
+  const detail = useQuery(outboundWebhookDeliveryOptions(wsId, subscription.id, selectedDeliveryId));
+  const redeliver = useRedeliverOutboundWebhookDelivery(wsId);
+
+  return (
+    <div className="space-y-3 border-t border-border p-4">
+      <p className="text-body font-medium">{t(($) => $.outbound_webhooks.delivery_history)}</p>
+      {history.isError ? (
+        <p className="text-caption text-destructive">{t(($) => $.outbound_webhooks.history_failed)}</p>
+      ) : history.data?.deliveries.length ? (
+        <div className="space-y-2">
+          {history.data.deliveries.map((delivery) => (
+            <div key={delivery.id} className="rounded-md border border-border p-3 text-caption">
+              <div className="flex flex-wrap items-center gap-2">
+                <code className="font-medium">{delivery.eventType}</code>
+                <span>{delivery.state}</span>
+                <span>{t(($) => $.outbound_webhooks.attempts)}: {delivery.attemptCount}</span>
+                {delivery.responseStatus !== null && <span>HTTP {delivery.responseStatus}</span>}
+                <time className="text-muted-foreground">{new Date(delivery.createdAt).toLocaleString()}</time>
+                <Button variant="outline" size="sm" onClick={() => setSelectedDeliveryId(selectedDeliveryId === delivery.id ? "" : delivery.id)}>
+                  {selectedDeliveryId === delivery.id ? t(($) => $.outbound_webhooks.hide_details) : t(($) => $.outbound_webhooks.inspect)}
+                </Button>
+                {canManage && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={subscription.status === "paused" || redeliver.isPending}
+                    onClick={() => redeliver.mutate({ subscriptionId: subscription.id, deliveryId: delivery.id }, {
+                      onSuccess: () => toast.success(t(($) => $.outbound_webhooks.redelivery_queued)),
+                      onError: (error) => toast.error(error instanceof Error ? error.message : t(($) => $.outbound_webhooks.redelivery_failed)),
+                    })}
+                  >{t(($) => $.outbound_webhooks.redeliver)}</Button>
+                )}
+              </div>
+              {selectedDeliveryId === delivery.id && detail.data && (
+                <dl className="mt-3 grid gap-1 rounded-md bg-muted p-3">
+                  <div><dt className="inline text-muted-foreground">{t(($) => $.outbound_webhooks.delivery_id)}: </dt><dd className="inline break-all">{detail.data.id}</dd></div>
+                  <div><dt className="inline text-muted-foreground">{t(($) => $.outbound_webhooks.event_id)}: </dt><dd className="inline break-all">{detail.data.eventId}</dd></div>
+                  {detail.data.redeliveryOf && <div><dt className="inline text-muted-foreground">{t(($) => $.outbound_webhooks.redelivery_of)}: </dt><dd className="inline break-all">{detail.data.redeliveryOf}</dd></div>}
+                  {detail.data.failureReason && <div><dt className="inline text-muted-foreground">{t(($) => $.outbound_webhooks.failure_reason)}: </dt><dd className="inline">{detail.data.failureReason}</dd></div>}
+                  {detail.data.responseExcerpt && <div><dt className="inline text-muted-foreground">{t(($) => $.outbound_webhooks.response_excerpt)}: </dt><dd className="inline break-words">{detail.data.responseExcerpt}</dd></div>}
+                </dl>
+              )}
+            </div>
+          ))}
+          <div className="flex items-center justify-between">
+            <Button variant="outline" size="sm" disabled={offset === 0} onClick={() => setOffset(Math.max(0, offset - 25))}>{t(($) => $.outbound_webhooks.previous)}</Button>
+            <span className="text-caption text-muted-foreground">
+              {t(($) => $.outbound_webhooks.deliveries, { count: history.data.total })}
+            </span>
+            <Button variant="outline" size="sm" disabled={history.data.nextOffset === null} onClick={() => setOffset(history.data?.nextOffset ?? offset)}>{t(($) => $.outbound_webhooks.next)}</Button>
+          </div>
+        </div>
+      ) : (
+        <p className="text-caption text-muted-foreground">{t(($) => $.outbound_webhooks.no_deliveries)}</p>
+      )}
     </div>
   );
 }
@@ -297,13 +364,13 @@ export function OutboundWebhooksTab() {
                     </form>
                   )}
                   {selectedSubscriptionId === subscription.id && selectedSubscription.data && (
-                    <dl className="grid gap-2 border-t border-border p-4 text-caption sm:grid-cols-2">
+                    <><dl className="grid gap-2 border-t border-border p-4 text-caption sm:grid-cols-2">
                       <div><dt className="text-muted-foreground">{t(($) => $.outbound_webhooks.destination_hint)}</dt><dd>{selectedSubscription.data.destinationHint}</dd></div>
                       <div><dt className="text-muted-foreground">{t(($) => $.outbound_webhooks.secret_hint)}</dt><dd>{selectedSubscription.data.signingSecretHint || "—"}</dd></div>
                       <div><dt className="text-muted-foreground">{t(($) => $.outbound_webhooks.event_catalog_version)}</dt><dd>{selectedSubscription.data.eventCatalogVersion}</dd></div>
                       <div><dt className="text-muted-foreground">{t(($) => $.outbound_webhooks.event_selection)}</dt><dd>{selectedSubscription.data.events.join(", ")}</dd></div>
                       <div><dt className="text-muted-foreground">{t(($) => $.outbound_webhooks.scope)}</dt><dd>{selectedSubscription.data.scopeMode === "workspace" ? t(($) => $.outbound_webhooks.workspace_scope_short) : t(($) => $.outbound_webhooks.project_scope)}</dd></div>
-                    </dl>
+                    </dl>{canManage && <DeliveryHistory wsId={wsId} subscription={selectedSubscription.data} canManage />}</>
                   )}
                 </div>
               );

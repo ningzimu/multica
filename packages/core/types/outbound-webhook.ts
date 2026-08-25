@@ -75,3 +75,27 @@ export interface TestOutboundWebhookSubscriptionResponse {
   eventId: string;
   state: "pending";
 }
+
+export type OutboundWebhookDeliveryState = "pending" | "succeeded" | "failed";
+
+export interface OutboundWebhookDelivery {
+  id: string;
+  eventId: string;
+  subscriptionId: string;
+  eventType: string;
+  state: OutboundWebhookDeliveryState;
+  attemptCount: number;
+  responseStatus: number | null;
+  responseExcerpt: string | null;
+  failureReason: string | null;
+  redeliveryOf: string | null;
+  createdAt: string;
+  lastAttemptAt: string | null;
+  completedAt: string | null;
+}
+
+export interface ListOutboundWebhookDeliveriesResponse {
+  deliveries: OutboundWebhookDelivery[];
+  total: number;
+  nextOffset: number | null;
+}

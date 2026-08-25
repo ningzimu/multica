@@ -263,6 +263,7 @@ var concurrentIndexCleanups = map[string]string{
 	"412_outbound_webhook_delivery_subscription_index":          "outbound_webhook_delivery_subscription_idx",
 	"414_outbound_webhook_delivery_due_index":                   "idx_outbound_webhook_delivery_due",
 	"415_outbound_webhook_delivery_live_lease_index":            "idx_outbound_webhook_delivery_live_lease",
+	"419_outbound_webhook_delivery_retention_index":             "outbound_webhook_delivery_retention_idx",
 }
 
 // concurrentDownIndexCleanups covers every migration whose down direction

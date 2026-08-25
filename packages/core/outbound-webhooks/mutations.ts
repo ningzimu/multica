@@ -69,3 +69,13 @@ export function useRotateOutboundWebhookSecret(wsId: string) {
     api.rotateOutboundWebhookSecret(wsId, subscriptionId),
   );
 }
+
+export function useRedeliverOutboundWebhookDelivery(wsId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ subscriptionId, deliveryId }: { subscriptionId: string; deliveryId: string }) =>
+      api.redeliverOutboundWebhookDelivery(wsId, subscriptionId, deliveryId),
+    onSuccess: (_result, { subscriptionId }) =>
+      queryClient.invalidateQueries({ queryKey: outboundWebhookKeys.detail(wsId, subscriptionId) }),
+  });
+}

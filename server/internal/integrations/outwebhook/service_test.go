@@ -418,6 +418,75 @@ func TestCreateRejectsUnknownDuplicateOrEmptyEventSelections(t *testing.T) {
 	}
 }
 
+func TestResponseExcerptIsUnicodeBoundedAndRedactsCredentials(t *testing.T) {
+	body := `{"token":"json-token","nested":{"password":"json-password","client_secret":"json-secret","api_key":"json-key"},"message":"Authorization: Digest digest-secret, nonce=digest-nonce; Proxy-Authorization: Custom proxy-secret"}` +
+		" Authorization: Bearer bearer-value\nProxy-Authorization: Basic basic-value\n" +
+		" token=plain-token https://user:pass@receiver.example/secret-path https://receiver.example/private/path?key=value " + strings.Repeat("界", 600)
+	got := responseExcerpt([]byte(body))
+	for _, leaked := range []string{"json-token", "json-password", "json-secret", "json-key", "digest-secret", "digest-nonce", "proxy-secret", "bearer-value", "basic-value", "plain-token", "key=value", "user:pass", "secret-path", "private/path", "receiver.example"} {
+		if strings.Contains(got, leaked) {
+			t.Fatalf("response excerpt exposed %q: %q", leaked, got)
+		}
+	}
+	if len([]rune(got)) != maxResponseExcerptCodePoints {
+		t.Fatalf("response excerpt has %d code points, want %d", len([]rune(got)), maxResponseExcerptCodePoints)
+	}
+	if !strings.Contains(got, "[redacted]") {
+		t.Fatalf("response excerpt did not mark redaction: %q", got)
+	}
+}
+
+func TestResponseExcerptRedactsValidNestedJSONBeforeBounding(t *testing.T) {
+	got := responseExcerpt([]byte(`{"token":"t","password":"p","secret":"s","api_key":"k","nested":[{"refresh_token":"r"}],"safe":"` + strings.Repeat("界", 600) + `"}`))
+	for _, leaked := range []string{`"t"`, `"p"`, `"s"`, `"k"`, `"r"`} {
+		if strings.Contains(got, leaked) {
+			t.Fatalf("structured response excerpt exposed %s: %q", leaked, got)
+		}
+	}
+	if len([]rune(got)) != maxResponseExcerptCodePoints {
+		t.Fatalf("structured excerpt has %d code points, want %d", len([]rune(got)), maxResponseExcerptCodePoints)
+	}
+}
+
+type recordingObserver struct {
+	operations map[string]int
+	oldest     float64
+}
+
+func (o *recordingObserver) RecordOutboundWebhookOperation(operation string) {
+	o.operations[operation]++
+}
+
+func (o *recordingObserver) SetOutboundWebhookOldestPending(seconds float64) {
+	o.oldest = seconds
+}
+
+func TestFailureMetricsAreEmittedFromCanonicalizationAndEgressPaths(t *testing.T) {
+	box, err := secretbox.New([]byte("0123456789abcdef0123456789abcdef"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	observer := &recordingObserver{operations: make(map[string]int)}
+	service := New(nil, nil, box, nil, WithObserver(observer))
+	service.captureIssueUpdated(events.Event{Payload: "not an issue payload"})
+	_, err = service.Create(context.Background(), CreateInput{
+		WorkspaceID: pgtype.UUID{Bytes: uuid.New(), Valid: true},
+		CreatedBy:   pgtype.UUID{Bytes: uuid.New(), Valid: true},
+		Name:        "Rejected receiver",
+		Destination: "http://receiver.example/events",
+		Events:      []string{EventIssueCreated},
+		ScopeMode:   ScopeWorkspace,
+	})
+	if !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("unsafe destination error = %v, want ErrInvalidInput", err)
+	}
+	for _, operation := range []string{operationCanonicalizationFailed, operationEgressRejected} {
+		if observer.operations[operation] != 1 {
+			t.Fatalf("operation %s count = %d, want 1", operation, observer.operations[operation])
+		}
+	}
+}
+
 func stringPointer(value string) *string { return &value }
 
 func sameOptionalString(left, right *string) bool {

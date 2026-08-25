@@ -16,6 +16,7 @@ import (
 	mathrand "math/rand/v2"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -46,15 +47,33 @@ const (
 	ScopeProject              = "project"
 	CatalogVersion            = 1
 
-	maxCommentExcerptCodePoints = 500
-	maxResponseBytes            = 64 << 10
-	deliveryTimeout             = 10 * time.Second
-	dispatchQueueSize           = 1
-	hardMaxAttempts             = 32
-	hardMaxWorkers              = 64
-	hardMaxPerSub               = 16
-	hardMaxPending              = 100_000
-	hardMaxFailures             = 100
+	maxCommentExcerptCodePoints  = 500
+	maxResponseBytes             = 64 << 10
+	deliveryTimeout              = 10 * time.Second
+	dispatchQueueSize            = 1
+	hardMaxAttempts              = 32
+	hardMaxWorkers               = 64
+	hardMaxPerSub                = 16
+	hardMaxPending               = 100_000
+	hardMaxFailures              = 100
+	defaultHistoryRetention      = 30 * 24 * time.Hour
+	defaultMaintenanceInterval   = time.Hour
+	maxHistoryPageSize           = 100
+	defaultHistoryPageSize       = 25
+	maxResponseExcerptCodePoints = 512
+
+	operationCanonicalizationFailed = "canonicalization_failed"
+	operationMatchingFailed         = "matching_failed"
+	operationInsertionFailed        = "insertion_failed"
+	operationDeliverySucceeded      = "delivery_succeeded"
+	operationDeliveryFailed         = "delivery_failed"
+	operationRetryScheduled         = "delivery_retry_scheduled"
+	operationLeaseRecovered         = "lease_recovered"
+	operationSubscriptionPaused     = "subscription_paused"
+	operationEgressRejected         = "egress_rejected"
+	operationCleanupSucceeded       = "cleanup_succeeded"
+	operationCleanupFailed          = "cleanup_failed"
+	operationRedeliveryCreated      = "redelivery_created"
 )
 
 var eventCatalog = []string{
@@ -71,6 +90,7 @@ var eventCatalog = []string{
 var (
 	ErrUnavailable          = errors.New("outbound webhooks are unavailable")
 	ErrInvalidInput         = errors.New("invalid outbound webhook input")
+	ErrPaused               = errors.New("outbound webhook subscription is paused")
 	errCommentBodyUnchanged = errors.New("comment body is unchanged")
 )
 
@@ -79,17 +99,25 @@ type Service struct {
 	txStarter interface {
 		Begin(context.Context) (pgx.Tx, error)
 	}
-	box            *secretbox.Box
-	allowedOrigins map[string]struct{}
-	clientFor      func(*url.URL, bool) *http.Client
-	now            func() time.Time
-	policy         DeliveryPolicy
-	jitter         func(time.Duration) time.Duration
-	dispatchQueue  chan struct{}
-	dispatchCancel context.CancelFunc
-	dispatchWG     sync.WaitGroup
-	startOnce      sync.Once
-	closeOnce      sync.Once
+	box                 *secretbox.Box
+	allowedOrigins      map[string]struct{}
+	clientFor           func(*url.URL, bool) *http.Client
+	now                 func() time.Time
+	policy              DeliveryPolicy
+	jitter              func(time.Duration) time.Duration
+	dispatchQueue       chan struct{}
+	dispatchCancel      context.CancelFunc
+	dispatchWG          sync.WaitGroup
+	startOnce           sync.Once
+	closeOnce           sync.Once
+	observer            Observer
+	retention           time.Duration
+	maintenanceInterval time.Duration
+}
+
+type Observer interface {
+	RecordOutboundWebhookOperation(operation string)
+	SetOutboundWebhookOldestPending(seconds float64)
 }
 
 type DeliveryPolicy struct {
@@ -106,6 +134,21 @@ type DeliveryPolicy struct {
 }
 
 type Option func(*Service)
+
+func WithObserver(observer Observer) Option {
+	return func(service *Service) { service.observer = observer }
+}
+
+func WithHistoryPolicy(retention, maintenanceInterval time.Duration) Option {
+	return func(service *Service) {
+		if retention > 0 {
+			service.retention = retention
+		}
+		if maintenanceInterval > 0 {
+			service.maintenanceInterval = maintenanceInterval
+		}
+	}
+}
 
 // WithHTTPClient is intended for a controlled receiver in integration tests.
 // Destination validation still runs before this client is selected.
@@ -200,6 +243,28 @@ type TestResult struct {
 	State      string `json:"state"`
 }
 
+type Delivery struct {
+	ID              string     `json:"id"`
+	EventID         string     `json:"event_id"`
+	SubscriptionID  string     `json:"subscription_id"`
+	EventType       string     `json:"event_type"`
+	State           string     `json:"state"`
+	AttemptCount    int32      `json:"attempt_count"`
+	ResponseStatus  *int32     `json:"response_status"`
+	ResponseExcerpt *string    `json:"response_excerpt"`
+	FailureReason   *string    `json:"failure_reason"`
+	RedeliveryOf    *string    `json:"redelivery_of"`
+	CreatedAt       time.Time  `json:"created_at"`
+	LastAttemptAt   *time.Time `json:"last_attempt_at"`
+	CompletedAt     *time.Time `json:"completed_at"`
+}
+
+type DeliveryPage struct {
+	Deliveries []Delivery `json:"deliveries"`
+	Total      int64      `json:"total"`
+	NextOffset *int32     `json:"next_offset"`
+}
+
 type UpdateScopeInput struct {
 	WorkspaceID    pgtype.UUID
 	SubscriptionID pgtype.UUID
@@ -229,10 +294,12 @@ func New(queries *db.Queries, txStarter interface {
 			client.Timeout = deliveryTimeout
 			return client
 		},
-		now:           time.Now,
-		policy:        DefaultDeliveryPolicy(),
-		jitter:        boundedJitter,
-		dispatchQueue: make(chan struct{}, dispatchQueueSize),
+		now:                 time.Now,
+		policy:              DefaultDeliveryPolicy(),
+		jitter:              boundedJitter,
+		dispatchQueue:       make(chan struct{}, dispatchQueueSize),
+		retention:           defaultHistoryRetention,
+		maintenanceInterval: defaultMaintenanceInterval,
 	}
 	for _, option := range options {
 		option(service)
@@ -267,8 +334,58 @@ func (s *Service) startDispatcher() {
 				s.runDispatcher(ctx)
 			}()
 		}
+		s.dispatchWG.Add(1)
+		go func() {
+			defer s.dispatchWG.Done()
+			s.runMaintenance(ctx)
+		}()
 		s.wakeDispatcher()
 	})
+}
+
+func (s *Service) runMaintenance(ctx context.Context) {
+	s.RunMaintenance(ctx)
+	ticker := time.NewTicker(s.maintenanceInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			s.RunMaintenance(ctx)
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func (s *Service) RunMaintenance(ctx context.Context) {
+	if s == nil || s.queries == nil {
+		return
+	}
+	cutoff := pgtype.Timestamptz{Time: s.now().UTC().Add(-s.retention), Valid: true}
+	removed, err := s.queries.CleanupExpiredOutboundWebhookDeliveries(ctx, cutoff)
+	if err != nil {
+		slog.Error("outbound webhook delivery cleanup failed", "error", err)
+		s.observe(operationCleanupFailed)
+	} else {
+		if removed > 0 {
+			slog.Info("outbound webhook delivery cleanup completed", "removed", removed)
+		}
+		s.observe(operationCleanupSucceeded)
+	}
+	age, err := s.queries.OldestPendingOutboundWebhookDelivery(ctx)
+	if err != nil {
+		slog.Error("outbound webhook oldest pending observation failed", "error", err)
+		return
+	}
+	if s.observer != nil {
+		s.observer.SetOutboundWebhookOldestPending(age)
+	}
+}
+
+func (s *Service) observe(operation string) {
+	if s.observer != nil {
+		s.observer.RecordOutboundWebhookOperation(operation)
+	}
 }
 
 func (s *Service) runDispatcher(ctx context.Context) {
@@ -310,26 +427,30 @@ func (s *Service) dispatchOne(ctx context.Context) bool {
 		}
 		return false
 	}
-	delivery, err := queries.ClaimDueOutboundWebhookDelivery(ctx, db.ClaimDueOutboundWebhookDeliveryParams{
+	claimed, err := queries.ClaimDueOutboundWebhookDelivery(ctx, db.ClaimDueOutboundWebhookDeliveryParams{
 		LeaseSeconds:               s.policy.LeaseDuration.Seconds(),
 		MaxAttempts:                s.policy.MaxAttempts,
 		MaxGlobalConcurrency:       s.policy.GlobalConcurrency,
 		MaxSubscriptionConcurrency: s.policy.SubscriptionConcurrency,
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
-		rows, settleErr := queries.FailExhaustedOutboundWebhookDelivery(ctx, db.FailExhaustedOutboundWebhookDeliveryParams{
+		settled, settleErr := queries.FailExhaustedOutboundWebhookDelivery(ctx, db.FailExhaustedOutboundWebhookDeliveryParams{
 			MaxAttempts:      s.policy.MaxAttempts,
 			FailureThreshold: s.policy.ConsecutiveFailureThreshold,
 		})
-		if settleErr != nil && ctx.Err() == nil {
+		if settleErr != nil && !errors.Is(settleErr, pgx.ErrNoRows) && ctx.Err() == nil {
 			slog.Error("outbound webhook exhausted delivery settlement failed", "error", settleErr)
 		}
-		if settleErr == nil && rows > 0 {
+		if settleErr == nil {
 			if err := tx.Commit(ctx); err != nil {
 				if ctx.Err() == nil {
 					slog.Error("outbound webhook exhausted delivery commit failed", "error", err)
 				}
 				return false
+			}
+			s.observe(operationDeliveryFailed)
+			if settled.NewlyPaused.Valid && settled.NewlyPaused.Bool {
+				s.RecordSubscriptionPaused(settled.ID, "failure_threshold")
 			}
 			return true
 		}
@@ -342,11 +463,17 @@ func (s *Service) dispatchOne(ctx context.Context) bool {
 		slog.Error("outbound webhook delivery claim failed", "error", err)
 		return false
 	}
+	delivery := claimed.OutboundWebhookDelivery
+	recovered, _ := claimed.LeaseRecovered.(bool)
 	if err := tx.Commit(ctx); err != nil {
 		if ctx.Err() == nil {
 			slog.Error("outbound webhook delivery claim commit failed", "error", err)
 		}
 		return false
+	}
+	if recovered {
+		s.observe(operationLeaseRecovered)
+		slog.Info("outbound webhook expired lease recovered", "delivery_id", util.UUIDToString(delivery.ID), "event_type", delivery.EventType)
 	}
 	subscription, err := s.queries.GetOutboundWebhookSubscription(ctx, db.GetOutboundWebhookSubscriptionParams{
 		WorkspaceID: delivery.WorkspaceID,
@@ -426,6 +553,7 @@ func (s *Service) Create(ctx context.Context, input CreateInput) (CreateResult, 
 	}
 	endpoint, _, err := s.validateDestination(ctx, input.Destination)
 	if err != nil {
+		s.observe(operationEgressRejected)
 		return CreateResult{}, fmt.Errorf("%w: destination is not allowed", ErrInvalidInput)
 	}
 	secret, err := generateSigningSecret()
@@ -644,6 +772,7 @@ func (s *Service) Update(ctx context.Context, input UpdateInput) (Subscription, 
 	if input.Destination != nil {
 		endpoint, _, err := s.validateDestination(ctx, *input.Destination)
 		if err != nil {
+			s.observe(operationEgressRejected)
 			return Subscription{}, fmt.Errorf("%w: destination is not allowed", ErrInvalidInput)
 		}
 		destinationCiphertext, err = s.box.Seal([]byte(endpoint.String()))
@@ -678,7 +807,10 @@ func (s *Service) Pause(ctx context.Context, workspaceID, id pgtype.UUID) (Subsc
 	if err != nil {
 		return Subscription{}, err
 	}
-	return subscriptionResponse(row), nil
+	if row.NewlyPaused {
+		s.RecordSubscriptionPaused(row.OutboundWebhookSubscription.ID, "manual")
+	}
+	return subscriptionResponse(row.OutboundWebhookSubscription), nil
 }
 
 func (s *Service) Resume(ctx context.Context, workspaceID, id pgtype.UUID) (Subscription, error) {
@@ -776,6 +908,7 @@ func (s *Service) Test(ctx context.Context, input TestInput) (TestResult, error)
 		SecretVersion: subscription.SecretVersion, MaxPending: s.policy.MaxPendingPerSubscription,
 	})
 	if err != nil {
+		s.observe(operationInsertionFailed)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return TestResult{}, fmt.Errorf("%w: pending delivery limit reached", ErrInvalidInput)
 		}
@@ -822,11 +955,13 @@ func (s *Service) captureIssueUpdated(event events.Event) {
 	payload, ok := event.Payload.(map[string]any)
 	if !ok {
 		slog.Error("outbound webhook canonicalization failed", "event_type", "issue changes", "error", "issue:updated payload is not an object")
+		s.observe(operationCanonicalizationFailed)
 		return
 	}
 	changes, err := issueProductEvents(payload)
 	if err != nil {
 		slog.Error("outbound webhook canonicalization failed", "event_type", "issue changes", "error", err)
+		s.observe(operationCanonicalizationFailed)
 		return
 	}
 	if len(changes) > 0 {
@@ -902,6 +1037,7 @@ func (s *Service) captureProductEvents(event events.Event, productEvents []produ
 		})
 		if err != nil {
 			slog.Error("outbound webhook subscription lookup failed", "event_type", product.eventType, "error", err)
+			s.observe(operationMatchingFailed)
 			return
 		}
 		if len(rows) == 0 {
@@ -912,6 +1048,7 @@ func (s *Service) captureProductEvents(event events.Event, productEvents []produ
 		if err != nil {
 			if !errors.Is(err, errCommentBodyUnchanged) {
 				slog.Error("outbound webhook canonicalization failed", "event_type", product.eventType, "error", err)
+				s.observe(operationCanonicalizationFailed)
 			}
 			return
 		}
@@ -928,6 +1065,7 @@ func (s *Service) captureProductEvents(event events.Event, productEvents []produ
 				MaxPending:              s.policy.MaxPendingPerSubscription,
 			})
 			if err != nil {
+				s.observe(operationInsertionFailed)
 				if errors.Is(err, pgx.ErrNoRows) {
 					slog.Warn("outbound webhook pending delivery limit reached", "subscription_id", util.UUIDToString(subscription.ID), "event_type", product.eventType)
 					continue
@@ -944,6 +1082,7 @@ func (s *Service) captureProductEvents(event events.Event, productEvents []produ
 	}
 	if err := tx.Commit(ctx); err != nil {
 		slog.Error("outbound webhook delivery commit failed", "event_type", event.Type, "error", err)
+		s.observe(operationInsertionFailed)
 		return
 	}
 	s.wakeDispatcher()
@@ -1403,6 +1542,166 @@ func optionalString(value any) *string {
 	return nil
 }
 
+func (s *Service) ListDeliveries(ctx context.Context, workspaceID, subscriptionID pgtype.UUID, limit, offset int32) (DeliveryPage, error) {
+	if !s.Available() {
+		return DeliveryPage{}, ErrUnavailable
+	}
+	if limit == 0 {
+		limit = defaultHistoryPageSize
+	}
+	if limit < 1 || limit > maxHistoryPageSize || offset < 0 {
+		return DeliveryPage{}, ErrInvalidInput
+	}
+	if _, err := s.queries.GetOutboundWebhookSubscription(ctx, db.GetOutboundWebhookSubscriptionParams{WorkspaceID: workspaceID, ID: subscriptionID}); err != nil {
+		return DeliveryPage{}, err
+	}
+	rows, err := s.queries.ListOutboundWebhookDeliveries(ctx, db.ListOutboundWebhookDeliveriesParams{
+		WorkspaceID: workspaceID, SubscriptionID: subscriptionID, PageLimit: limit, PageOffset: offset,
+	})
+	if err != nil {
+		return DeliveryPage{}, err
+	}
+	total, err := s.queries.CountOutboundWebhookDeliveries(ctx, db.CountOutboundWebhookDeliveriesParams{WorkspaceID: workspaceID, SubscriptionID: subscriptionID})
+	if err != nil {
+		return DeliveryPage{}, err
+	}
+	items := make([]Delivery, 0, len(rows))
+	for _, row := range rows {
+		items = append(items, deliveryResponse(row))
+	}
+	var next *int32
+	if int64(offset)+int64(len(items)) < total {
+		value := offset + int32(len(items))
+		next = &value
+	}
+	return DeliveryPage{Deliveries: items, Total: total, NextOffset: next}, nil
+}
+
+func (s *Service) GetDelivery(ctx context.Context, workspaceID, subscriptionID, deliveryID pgtype.UUID) (Delivery, error) {
+	if !s.Available() {
+		return Delivery{}, ErrUnavailable
+	}
+	row, err := s.queries.GetOutboundWebhookDeliveryForHistory(ctx, db.GetOutboundWebhookDeliveryForHistoryParams{
+		WorkspaceID: workspaceID, SubscriptionID: subscriptionID, ID: deliveryID,
+	})
+	if err != nil {
+		return Delivery{}, err
+	}
+	return deliveryResponse(row), nil
+}
+
+func (s *Service) Redeliver(ctx context.Context, workspaceID, subscriptionID, deliveryID pgtype.UUID) (Delivery, error) {
+	if !s.Available() {
+		return Delivery{}, ErrUnavailable
+	}
+	subscription, err := s.queries.GetOutboundWebhookSubscription(ctx, db.GetOutboundWebhookSubscriptionParams{WorkspaceID: workspaceID, ID: subscriptionID})
+	if err != nil {
+		return Delivery{}, err
+	}
+	if subscription.Status != "active" {
+		return Delivery{}, ErrPaused
+	}
+	row, err := s.queries.CreateOutboundWebhookRedelivery(ctx, db.CreateOutboundWebhookRedeliveryParams{
+		WorkspaceID: workspaceID, SubscriptionID: subscriptionID, DeliveryID: deliveryID,
+	})
+	if err != nil {
+		return Delivery{}, err
+	}
+	s.observe(operationRedeliveryCreated)
+	s.wakeDispatcher()
+	return deliveryResponse(row), nil
+}
+
+func deliveryResponse(row db.OutboundWebhookDelivery) Delivery {
+	delivery := Delivery{
+		ID: util.UUIDToString(row.ID), EventID: util.UUIDToString(row.EventID),
+		SubscriptionID: util.UUIDToString(row.SubscriptionID), EventType: row.EventType,
+		State: row.State, AttemptCount: row.AttemptCount, CreatedAt: row.CreatedAt.Time,
+	}
+	if row.ResponseStatus.Valid {
+		value := row.ResponseStatus.Int32
+		delivery.ResponseStatus = &value
+	}
+	if row.ResponseExcerpt.Valid {
+		value := row.ResponseExcerpt.String
+		delivery.ResponseExcerpt = &value
+	}
+	if row.FailureReason.Valid {
+		value := row.FailureReason.String
+		delivery.FailureReason = &value
+	}
+	if row.RedeliveryOfID.Valid {
+		value := util.UUIDToString(row.RedeliveryOfID)
+		delivery.RedeliveryOf = &value
+	}
+	if row.LastAttemptAt.Valid {
+		value := row.LastAttemptAt.Time
+		delivery.LastAttemptAt = &value
+	}
+	if row.CompletedAt.Valid {
+		value := row.CompletedAt.Time
+		delivery.CompletedAt = &value
+	}
+	return delivery
+}
+
+var responseAuthorizationHeader = regexp.MustCompile(`(?i)((?:proxy-)?authorization\s*:\s*)[^\r\n]+`)
+var sensitiveResponseValue = regexp.MustCompile(`(?i)(["']?(?:authorization|proxy-authorization|cookie|set-cookie|x-api-key|api[_ -]?key|[a-z0-9_-]*(?:secret|token|password)[a-z0-9_-]*)["']?\s*[:=]\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;}]+)`)
+var responseHTTPSURL = regexp.MustCompile(`https://[^\s"'<>]+`)
+
+func responseExcerpt(body []byte) string {
+	text := strings.TrimSpace(string(bytes.ToValidUTF8(body, []byte("�"))))
+	if structured, ok := redactStructuredResponseJSON([]byte(text)); ok {
+		text = structured
+	}
+	text = responseAuthorizationHeader.ReplaceAllString(text, "$1[redacted]")
+	text = sensitiveResponseValue.ReplaceAllString(text, `$1"[redacted]"`)
+	text = responseHTTPSURL.ReplaceAllString(text, "[redacted-url]")
+	runes := []rune(text)
+	if len(runes) > maxResponseExcerptCodePoints {
+		runes = runes[:maxResponseExcerptCodePoints]
+	}
+	return string(runes)
+}
+
+func redactStructuredResponseJSON(body []byte) (string, bool) {
+	var value any
+	if len(body) == 0 || json.Unmarshal(body, &value) != nil {
+		return "", false
+	}
+	redactResponseJSONValue(value)
+	redacted, err := json.Marshal(value)
+	if err != nil {
+		return "", false
+	}
+	return string(redacted), true
+}
+
+func redactResponseJSONValue(value any) {
+	switch typed := value.(type) {
+	case map[string]any:
+		for key, child := range typed {
+			if sensitiveResponseKey(key) {
+				typed[key] = "[redacted]"
+				continue
+			}
+			redactResponseJSONValue(child)
+		}
+	case []any:
+		for _, child := range typed {
+			redactResponseJSONValue(child)
+		}
+	}
+}
+
+func sensitiveResponseKey(key string) bool {
+	normalized := strings.NewReplacer("_", "", "-", "", " ", "").Replace(strings.ToLower(key))
+	return normalized == "authorization" || normalized == "proxyauthorization" ||
+		normalized == "cookie" || normalized == "setcookie" || normalized == "xapikey" ||
+		normalized == "apikey" || strings.Contains(normalized, "secret") ||
+		strings.Contains(normalized, "token") || strings.Contains(normalized, "password")
+}
+
 func (s *Service) deliver(ctx context.Context, subscription db.OutboundWebhookSubscription, delivery db.OutboundWebhookDelivery) {
 	destination, err := s.box.Open(delivery.DestinationCiphertext)
 	if err != nil {
@@ -1420,6 +1719,7 @@ func (s *Service) deliver(ctx context.Context, subscription db.OutboundWebhookSu
 			s.releaseClaim(delivery)
 			return
 		}
+		s.observe(operationEgressRejected)
 		s.failClaim(delivery, 0, "destination is no longer allowed")
 		return
 	}
@@ -1452,30 +1752,43 @@ func (s *Service) deliver(ctx context.Context, subscription db.OutboundWebhookSu
 		return
 	}
 	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxResponseBytes))
+	responseBody, readErr := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
+	if readErr != nil {
+		slog.Warn("outbound webhook response body could not be read", "delivery_id", util.UUIDToString(delivery.ID), "error", readErr)
+		responseBody = nil
+	}
+	excerpt := pgtype.Text{String: responseExcerpt(responseBody), Valid: len(responseBody) > 0}
 	if retryableStatus(resp.StatusCode) {
-		s.retryOrFail(delivery, resp.StatusCode, fmt.Sprintf("receiver returned HTTP %d", resp.StatusCode), resp.Header.Get("Retry-After"))
+		s.retryOrFail(delivery, resp.StatusCode, fmt.Sprintf("receiver returned HTTP %d", resp.StatusCode), resp.Header.Get("Retry-After"), excerpt)
 		return
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		s.failClaim(delivery, resp.StatusCode, fmt.Sprintf("receiver returned HTTP %d", resp.StatusCode))
+		s.failClaimWithExcerpt(delivery, resp.StatusCode, fmt.Sprintf("receiver returned HTTP %d", resp.StatusCode), excerpt)
 		return
 	}
 	rows, err := s.queries.SucceedClaimedOutboundWebhookDelivery(context.Background(), db.SucceedClaimedOutboundWebhookDeliveryParams{
 		ID: delivery.ID, LeaseToken: delivery.LeaseToken,
-		ResponseStatus: pgtype.Int4{Int32: int32(resp.StatusCode), Valid: true},
+		ResponseStatus:  pgtype.Int4{Int32: int32(resp.StatusCode), Valid: true},
+		ResponseExcerpt: excerpt,
 	})
 	if err != nil {
 		slog.Error("outbound webhook delivery state update failed", "delivery_id", util.UUIDToString(delivery.ID), "event_type", delivery.EventType, "error", err)
 	} else if rows == 0 {
 		slog.Warn("outbound webhook delivery success ignored after lease loss", "delivery_id", util.UUIDToString(delivery.ID), "event_type", delivery.EventType)
 	}
+	if err == nil && rows > 0 {
+		s.observe(operationDeliverySucceeded)
+	}
 }
 
-func (s *Service) retryOrFail(delivery db.OutboundWebhookDelivery, status int, reason, retryAfter string) {
+func (s *Service) retryOrFail(delivery db.OutboundWebhookDelivery, status int, reason, retryAfter string, excerpt ...pgtype.Text) {
 	attempt := delivery.AttemptCount
 	if attempt >= s.policy.MaxAttempts {
-		s.failClaim(delivery, status, reason)
+		value := pgtype.Text{}
+		if len(excerpt) > 0 {
+			value = excerpt[0]
+		}
+		s.failClaimWithExcerpt(delivery, status, reason, value)
 		return
 	}
 	delay := s.retryDelay(attempt, retryAfter)
@@ -1483,6 +1796,9 @@ func (s *Service) retryOrFail(delivery db.OutboundWebhookDelivery, status int, r
 		ID: delivery.ID, LeaseToken: delivery.LeaseToken,
 		FailureReason: pgtype.Text{String: reason, Valid: true},
 		NextAttemptAt: pgtype.Timestamptz{Time: s.now().Add(delay), Valid: true},
+	}
+	if len(excerpt) > 0 {
+		params.ResponseExcerpt = excerpt[0]
 	}
 	if status != 0 {
 		params.ResponseStatus = pgtype.Int4{Int32: int32(status), Valid: true}
@@ -1497,24 +1813,53 @@ func (s *Service) retryOrFail(delivery db.OutboundWebhookDelivery, status int, r
 		return
 	}
 	slog.Info("outbound webhook delivery scheduled for retry", "delivery_id", util.UUIDToString(delivery.ID), "event_type", delivery.EventType, "attempt", attempt, "retry_in", delay)
+	s.observe(operationRetryScheduled)
 	s.wakeDispatcher()
 }
 
 func (s *Service) failClaim(delivery db.OutboundWebhookDelivery, status int, reason string) {
+	s.failClaimWithExcerpt(delivery, status, reason, pgtype.Text{})
+}
+
+func (s *Service) failClaimWithExcerpt(delivery db.OutboundWebhookDelivery, status int, reason string, excerpt pgtype.Text) {
 	params := db.FailClaimedOutboundWebhookDeliveryParams{
 		ID: delivery.ID, LeaseToken: delivery.LeaseToken,
 		FailureReason:    pgtype.Text{String: reason, Valid: true},
 		FailureThreshold: s.policy.ConsecutiveFailureThreshold,
+		ResponseExcerpt:  excerpt,
 	}
 	if status != 0 {
 		params.ResponseStatus = pgtype.Int4{Int32: int32(status), Valid: true}
 	}
-	rows, err := s.queries.FailClaimedOutboundWebhookDelivery(context.Background(), params)
+	result, err := s.queries.FailClaimedOutboundWebhookDelivery(context.Background(), params)
 	if err != nil {
-		slog.Error("outbound webhook delivery state update failed", "delivery_id", util.UUIDToString(delivery.ID), "event_type", delivery.EventType, "error", err)
-	} else if rows == 0 {
-		slog.Warn("outbound webhook terminal outcome ignored after lease loss", "delivery_id", util.UUIDToString(delivery.ID), "event_type", delivery.EventType)
+		if !errors.Is(err, pgx.ErrNoRows) {
+			slog.Error("outbound webhook delivery state update failed", "delivery_id", util.UUIDToString(delivery.ID), "event_type", delivery.EventType, "error", err)
+		} else {
+			slog.Warn("outbound webhook terminal outcome ignored after lease loss", "delivery_id", util.UUIDToString(delivery.ID), "event_type", delivery.EventType)
+		}
+		return
 	}
+	if !result.ID.Valid {
+		slog.Warn("outbound webhook terminal outcome ignored after lease loss", "delivery_id", util.UUIDToString(delivery.ID), "event_type", delivery.EventType)
+		return
+	}
+	s.observe(operationDeliveryFailed)
+	if result.NewlyPaused.Valid && result.NewlyPaused.Bool {
+		s.RecordSubscriptionPaused(result.ID, "failure_threshold")
+	}
+}
+
+// RecordSubscriptionPaused records a committed transition using only bounded,
+// low-cardinality reason values. Callers must invoke it after persistence.
+func (s *Service) RecordSubscriptionPaused(subscriptionID pgtype.UUID, reason string) {
+	switch reason {
+	case "manual", "scope_empty", "failure_threshold":
+	default:
+		reason = "unknown"
+	}
+	s.observe(operationSubscriptionPaused)
+	slog.Info("outbound webhook subscription paused", "subscription_id", util.UUIDToString(subscriptionID), "reason", reason)
 }
 
 func (s *Service) releaseClaim(delivery db.OutboundWebhookDelivery) {

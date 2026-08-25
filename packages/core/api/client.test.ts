@@ -6,6 +6,52 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+describe("ApiClient outbound webhook delivery response schemas", () => {
+  it("falls back when the history wrapper is missing or malformed", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ items: [] }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ deliveries: "private", total: "many", next_offset: 0 }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }));
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new ApiClient("https://api.example.test");
+
+    await expect(client.listOutboundWebhookDeliveries("ws-1", "sub-1")).resolves.toEqual({
+      deliveries: [], total: 0, nextOffset: null,
+    });
+    await expect(client.listOutboundWebhookDeliveries("ws-1", "sub-1")).resolves.toEqual({
+      deliveries: [], total: 0, nextOffset: null,
+    });
+  });
+
+  it("falls back safely for malformed detail and redelivery bodies", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ id: "delivery-1", request_body: "private" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ id: 42, destination: "private" }), {
+        status: 202,
+        headers: { "Content-Type": "application/json" },
+      }));
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new ApiClient("https://api.example.test");
+
+    await expect(client.getOutboundWebhookDelivery("ws-1", "sub-1", "delivery-1")).resolves.toMatchObject({
+      id: "delivery-1", subscriptionId: "sub-1", responseExcerpt: null,
+    });
+    await expect(client.redeliverOutboundWebhookDelivery("ws-1", "sub-1", "delivery-1")).resolves.toMatchObject({
+      id: "", subscriptionId: "sub-1", responseExcerpt: null,
+    });
+  });
+});
+
 describe("ApiClient edit guards", () => {
   it("serializes field baselines for issue and comment writes", async () => {
     const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(

@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -43,6 +44,52 @@ type outboundWebhookRoundTripFunc func(*http.Request) (*http.Response, error)
 
 func (fn outboundWebhookRoundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
 	return fn(request)
+}
+
+type outboundWebhookObserver struct {
+	mu         sync.Mutex
+	operations map[string]int
+	oldest     float64
+	oldestSet  bool
+}
+
+func newOutboundWebhookObserver() *outboundWebhookObserver {
+	return &outboundWebhookObserver{operations: make(map[string]int)}
+}
+
+func (o *outboundWebhookObserver) RecordOutboundWebhookOperation(operation string) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.operations[operation]++
+}
+
+func (o *outboundWebhookObserver) SetOutboundWebhookOldestPending(seconds float64) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.oldest = seconds
+	o.oldestSet = true
+}
+
+func (o *outboundWebhookObserver) recorded(operation string) bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.operations[operation] > 0
+}
+
+func (o *outboundWebhookObserver) snapshot() map[string]int {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	result := make(map[string]int, len(o.operations))
+	for operation, count := range o.operations {
+		result[operation] = count
+	}
+	return result
+}
+
+func (o *outboundWebhookObserver) observedOldestPending() bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.oldestSet && o.oldest >= 0
 }
 
 func createReliabilityWebhookSubscription(t *testing.T, h *Handler, name, destination string) outwebhook.Subscription {
@@ -385,7 +432,8 @@ func TestOutboundWebhookRestartRecoversPendingAndExpiredLease(t *testing.T) {
 	`, first.header.Get("X-Multica-Delivery-ID"), leaseExpiry); err != nil {
 		t.Fatal(err)
 	}
-	serviceTwo := outwebhook.New(db.New(testPool), testPool, box, []string{receiver.URL}, outwebhook.WithHTTPClient(receiver.Client()), outwebhook.WithDeliveryPolicy(policy))
+	observer := newOutboundWebhookObserver()
+	serviceTwo := outwebhook.New(db.New(testPool), testPool, box, []string{receiver.URL}, outwebhook.WithHTTPClient(receiver.Client()), outwebhook.WithDeliveryPolicy(policy), outwebhook.WithObserver(observer))
 	serviceTwo.Register(events.New())
 	t.Cleanup(func() {
 		serviceTwo.Close()
@@ -415,6 +463,9 @@ func TestOutboundWebhookRestartRecoversPendingAndExpiredLease(t *testing.T) {
 	if got := subscription.ID; got == "" {
 		t.Fatal("subscription fixture was not created")
 	}
+	if !observer.recorded("lease_recovered") || !observer.recorded("delivery_succeeded") {
+		t.Fatalf("lease recovery metrics were not observed: %+v", observer.snapshot())
+	}
 }
 
 func TestOutboundWebhookHonorsBoundedRetryAfter(t *testing.T) {
@@ -440,7 +491,8 @@ func TestOutboundWebhookHonorsBoundedRetryAfter(t *testing.T) {
 	policy.InitialBackoff = 5 * time.Millisecond
 	policy.MaxBackoff = 300 * time.Millisecond
 	policy.MaxRetryAfter = 200 * time.Millisecond
-	serviceUnderTest := outwebhook.New(db.New(testPool), testPool, box, []string{receiver.URL}, outwebhook.WithHTTPClient(receiver.Client()), outwebhook.WithDeliveryPolicy(policy))
+	observer := newOutboundWebhookObserver()
+	serviceUnderTest := outwebhook.New(db.New(testPool), testPool, box, []string{receiver.URL}, outwebhook.WithHTTPClient(receiver.Client()), outwebhook.WithDeliveryPolicy(policy), outwebhook.WithObserver(observer))
 	bus := events.New()
 	serviceUnderTest.Register(bus)
 	t.Cleanup(func() {
@@ -499,6 +551,9 @@ func TestOutboundWebhookHonorsBoundedRetryAfter(t *testing.T) {
 	if state != "succeeded" || count != 2 {
 		t.Fatalf("Retry-After delivery = %s after %d attempts, want succeeded after 2", state, count)
 	}
+	if !observer.recorded("delivery_retry_scheduled") || !observer.recorded("delivery_succeeded") {
+		t.Fatalf("retry metrics were not observed: %+v", observer.snapshot())
+	}
 }
 
 func TestOutboundWebhookTerminalFailuresPauseAndSuccessResets(t *testing.T) {
@@ -520,7 +575,8 @@ func TestOutboundWebhookTerminalFailuresPauseAndSuccessResets(t *testing.T) {
 	policy := outwebhook.DefaultDeliveryPolicy()
 	policy.PollInterval = 5 * time.Millisecond
 	policy.ConsecutiveFailureThreshold = 2
-	serviceUnderTest := outwebhook.New(db.New(testPool), testPool, box, []string{receiver.URL}, outwebhook.WithHTTPClient(receiver.Client()), outwebhook.WithDeliveryPolicy(policy))
+	observer := newOutboundWebhookObserver()
+	serviceUnderTest := outwebhook.New(db.New(testPool), testPool, box, []string{receiver.URL}, outwebhook.WithHTTPClient(receiver.Client()), outwebhook.WithDeliveryPolicy(policy), outwebhook.WithObserver(observer))
 	bus := events.New()
 	serviceUnderTest.Register(bus)
 	t.Cleanup(func() {
@@ -573,6 +629,11 @@ func TestOutboundWebhookTerminalFailuresPauseAndSuccessResets(t *testing.T) {
 	}
 	if visible.Status != "paused" || visible.PauseReason == nil || *visible.PauseReason != "failure_threshold" {
 		t.Fatalf("automatic pause was not visible through the subscription API: %+v", visible)
+	}
+	for _, operation := range []string{"delivery_failed", "delivery_succeeded", "subscription_paused"} {
+		if !observer.recorded(operation) {
+			t.Fatalf("operation metric %s was not observed: %+v", operation, observer.snapshot())
+		}
 	}
 }
 
@@ -1274,7 +1335,8 @@ func TestOutboundWebhookProjectScopeValidationUpdateAndDeletion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	outbound := outwebhook.New(db.New(testPool), testPool, box, []string{"https://127.0.0.1:9443"})
+	observer := newOutboundWebhookObserver()
+	outbound := outwebhook.New(db.New(testPool), testPool, box, []string{"https://127.0.0.1:9443"}, outwebhook.WithObserver(observer))
 	h := *testHandler
 	h.OutboundWebhooks = outbound
 	projectA := dbfx.Project(t, "Webhook scope A")
@@ -1330,6 +1392,9 @@ func TestOutboundWebhookProjectScopeValidationUpdateAndDeletion(t *testing.T) {
 	}
 	if status != "paused" || pauseReason != "scope_empty" || len(projectIDs) != 0 {
 		t.Fatalf("empty scope widened or stayed active: status=%s reason=%s projects=%v", status, pauseReason, projectIDs)
+	}
+	if got := observer.snapshot()["subscription_paused"]; got != 1 {
+		t.Fatalf("scope-empty pause metric count = %d, want 1", got)
 	}
 }
 
@@ -1430,6 +1495,36 @@ func TestProjectScopedWebhookUsesIssueAndCommentEventTimeProjectSnapshots(t *tes
 	testutil.Call(t, h.UpdateIssue,
 		withURLParam(newRequest(http.MethodPatch, "/api/issues/"+issue.ID, map[string]any{"project_id": nil, "suppress_run": true}), "id", issue.ID)).Want(http.StatusOK)
 	receive(outwebhook.EventIssueProjectChanged)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var succeeded int
+		if err := testPool.QueryRow(context.Background(), `
+			SELECT count(*) FROM outbound_webhook_delivery
+			WHERE subscription_id = $1 AND state = 'succeeded'
+		`, created.Subscription.ID).Scan(&succeeded); err != nil {
+			t.Fatal(err)
+		}
+		if succeeded == 5 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("project-scoped multi-event deliveries persisted succeeded = %d, want 5", succeeded)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	var history outwebhook.DeliveryPage
+	historyRequest := withURLParams(newRequest(http.MethodGet, "/deliveries?limit=10", nil),
+		"id", testWorkspaceID, "subscriptionId", created.Subscription.ID)
+	testutil.Call(t, h.ListOutboundWebhookDeliveries, historyRequest).Want(http.StatusOK).JSON(&history)
+	if history.Total != 5 || len(history.Deliveries) != 5 {
+		t.Fatalf("project-scoped successful history = %+v, want 5 persisted deliveries", history)
+	}
+	for _, delivery := range history.Deliveries {
+		if delivery.State != "succeeded" || delivery.ResponseStatus == nil || *delivery.ResponseStatus != http.StatusNoContent {
+			t.Fatalf("project-scoped successful history row = %+v", delivery)
+		}
+	}
 
 	var projectBIssue struct {
 		ID string `json:"id"`
@@ -1657,7 +1752,8 @@ func TestOutboundWebhookLifecycleKeepsSecretsOneTimeAndTestsThroughPersistedDeli
 	}
 	queries := db.New(testPool)
 	bus := events.New()
-	outbound := outwebhook.New(queries, testPool, box, []string{receiver.URL}, outwebhook.WithHTTPClient(receiver.Client()))
+	observer := newOutboundWebhookObserver()
+	outbound := outwebhook.New(queries, testPool, box, []string{receiver.URL}, outwebhook.WithHTTPClient(receiver.Client()), outwebhook.WithObserver(observer))
 	h := New(queries, testPool, testHandler.Hub, bus, service.NewEmailService(), nil, nil, analytics.NoopClient{}, Config{AllowSignup: true})
 	h.OutboundWebhooks = outbound
 
@@ -1686,6 +1782,10 @@ func TestOutboundWebhookLifecycleKeepsSecretsOneTimeAndTestsThroughPersistedDeli
 	testutil.Call(t, h.PauseOutboundWebhook, params(http.MethodPost, "/pause", nil)).Want(http.StatusOK).JSON(&paused)
 	if paused.Status != "paused" || paused.PauseReason == nil || *paused.PauseReason != "manual" {
 		t.Fatalf("manual pause was not represented safely: %+v", paused)
+	}
+	testutil.Call(t, h.PauseOutboundWebhook, params(http.MethodPost, "/pause", nil)).Want(http.StatusOK)
+	if got := observer.snapshot()["subscription_paused"]; got != 1 {
+		t.Fatalf("manual pause metric count = %d after idempotent pause, want 1", got)
 	}
 
 	var tested outwebhook.TestResult
@@ -1768,5 +1868,151 @@ func TestOutboundWebhookLifecycleKeepsSecretsOneTimeAndTestsThroughPersistedDeli
 	testutil.Call(t, h.DeleteOutboundWebhook, params(http.MethodDelete, "", nil)).Want(http.StatusNoContent)
 	if count := dbfx.Count(t, `SELECT count(*) FROM outbound_webhook_delivery WHERE subscription_id = $1`, subscriptionID); count != 0 {
 		t.Fatalf("delete left %d retained deliveries", count)
+	}
+}
+
+func TestOutboundWebhookHistoryRedeliveryAndRetention(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database unavailable")
+	}
+	type received struct {
+		body   []byte
+		header http.Header
+	}
+	firstRequests := make(chan received, 2)
+	first := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read first receiver request: %v", err)
+			return
+		}
+		firstRequests <- received{body, r.Header.Clone()}
+		w.WriteHeader(http.StatusBadRequest)
+		if _, err := w.Write([]byte("token=receiver-secret " + strings.Repeat("界", 600))); err != nil {
+			t.Errorf("write first receiver response: %v", err)
+		}
+	}))
+	defer first.Close()
+	secondRequests := make(chan received, 2)
+	second := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read second receiver request: %v", err)
+			return
+		}
+		secondRequests <- received{body, r.Header.Clone()}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer second.Close()
+	box, err := secretbox.New([]byte("0123456789abcdef0123456789abcdef"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	queries, bus := db.New(testPool), events.New()
+	client := first.Client()
+	firstTransport := client.Transport
+	secondTransport := second.Client().Transport
+	client.Transport = outboundWebhookRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if strings.HasPrefix(request.URL.String(), second.URL) {
+			return secondTransport.RoundTrip(request)
+		}
+		return firstTransport.RoundTrip(request)
+	})
+	observer := newOutboundWebhookObserver()
+	outbound := outwebhook.New(queries, testPool, box, []string{first.URL, second.URL}, outwebhook.WithHTTPClient(client), outwebhook.WithHistoryPolicy(30*24*time.Hour, time.Hour), outwebhook.WithObserver(observer))
+	outbound.Register(bus)
+	t.Cleanup(func() { outbound.Close(); outbound.WaitWithTimeout(time.Second) })
+	h := New(queries, testPool, testHandler.Hub, bus, service.NewEmailService(), nil, nil, analytics.NoopClient{}, Config{AllowSignup: true})
+	h.OutboundWebhooks = outbound
+	var created struct {
+		Subscription  outwebhook.Subscription `json:"subscription"`
+		SigningSecret string                  `json:"signing_secret"`
+	}
+	testutil.Call(t, h.CreateOutboundWebhook, withURLParam(newRequest(http.MethodPost, "/create", map[string]any{
+		"name": "History receiver", "destination": first.URL + "/events", "events": []string{"issue.created"}, "scope_mode": "workspace",
+	}), "id", testWorkspaceID)).Want(http.StatusCreated).JSON(&created)
+	subscriptionID := created.Subscription.ID
+	t.Cleanup(func() {
+		if _, err := testPool.Exec(context.Background(), `DELETE FROM outbound_webhook_delivery WHERE subscription_id=$1`, subscriptionID); err != nil {
+			t.Errorf("delete history test deliveries: %v", err)
+		}
+		if _, err := testPool.Exec(context.Background(), `DELETE FROM outbound_webhook_subscription WHERE id=$1`, subscriptionID); err != nil {
+			t.Errorf("delete history test subscription: %v", err)
+		}
+	})
+	createReliabilityWebhookIssue(t, h, "History and redelivery")
+	var original received
+	select {
+	case original = <-firstRequests:
+	case <-time.After(5 * time.Second):
+		t.Fatal("original delivery was not received")
+	}
+	originalID := original.header.Get("X-Multica-Delivery-ID")
+	waitOutboundWebhookDeliveryState(t, originalID, "failed")
+	params := func(method, suffix string, body any) *http.Request {
+		return withURLParams(newRequest(method, suffix, body), "id", testWorkspaceID, "subscriptionId", subscriptionID)
+	}
+	memberID := addSecondWorkspaceMember(t, "outbound-history-member@multica.test")
+	memberParams := func(method, suffix string) *http.Request {
+		return withURLParams(newRequestAs(memberID, method, suffix, nil), "id", testWorkspaceID, "subscriptionId", subscriptionID, "deliveryId", originalID)
+	}
+	testutil.Call(t, h.ListOutboundWebhookDeliveries, memberParams(http.MethodGet, "/deliveries?limit=1")).Want(http.StatusForbidden)
+	testutil.Call(t, h.GetOutboundWebhookDelivery, memberParams(http.MethodGet, "/detail")).Want(http.StatusForbidden)
+	var page outwebhook.DeliveryPage
+	testutil.Call(t, h.ListOutboundWebhookDeliveries, params(http.MethodGet, "/deliveries?limit=1", nil)).Want(http.StatusOK).JSON(&page)
+	if len(page.Deliveries) != 1 || page.Total != 1 || page.Deliveries[0].ResponseExcerpt == nil {
+		t.Fatalf("unexpected history: %+v", page)
+	}
+	if len([]rune(*page.Deliveries[0].ResponseExcerpt)) > 512 || strings.Contains(*page.Deliveries[0].ResponseExcerpt, "receiver-secret") {
+		t.Fatalf("unsafe excerpt: %q", *page.Deliveries[0].ResponseExcerpt)
+	}
+	detailRequest := withURLParams(newRequest(http.MethodGet, "/detail", nil), "id", testWorkspaceID, "subscriptionId", subscriptionID, "deliveryId", originalID)
+	detailBody := testutil.Call(t, h.GetOutboundWebhookDelivery, detailRequest).Want(http.StatusOK).Text()
+	for _, forbidden := range []string{"request_body", "destination_ciphertext", "signing_secret", "receiver-secret"} {
+		if strings.Contains(detailBody, forbidden) {
+			t.Fatalf("detail exposed %q", forbidden)
+		}
+	}
+	testutil.Call(t, h.PauseOutboundWebhook, params(http.MethodPost, "/pause", nil)).Want(http.StatusOK)
+	redeliveryRequest := func() *http.Request {
+		return withURLParams(newRequest(http.MethodPost, "/redeliver", nil), "id", testWorkspaceID, "subscriptionId", subscriptionID, "deliveryId", originalID)
+	}
+	testutil.Call(t, h.RedeliverOutboundWebhookDelivery, redeliveryRequest()).Want(http.StatusConflict)
+	testutil.Call(t, h.ResumeOutboundWebhook, params(http.MethodPost, "/resume", nil)).Want(http.StatusOK)
+	testutil.Call(t, h.UpdateOutboundWebhook, params(http.MethodPut, "/update", map[string]any{"name": "History receiver", "destination": second.URL + "/events", "events": []string{"issue.created"}, "scope_mode": "workspace"})).Want(http.StatusOK)
+	var rotated struct {
+		SigningSecret string `json:"signing_secret"`
+	}
+	testutil.Call(t, h.RotateOutboundWebhookSecret, params(http.MethodPost, "/rotate", nil)).Want(http.StatusOK).JSON(&rotated)
+	var redelivery outwebhook.Delivery
+	testutil.Call(t, h.RedeliverOutboundWebhookDelivery, redeliveryRequest()).Want(http.StatusAccepted).JSON(&redelivery)
+	if redelivery.ID == originalID || redelivery.RedeliveryOf == nil || *redelivery.RedeliveryOf != originalID || redelivery.EventID != original.header.Get("X-Multica-Event-ID") {
+		t.Fatalf("wrong linkage: %+v", redelivery)
+	}
+	var replay received
+	select {
+	case replay = <-secondRequests:
+	case <-time.After(5 * time.Second):
+		t.Fatal("redelivery did not use current destination")
+	}
+	if string(replay.body) != string(original.body) || replay.header.Get("X-Multica-Delivery-ID") != redelivery.ID {
+		t.Fatal("redelivery body or ID changed incorrectly")
+	}
+	mac := hmac.New(sha256.New, []byte(rotated.SigningSecret))
+	mac.Write([]byte(replay.header.Get("X-Multica-Timestamp")))
+	mac.Write([]byte("."))
+	mac.Write(replay.body)
+	if replay.header.Get("X-Multica-Signature") != "v1="+hex.EncodeToString(mac.Sum(nil)) {
+		t.Fatal("redelivery did not use current signing secret")
+	}
+	if _, err := testPool.Exec(context.Background(), `UPDATE outbound_webhook_delivery SET state='succeeded', completed_at=now()-interval '31 days' WHERE id=$1`, originalID); err != nil {
+		t.Fatal(err)
+	}
+	outbound.RunMaintenance(context.Background())
+	if !observer.recorded("cleanup_succeeded") || !observer.recorded("redelivery_created") || !observer.observedOldestPending() {
+		t.Fatalf("history maintenance metrics were not observed: %+v", observer.snapshot())
+	}
+	if count := dbfx.Count(t, `SELECT count(*) FROM outbound_webhook_delivery WHERE id=$1`, originalID); count != 0 {
+		t.Fatalf("retention left %d rows", count)
 	}
 }

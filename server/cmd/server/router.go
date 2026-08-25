@@ -409,7 +409,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	outboundWebhookPolicy.SubscriptionConcurrency = int64(envPositiveInt("MULTICA_OUTBOUND_WEBHOOK_SUBSCRIPTION_CONCURRENCY", int(outboundWebhookPolicy.SubscriptionConcurrency)))
 	outboundWebhookPolicy.MaxPendingPerSubscription = int64(envPositiveInt("MULTICA_OUTBOUND_WEBHOOK_MAX_PENDING_PER_SUBSCRIPTION", int(outboundWebhookPolicy.MaxPendingPerSubscription)))
 	outboundWebhookPolicy.ConsecutiveFailureThreshold = int32(envPositiveInt("MULTICA_OUTBOUND_WEBHOOK_FAILURE_THRESHOLD", int(outboundWebhookPolicy.ConsecutiveFailureThreshold)))
-	h.OutboundWebhooks = outwebhook.New(queries, pool, outboundWebhookBox, splitAndTrim(os.Getenv("MULTICA_OUTBOUND_WEBHOOK_ALLOWED_ORIGINS")), outwebhook.WithDeliveryPolicy(outboundWebhookPolicy))
+	h.OutboundWebhooks = outwebhook.New(queries, pool, outboundWebhookBox, splitAndTrim(os.Getenv("MULTICA_OUTBOUND_WEBHOOK_ALLOWED_ORIGINS")), outwebhook.WithDeliveryPolicy(outboundWebhookPolicy), outwebhook.WithObserver(opts.BusinessMetrics))
 	h.OutboundWebhooks.Register(bus)
 	if apnsConfig, enabled, err := push.ConfigFromEnv(); err != nil {
 		slog.Error("APNs system notifications disabled by invalid configuration", "error", err)
@@ -1610,6 +1610,9 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					r.Post("/outbound-webhooks/{subscriptionId}/resume", h.ResumeOutboundWebhook)
 					r.Post("/outbound-webhooks/{subscriptionId}/test", h.TestOutboundWebhook)
 					r.Post("/outbound-webhooks/{subscriptionId}/rotate-secret", h.RotateOutboundWebhookSecret)
+					r.Get("/outbound-webhooks/{subscriptionId}/deliveries", h.ListOutboundWebhookDeliveries)
+					r.Get("/outbound-webhooks/{subscriptionId}/deliveries/{deliveryId}", h.GetOutboundWebhookDelivery)
+					r.Post("/outbound-webhooks/{subscriptionId}/deliveries/{deliveryId}/redeliver", h.RedeliverOutboundWebhookDelivery)
 					r.Patch("/outbound-webhooks/{subscriptionId}/scope", h.UpdateOutboundWebhookScope)
 					r.Delete("/outbound-webhooks/{subscriptionId}", h.DeleteOutboundWebhook)
 				})

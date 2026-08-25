@@ -88,6 +88,8 @@ import type {
   CreateOutboundWebhookSubscriptionResponse,
   RotateOutboundWebhookSecretResponse,
   TestOutboundWebhookSubscriptionResponse,
+  OutboundWebhookDelivery,
+  ListOutboundWebhookDeliveriesResponse,
 } from "../types";
 import type { CloudRuntimeNode } from "../runtimes/cloud-runtime";
 import type { CreateFeedbackResponse } from "../feedback/types";
@@ -460,6 +462,56 @@ export const EMPTY_LIST_OUTBOUND_WEBHOOK_SUBSCRIPTIONS: ListOutboundWebhookSubsc
 export const EMPTY_CREATE_OUTBOUND_WEBHOOK_SUBSCRIPTION: CreateOutboundWebhookSubscriptionResponse = {
   subscription: EMPTY_OUTBOUND_WEBHOOK_SUBSCRIPTION,
   signingSecret: "",
+};
+
+export const OutboundWebhookDeliverySchema = z.object({
+  id: z.string(),
+  event_id: z.string(),
+  subscription_id: z.string(),
+  event_type: z.string(),
+  state: z.enum(["pending", "succeeded", "failed"]).catch("failed"),
+  attempt_count: z.number().int().nonnegative().default(0),
+  response_status: z.number().int().nullable().catch(null),
+  response_excerpt: z.string().max(512).nullable().catch(null),
+  failure_reason: z.string().nullable().catch(null),
+  redelivery_of: z.string().nullable().catch(null),
+  created_at: z.string(),
+  last_attempt_at: z.string().nullable().catch(null),
+  completed_at: z.string().nullable().catch(null),
+}).loose().transform((value): OutboundWebhookDelivery => ({
+  id: value.id,
+  eventId: value.event_id,
+  subscriptionId: value.subscription_id,
+  eventType: value.event_type,
+  state: value.state,
+  attemptCount: value.attempt_count,
+  responseStatus: value.response_status,
+  responseExcerpt: value.response_excerpt,
+  failureReason: value.failure_reason,
+  redeliveryOf: value.redelivery_of,
+  createdAt: value.created_at,
+  lastAttemptAt: value.last_attempt_at,
+  completedAt: value.completed_at,
+}));
+
+export const ListOutboundWebhookDeliveriesResponseSchema = z.object({
+	deliveries: z.array(OutboundWebhookDeliverySchema),
+	total: z.number().int().nonnegative(),
+	next_offset: z.number().int().nonnegative().nullable(),
+}).loose().transform((value): ListOutboundWebhookDeliveriesResponse => ({
+  deliveries: value.deliveries,
+  total: value.total,
+  nextOffset: value.next_offset,
+}));
+
+export const EMPTY_OUTBOUND_WEBHOOK_DELIVERY: OutboundWebhookDelivery = {
+  id: "", eventId: "", subscriptionId: "", eventType: "", state: "failed",
+  attemptCount: 0, responseStatus: null, responseExcerpt: null, failureReason: null,
+  redeliveryOf: null, createdAt: "", lastAttemptAt: null, completedAt: null,
+};
+
+export const EMPTY_LIST_OUTBOUND_WEBHOOK_DELIVERIES: ListOutboundWebhookDeliveriesResponse = {
+  deliveries: [], total: 0, nextOffset: null,
 };
 
 export const GitHubConnectResponseSchema = z.object({

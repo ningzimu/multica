@@ -979,6 +979,8 @@ type OutboundWebhookDelivery struct {
 	SigningSecretCiphertext []byte             `json:"signing_secret_ciphertext"`
 	DestinationCiphertext   []byte             `json:"destination_ciphertext"`
 	SecretVersion           int32              `json:"secret_version"`
+	RedeliveryOfID          pgtype.UUID        `json:"redelivery_of_id"`
+	ResponseExcerpt         pgtype.Text        `json:"response_excerpt"`
 }
 
 type OutboundWebhookSubscription struct {

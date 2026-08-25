@@ -1201,7 +1201,11 @@
     "load_failed": "送信 Webhook の読み込みに失敗しました。",
     "unavailable": "送信 Webhook は利用できません",
     "unavailable_description": "Webhook を管理・配信するには、この環境に送信 Webhook 用の暗号化キーを設定してください。",
-    "empty": "送信 Webhook はまだありません。"
+    "empty": "送信 Webhook はまだありません。",
+    "delivery_history": "配信履歴", "history_failed": "配信履歴を読み込めませんでした。",
+    "attempts": "試行回数", "redeliver": "再配信", "redelivery_queued": "再配信をキューに追加しました", "redelivery_failed": "再配信に失敗しました",
+    "delivery_id": "配信 ID", "event_id": "イベント ID", "redelivery_of": "元の配信", "failure_reason": "失敗理由", "response_excerpt": "レスポンス抜粋",
+    "previous": "前へ", "next": "次へ", "deliveries_other": "{{count}} 件の配信", "no_deliveries": "配信履歴はまだありません。"
   },
   "members": {
     "section_title": "メンバー（{{count}}）",

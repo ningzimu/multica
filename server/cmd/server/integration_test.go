@@ -966,6 +966,38 @@ func TestDeleteWorkspaceRequiresOwner(t *testing.T) {
 	}
 }
 
+func TestOutboundWebhookDeliveryHistoryRoutesRequireAdministrator(t *testing.T) {
+	email := fmt.Sprintf("outbound-history-member-%d@multica.test", time.Now().UnixNano())
+	memberID := testFixture.User(t, "History Member", email)
+	testFixture.Member(t, testWorkspaceID, memberID, "member")
+	token, err := generateTestJWT(memberID, email, "History Member")
+	if err != nil {
+		t.Fatalf("generate member token: %v", err)
+	}
+
+	const subscriptionID = "d1474000-0000-4000-8000-000000000017"
+	const deliveryID = "d1474000-0000-4000-8000-000000000018"
+	for _, path := range []string{
+		"/api/workspaces/" + testWorkspaceID + "/outbound-webhooks/" + subscriptionID + "/deliveries",
+		"/api/workspaces/" + testWorkspaceID + "/outbound-webhooks/" + subscriptionID + "/deliveries/" + deliveryID,
+	} {
+		req, err := http.NewRequest(http.MethodGet, testServer.URL+path, nil)
+		if err != nil {
+			t.Fatalf("build history request: %v", err)
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("X-Workspace-ID", testWorkspaceID)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("history request failed: %v", err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("member history route %s status = %d, want 403", path, resp.StatusCode)
+		}
+	}
+}
+
 func TestDingTalkGroupsThroughRouterSupportsFilteredWorkspaceAndAgentScopes(t *testing.T) {
 	removedRouteResp := authRequest(t, http.MethodGet, "/api/workspaces/"+testWorkspaceID+"/dingtalk/group-routes", nil)
 	removedRouteResp.Body.Close()

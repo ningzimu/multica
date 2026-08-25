@@ -121,6 +121,9 @@ export type {
   RotateOutboundWebhookSecretResponse,
   TestOutboundWebhookSubscriptionResponse,
   OutboundWebhookEvent,
+  OutboundWebhookDelivery,
+  OutboundWebhookDeliveryState,
+  ListOutboundWebhookDeliveriesResponse,
 } from "./outbound-webhook";
 export { outboundWebhookEventTypes } from "./outbound-webhook";
 export type { Comment, CommentType, CommentAuthorType, CommentTriggerPreview, CommentTriggerPreviewAgent, CommentTriggerSource, CommentTriggerOutcome, CommentTriggerStatus, Reaction } from "./comment";

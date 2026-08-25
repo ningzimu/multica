@@ -1201,7 +1201,11 @@
     "load_failed": "加载出站 Webhook 失败。",
     "unavailable": "出站 Webhook 不可用",
     "unavailable_description": "请为此部署配置出站 Webhook 加密密钥，之后才能管理或投递 Webhook。",
-    "empty": "暂无出站 Webhook。"
+    "empty": "暂无出站 Webhook。",
+    "delivery_history": "投递历史", "history_failed": "无法加载投递历史。",
+    "attempts": "尝试次数", "redeliver": "重新投递", "redelivery_queued": "已加入重新投递队列", "redelivery_failed": "重新投递失败",
+    "delivery_id": "投递 ID", "event_id": "事件 ID", "redelivery_of": "原投递", "failure_reason": "失败原因", "response_excerpt": "响应摘要",
+    "previous": "上一页", "next": "下一页", "deliveries_other": "{{count}} 条投递", "no_deliveries": "暂无投递记录。"
   },
   "members": {
     "section_title": "成员（{{count}}）",

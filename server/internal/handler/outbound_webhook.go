@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strconv"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5"
@@ -303,6 +304,90 @@ func (h *Handler) RotateOutboundWebhookSecret(w http.ResponseWriter, r *http.Req
 		return
 	}
 	writeJSON(w, http.StatusOK, result)
+}
+
+func (h *Handler) ListOutboundWebhookDeliveries(w http.ResponseWriter, r *http.Request) {
+	workspaceID, subscriptionID, ok := h.requireOutboundWebhookMutation(w, r)
+	if !ok {
+		return
+	}
+	limit, offset := int32(0), int32(0)
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		value, err := strconv.ParseInt(raw, 10, 32)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid delivery history pagination")
+			return
+		}
+		limit = int32(value)
+	}
+	if raw := r.URL.Query().Get("offset"); raw != "" {
+		value, err := strconv.ParseInt(raw, 10, 32)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid delivery history pagination")
+			return
+		}
+		offset = int32(value)
+	}
+	page, err := h.OutboundWebhooks.ListDeliveries(r.Context(), workspaceID, subscriptionID, limit, offset)
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "outbound webhook not found")
+		return
+	}
+	if errors.Is(err, outwebhook.ErrInvalidInput) {
+		writeError(w, http.StatusBadRequest, "invalid delivery history pagination")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to list webhook deliveries")
+		return
+	}
+	writeJSON(w, http.StatusOK, page)
+}
+
+func (h *Handler) GetOutboundWebhookDelivery(w http.ResponseWriter, r *http.Request) {
+	workspaceID, subscriptionID, ok := h.requireOutboundWebhookMutation(w, r)
+	if !ok {
+		return
+	}
+	deliveryID, ok := parseUUIDOrBadRequest(w, chi.URLParam(r, "deliveryId"), "delivery_id")
+	if !ok {
+		return
+	}
+	delivery, err := h.OutboundWebhooks.GetDelivery(r.Context(), workspaceID, subscriptionID, deliveryID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "webhook delivery not found")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to get webhook delivery")
+		return
+	}
+	writeJSON(w, http.StatusOK, delivery)
+}
+
+func (h *Handler) RedeliverOutboundWebhookDelivery(w http.ResponseWriter, r *http.Request) {
+	workspaceID, subscriptionID, ok := h.requireOutboundWebhookMutation(w, r)
+	if !ok {
+		return
+	}
+	deliveryID, ok := parseUUIDOrBadRequest(w, chi.URLParam(r, "deliveryId"), "delivery_id")
+	if !ok {
+		return
+	}
+	delivery, err := h.OutboundWebhooks.Redeliver(r.Context(), workspaceID, subscriptionID, deliveryID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "webhook delivery not found")
+		return
+	}
+	if errors.Is(err, outwebhook.ErrPaused) {
+		writeError(w, http.StatusConflict, "paused webhook subscriptions cannot redeliver")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to redeliver webhook delivery")
+		return
+	}
+	writeJSON(w, http.StatusAccepted, delivery)
 }
 
 func (h *Handler) requireOutboundWebhookMutation(w http.ResponseWriter, r *http.Request) (pgtype.UUID, pgtype.UUID, bool) {

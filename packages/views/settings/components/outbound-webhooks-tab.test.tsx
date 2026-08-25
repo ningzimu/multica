@@ -18,8 +18,12 @@ const mockPause = vi.hoisted(() => vi.fn());
 const mockResume = vi.hoisted(() => vi.fn());
 const mockTest = vi.hoisted(() => vi.fn());
 const mockRotate = vi.hoisted(() => vi.fn());
+const mockListDeliveries = vi.hoisted(() => vi.fn());
+const mockGetDelivery = vi.hoisted(() => vi.fn());
+const mockRedeliver = vi.hoisted(() => vi.fn());
 const mockListProjects = vi.hoisted(() => vi.fn());
 const mockToastError = vi.hoisted(() => vi.fn());
+const mockMemberRole = vi.hoisted(() => ({ value: "owner" }));
 
 vi.mock("@multica/core/api", () => ({
   api: {
@@ -32,6 +36,9 @@ vi.mock("@multica/core/api", () => ({
     resumeOutboundWebhookSubscription: mockResume,
     testOutboundWebhookSubscription: mockTest,
     rotateOutboundWebhookSecret: mockRotate,
+    listOutboundWebhookDeliveries: mockListDeliveries,
+    getOutboundWebhookDelivery: mockGetDelivery,
+    redeliverOutboundWebhookDelivery: mockRedeliver,
     listProjects: mockListProjects,
   },
 }));
@@ -41,7 +48,7 @@ vi.mock("@multica/core/paths", () => ({
 }));
 
 vi.mock("@multica/core/permissions", () => ({
-  useCurrentMember: () => ({ role: "owner", isLoading: false }),
+  useCurrentMember: () => ({ role: mockMemberRole.value, isLoading: false }),
 }));
 
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: mockToastError } }));
@@ -62,6 +69,7 @@ function Wrapper({ children }: { children: ReactNode }) {
 describe("OutboundWebhooksTab", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockMemberRole.value = "owner";
     mockList.mockResolvedValue({ subscriptions: [], capabilityAvailable: true });
     mockListProjects.mockResolvedValue({ projects: [
       { id: "project-1", title: "Alpha" },
@@ -77,6 +85,9 @@ describe("OutboundWebhooksTab", () => {
     mockResume.mockResolvedValue({ id: "sub-1", status: "active" });
     mockTest.mockResolvedValue({ deliveryId: "delivery-1", eventId: "event-1", state: "pending" });
     mockRotate.mockResolvedValue({ subscription: { id: "sub-1" }, signingSecret: "whsec_rotated_once" });
+    mockListDeliveries.mockResolvedValue({ deliveries: [], total: 0, nextOffset: null });
+    mockGetDelivery.mockResolvedValue({ id: "delivery-1", eventId: "event-1", subscriptionId: "sub-1", eventType: "issue.created", state: "failed", attemptCount: 2, responseStatus: 503, responseExcerpt: "temporarily unavailable", failureReason: "receiver returned HTTP 503", redeliveryOf: null, createdAt: "2026-08-25T00:00:00Z", lastAttemptAt: null, completedAt: null });
+    mockRedeliver.mockResolvedValue({ id: "delivery-2", state: "pending" });
   });
 
   it("creates an explicit issue.created workspace subscription and discloses its secret once", async () => {
@@ -204,5 +215,59 @@ describe("OutboundWebhooksTab", () => {
     render(<OutboundWebhooksTab />, { wrapper: Wrapper });
     expect(await screen.findByText("Outbound Webhooks unavailable")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Create webhook" })).not.toBeInTheDocument();
+  });
+
+  it("shows redacted delivery detail and queues a linked redelivery", async () => {
+    mockList.mockResolvedValue({ capabilityAvailable: true, subscriptions: [
+      { id: "sub-1", workspaceId: "workspace-1", name: "Receiver", destinationHint: "https://example.com", events: ["issue.created"], eventCatalogVersion: 1, scopeMode: "workspace", projectIds: [], status: "active", pauseReason: null, consecutiveTerminalFailures: 0, signingSecretHint: "whsec_...once", secretVersion: 1, createdAt: "now", updatedAt: "now" },
+    ] });
+    mockListDeliveries.mockResolvedValue({ deliveries: [
+      { id: "delivery-1", eventId: "event-1", subscriptionId: "sub-1", eventType: "issue.created", state: "failed", attemptCount: 2, responseStatus: 503, responseExcerpt: "temporarily unavailable", failureReason: "receiver returned HTTP 503", redeliveryOf: null, createdAt: "2026-08-25T00:00:00Z", lastAttemptAt: null, completedAt: null },
+    ], total: 1, nextOffset: null });
+    const user = userEvent.setup();
+    render(<OutboundWebhooksTab />, { wrapper: Wrapper });
+
+    await user.click(await screen.findByRole("button", { name: "Inspect" }));
+    expect(await screen.findByText("Delivery history")).toBeInTheDocument();
+    await user.click(screen.getAllByRole("button", { name: "Inspect" }).at(-1)!);
+    await waitFor(() => expect(mockGetDelivery).toHaveBeenCalledWith("workspace-1", "sub-1", "delivery-1"));
+    expect(await screen.findByText("temporarily unavailable")).toBeInTheDocument();
+    expect(screen.queryByText(/whsec_once/)).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Redeliver" }));
+    await waitFor(() => expect(mockRedeliver).toHaveBeenCalledWith("workspace-1", "sub-1", "delivery-1"));
+  });
+
+  it("does not request or render administrator delivery history for a member", async () => {
+    mockMemberRole.value = "member";
+    mockList.mockResolvedValue({ capabilityAvailable: true, subscriptions: [
+      { id: "sub-1", workspaceId: "workspace-1", name: "Receiver", destinationHint: "https://example.com", events: ["issue.created"], eventCatalogVersion: 1, scopeMode: "workspace", projectIds: [], status: "active", pauseReason: null, consecutiveTerminalFailures: 0, signingSecretHint: "whsec_...once", secretVersion: 1, createdAt: "now", updatedAt: "now" },
+    ] });
+    const user = userEvent.setup();
+    render(<OutboundWebhooksTab />, { wrapper: Wrapper });
+
+    await user.click(await screen.findByRole("button", { name: "Inspect" }));
+    await waitFor(() => expect(mockGet).toHaveBeenCalledWith("workspace-1", "sub-1"));
+    expect(screen.queryByText("Delivery history")).not.toBeInTheDocument();
+    expect(mockListDeliveries).not.toHaveBeenCalled();
+    expect(mockGetDelivery).not.toHaveBeenCalled();
+  });
+
+  it("shows a persisted successful delivery for a scoped multi-event subscription", async () => {
+    mockList.mockResolvedValue({ capabilityAvailable: true, subscriptions: [
+      { id: "sub-1", workspaceId: "workspace-1", name: "Project receiver", destinationHint: "https://example.com", events: ["issue.project_changed", "comment.created"], eventCatalogVersion: 1, scopeMode: "project", projectIds: ["project-1"], status: "active", pauseReason: null, consecutiveTerminalFailures: 0, signingSecretHint: "whsec_...once", secretVersion: 1, createdAt: "now", updatedAt: "now" },
+    ] });
+    const successful = { id: "delivery-success", eventId: "event-success", subscriptionId: "sub-1", eventType: "comment.created", state: "succeeded", attemptCount: 1, responseStatus: 204, responseExcerpt: null, failureReason: null, redeliveryOf: null, createdAt: "2026-08-25T00:00:00Z", lastAttemptAt: "2026-08-25T00:00:01Z", completedAt: "2026-08-25T00:00:01Z" };
+    mockListDeliveries.mockResolvedValue({ deliveries: [successful], total: 1, nextOffset: null });
+    mockGetDelivery.mockResolvedValue(successful);
+    const user = userEvent.setup();
+    render(<OutboundWebhooksTab />, { wrapper: Wrapper });
+
+    await user.click(await screen.findByRole("button", { name: "Inspect" }));
+    expect(await screen.findByText("succeeded")).toBeInTheDocument();
+    expect(screen.getByText("HTTP 204")).toBeInTheDocument();
+    expect(screen.getByText("1 delivery")).toBeInTheDocument();
+    await user.click(screen.getAllByRole("button", { name: "Inspect" }).at(-1)!);
+    await waitFor(() => expect(mockGetDelivery).toHaveBeenCalledWith("workspace-1", "sub-1", "delivery-success"));
+    expect(await screen.findByText("delivery-success")).toBeInTheDocument();
   });
 });

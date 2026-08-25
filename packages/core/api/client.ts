@@ -223,6 +223,8 @@ import type {
   UpdateOutboundWebhookSubscriptionRequest,
   RotateOutboundWebhookSecretResponse,
   TestOutboundWebhookSubscriptionResponse,
+  OutboundWebhookDelivery,
+  ListOutboundWebhookDeliveriesResponse,
 } from "../types";
 import type { OnboardingCompletionPath } from "../onboarding/types";
 import type {
@@ -406,9 +408,13 @@ import {
   CreateOutboundWebhookSubscriptionResponseSchema,
   RotateOutboundWebhookSecretResponseSchema,
   TestOutboundWebhookSubscriptionResponseSchema,
+  OutboundWebhookDeliverySchema,
+  ListOutboundWebhookDeliveriesResponseSchema,
   EMPTY_OUTBOUND_WEBHOOK_SUBSCRIPTION,
   EMPTY_LIST_OUTBOUND_WEBHOOK_SUBSCRIPTIONS,
   EMPTY_CREATE_OUTBOUND_WEBHOOK_SUBSCRIPTION,
+  EMPTY_OUTBOUND_WEBHOOK_DELIVERY,
+  EMPTY_LIST_OUTBOUND_WEBHOOK_DELIVERIES,
   ListGitHubRepositoriesResponseSchema,
   EMPTY_GITHUB_CONNECT_RESPONSE,
   EMPTY_LIST_GITHUB_INSTALLATIONS_RESPONSE,
@@ -4299,6 +4305,50 @@ export class ApiClient {
       `/api/workspaces/${workspaceId}/outbound-webhooks/${subscriptionId}`,
       { method: "DELETE" },
     );
+  }
+
+  async listOutboundWebhookDeliveries(
+    workspaceId: string,
+    subscriptionId: string,
+    params?: { limit?: number; offset?: number },
+  ): Promise<ListOutboundWebhookDeliveriesResponse> {
+    const search = new URLSearchParams();
+    if (params?.limit) search.set("limit", params.limit.toString());
+    if (params?.offset) search.set("offset", params.offset.toString());
+    const suffix = search.size > 0 ? `?${search}` : "";
+    const raw = await this.fetch<unknown>(
+      `/api/workspaces/${workspaceId}/outbound-webhooks/${subscriptionId}/deliveries${suffix}`,
+    );
+    return parseWithFallback(raw, ListOutboundWebhookDeliveriesResponseSchema, EMPTY_LIST_OUTBOUND_WEBHOOK_DELIVERIES, {
+      endpoint: "GET /api/workspaces/:id/outbound-webhooks/:subscriptionId/deliveries",
+    });
+  }
+
+  async getOutboundWebhookDelivery(
+    workspaceId: string,
+    subscriptionId: string,
+    deliveryId: string,
+  ): Promise<OutboundWebhookDelivery> {
+    const raw = await this.fetch<unknown>(
+      `/api/workspaces/${workspaceId}/outbound-webhooks/${subscriptionId}/deliveries/${deliveryId}`,
+    );
+    return parseWithFallback(raw, OutboundWebhookDeliverySchema, { ...EMPTY_OUTBOUND_WEBHOOK_DELIVERY, id: deliveryId, subscriptionId }, {
+      endpoint: "GET /api/workspaces/:id/outbound-webhooks/:subscriptionId/deliveries/:deliveryId",
+    });
+  }
+
+  async redeliverOutboundWebhookDelivery(
+    workspaceId: string,
+    subscriptionId: string,
+    deliveryId: string,
+  ): Promise<OutboundWebhookDelivery> {
+    const raw = await this.fetch<unknown>(
+      `/api/workspaces/${workspaceId}/outbound-webhooks/${subscriptionId}/deliveries/${deliveryId}/redeliver`,
+      { method: "POST" },
+    );
+    return parseWithFallback(raw, OutboundWebhookDeliverySchema, { ...EMPTY_OUTBOUND_WEBHOOK_DELIVERY, subscriptionId }, {
+      endpoint: "POST /api/workspaces/:id/outbound-webhooks/:subscriptionId/deliveries/:deliveryId/redeliver",
+    });
   }
 
   // GitHub integration

@@ -631,10 +631,11 @@ func (h *Handler) DeleteProject(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to delete project views")
 		return
 	}
-	if _, err := qtx.RemoveProjectFromOutboundWebhookScopes(r.Context(), db.RemoveProjectFromOutboundWebhookScopesParams{
+	pausedWebhooks, err := qtx.RemoveProjectFromOutboundWebhookScopes(r.Context(), db.RemoveProjectFromOutboundWebhookScopesParams{
 		WorkspaceID: project.WorkspaceID,
 		ProjectID:   project.ID,
-	}); err != nil {
+	})
+	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to update outbound webhook scopes")
 		return
 	}
@@ -648,6 +649,13 @@ func (h *Handler) DeleteProject(w http.ResponseWriter, r *http.Request) {
 	if err := tx.Commit(r.Context()); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to commit project delete")
 		return
+	}
+	if h.OutboundWebhooks != nil {
+		for _, webhook := range pausedWebhooks {
+			if webhook.NewlyPaused.Valid && webhook.NewlyPaused.Bool {
+				h.OutboundWebhooks.RecordSubscriptionPaused(webhook.ID, "scope_empty")
+			}
+		}
 	}
 	h.publish(protocol.EventProjectDeleted, workspaceID, "member", userID, map[string]any{"project_id": uuidToString(project.ID)})
 	w.WriteHeader(http.StatusNoContent)
