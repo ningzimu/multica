@@ -1,0 +1,1 @@
+DROP INDEX CONCURRENTLY IF EXISTS idx_outbound_webhook_delivery_live_lease;

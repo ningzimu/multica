@@ -608,10 +608,12 @@ func (h *Handler) CreatePluginComment(w http.ResponseWriter, r *http.Request) {
 	// purpose (mention dispatch).
 	h.publish(protocol.EventCommentCreated, uuidToString(caller.WorkspaceID), authorType, uuidToString(authorID), map[string]any{
 		"comment":             commentToResponse(comment, nil, nil),
-		"issue_title":         issue.Title,
+		"issue_title":         createdComment.IssueTitle,
 		"issue_assignee_type": textToPtr(issue.AssigneeType),
 		"issue_assignee_id":   uuidToPtr(issue.AssigneeID),
-		"issue_status":        issue.Status,
+		"issue_status":        createdComment.IssueStatus,
+		"issue_priority":      createdComment.IssuePriority,
+		"issue_project_id":    uuidToPtr(createdComment.IssueProjectID),
 	})
 	if rootComment != nil {
 		h.TaskService.AutoUnresolveThreadOnReply(r.Context(), rootComment, uuidToString(caller.WorkspaceID), authorType, uuidToString(authorID))

@@ -959,6 +959,51 @@ type NotificationPreference struct {
 	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
 }
 
+type OutboundWebhookDelivery struct {
+	ID                      pgtype.UUID        `json:"id"`
+	EventID                 pgtype.UUID        `json:"event_id"`
+	SubscriptionID          pgtype.UUID        `json:"subscription_id"`
+	WorkspaceID             pgtype.UUID        `json:"workspace_id"`
+	EventType               string             `json:"event_type"`
+	RequestBody             []byte             `json:"request_body"`
+	State                   string             `json:"state"`
+	AttemptCount            int32              `json:"attempt_count"`
+	ResponseStatus          pgtype.Int4        `json:"response_status"`
+	FailureReason           pgtype.Text        `json:"failure_reason"`
+	CreatedAt               pgtype.Timestamptz `json:"created_at"`
+	CompletedAt             pgtype.Timestamptz `json:"completed_at"`
+	NextAttemptAt           pgtype.Timestamptz `json:"next_attempt_at"`
+	LeaseToken              pgtype.UUID        `json:"lease_token"`
+	LeaseExpiresAt          pgtype.Timestamptz `json:"lease_expires_at"`
+	LastAttemptAt           pgtype.Timestamptz `json:"last_attempt_at"`
+	SigningSecretCiphertext []byte             `json:"signing_secret_ciphertext"`
+	DestinationCiphertext   []byte             `json:"destination_ciphertext"`
+	SecretVersion           int32              `json:"secret_version"`
+	RedeliveryOfID          pgtype.UUID        `json:"redelivery_of_id"`
+	ResponseExcerpt         pgtype.Text        `json:"response_excerpt"`
+}
+
+type OutboundWebhookSubscription struct {
+	ID                          pgtype.UUID        `json:"id"`
+	WorkspaceID                 pgtype.UUID        `json:"workspace_id"`
+	Name                        string             `json:"name"`
+	DestinationCiphertext       []byte             `json:"destination_ciphertext"`
+	SecretCiphertext            []byte             `json:"secret_ciphertext"`
+	DestinationHint             string             `json:"destination_hint"`
+	Events                      []byte             `json:"events"`
+	EventCatalogVersion         int32              `json:"event_catalog_version"`
+	ScopeMode                   string             `json:"scope_mode"`
+	CreatedBy                   pgtype.UUID        `json:"created_by"`
+	CreatedAt                   pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt                   pgtype.Timestamptz `json:"updated_at"`
+	Status                      string             `json:"status"`
+	PauseReason                 pgtype.Text        `json:"pause_reason"`
+	ConsecutiveTerminalFailures int32              `json:"consecutive_terminal_failures"`
+	SigningSecretHint           string             `json:"signing_secret_hint"`
+	SecretVersion               int32              `json:"secret_version"`
+	ProjectIds                  []pgtype.UUID      `json:"project_ids"`
+}
+
 type PersonalAccessToken struct {
 	ID          pgtype.UUID        `json:"id"`
 	UserID      pgtype.UUID        `json:"user_id"`
@@ -1126,6 +1171,23 @@ type QuickAction struct {
 	CreatedByID   pgtype.UUID        `json:"created_by_id"`
 	CreatedAt     pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt     pgtype.Timestamptz `json:"updated_at"`
+}
+
+type RecipientDevice struct {
+	ID              pgtype.UUID        `json:"id"`
+	InstallationID  pgtype.UUID        `json:"installation_id"`
+	UserID          pgtype.UUID        `json:"user_id"`
+	Platform        string             `json:"platform"`
+	BundleID        string             `json:"bundle_id"`
+	PushEnvironment string             `json:"push_environment"`
+	DeviceToken     string             `json:"device_token"`
+	Enabled         bool               `json:"enabled"`
+	BoundAt         pgtype.Timestamptz `json:"bound_at"`
+	RevokedAt       pgtype.Timestamptz `json:"revoked_at"`
+	InvalidatedAt   pgtype.Timestamptz `json:"invalidated_at"`
+	LastSeenAt      pgtype.Timestamptz `json:"last_seen_at"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
 }
 
 type RuntimeProfile struct {

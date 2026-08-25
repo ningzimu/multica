@@ -183,6 +183,8 @@ func TestBusinessMetricsRegistryExposesAllFamilies(t *testing.T) {
 	m.RecordEntitlementVersionRegression("refresh")
 	m.RecordAutopilotQuotaDecision("observe", "manual", "admitted")
 	m.RecordIssueWindowDecision("observe", "list", "would_block")
+	m.RecordOutboundWebhookOperation("delivery_succeeded")
+	m.SetOutboundWebhookOldestPending(12)
 
 	families, err := registry.Gather()
 	if err != nil {

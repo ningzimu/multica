@@ -61,6 +61,16 @@ import {
   PluginPreviewSchema,
   EMPTY_PLUGIN_INSTALLATION_LIST,
   EMPTY_PLUGIN_PREVIEW,
+  ListOutboundWebhookSubscriptionsResponseSchema,
+  OutboundWebhookSubscriptionSchema,
+  EMPTY_LIST_OUTBOUND_WEBHOOK_SUBSCRIPTIONS,
+  CreateOutboundWebhookSubscriptionResponseSchema,
+  RotateOutboundWebhookSecretResponseSchema,
+  TestOutboundWebhookSubscriptionResponseSchema,
+  EMPTY_CREATE_OUTBOUND_WEBHOOK_SUBSCRIPTION,
+  OutboundWebhookDeliverySchema,
+  ListOutboundWebhookDeliveriesResponseSchema,
+  EMPTY_OUTBOUND_WEBHOOK_DELIVERY,
 } from "./schemas";
 import { IssueViewSchema, IssueViewListSchema } from "./schemas";
 import {
@@ -70,6 +80,162 @@ import {
   EMPTY_ISSUE_STATUS_ENTRY,
 } from "./schemas";
 import { parseWithFallback } from "./schema";
+
+describe("outbound webhook schemas", () => {
+  const subscription = {
+    id: "sub-1",
+    workspace_id: "workspace-1",
+    name: "Receiver",
+    destination_hint: "https://receiver.example",
+    events: ["issue.created"],
+    event_catalog_version: 1,
+    scope_mode: "workspace",
+    project_ids: [],
+    created_at: "2026-08-25T00:00:00Z",
+    updated_at: "2026-08-25T00:00:00Z",
+  };
+
+  it("parses an automatic failure-threshold pause without breaking older responses", () => {
+    const active = ListOutboundWebhookSubscriptionsResponseSchema.parse({ subscriptions: [subscription] });
+    expect(active.subscriptions[0]).toMatchObject({ status: "active", pauseReason: null, consecutiveTerminalFailures: 0 });
+
+    const paused = ListOutboundWebhookSubscriptionsResponseSchema.parse({
+      subscriptions: [{
+        ...subscription,
+        status: "paused",
+        pause_reason: "failure_threshold",
+        consecutive_terminal_failures: 5,
+      }],
+    });
+    expect(paused.subscriptions[0]).toMatchObject({
+      status: "paused",
+      pauseReason: "failure_threshold",
+      consecutiveTerminalFailures: 5,
+    });
+  });
+
+  it("fails closed to paused for a newer subscription lifecycle status", () => {
+    const parsed = ListOutboundWebhookSubscriptionsResponseSchema.parse({
+      subscriptions: [{ ...subscription, status: "future_lifecycle_state" }],
+    });
+    expect(parsed.subscriptions[0]?.status).toBe("paused");
+  });
+
+  it("preserves an explicit multi-project scope", () => {
+    const parsed = ListOutboundWebhookSubscriptionsResponseSchema.parse({
+      subscriptions: [{ ...subscription, scope_mode: "project", project_ids: ["project-1", "project-2"] }],
+    });
+    expect(parsed.subscriptions[0]).toMatchObject({
+      scopeMode: "project",
+      projectIds: ["project-1", "project-2"],
+    });
+  });
+
+  it("fails closed when scope mode and selected projects contradict each other", () => {
+    const parsed = parseWithFallback(
+      { subscriptions: [{ ...subscription, scope_mode: "project", project_ids: [] }] },
+      ListOutboundWebhookSubscriptionsResponseSchema,
+      EMPTY_LIST_OUTBOUND_WEBHOOK_SUBSCRIPTIONS,
+      { endpoint: "GET /api/workspaces/:id/outbound-webhooks" },
+    );
+    expect(parsed).toEqual(EMPTY_LIST_OUTBOUND_WEBHOOK_SUBSCRIPTIONS);
+  });
+
+  it("fails closed when the server returns an unknown scope mode", () => {
+    const parsed = parseWithFallback(
+      { subscriptions: [{ ...subscription, scope_mode: "future_restricted_scope" }] },
+      ListOutboundWebhookSubscriptionsResponseSchema,
+      EMPTY_LIST_OUTBOUND_WEBHOOK_SUBSCRIPTIONS,
+      { endpoint: "GET /api/workspaces/:id/outbound-webhooks" },
+    );
+    expect(parsed).toEqual(EMPTY_LIST_OUTBOUND_WEBHOOK_SUBSCRIPTIONS);
+  });
+
+  it("fails closed to an empty list when a subscription response is malformed", () => {
+    const parsed = parseWithFallback(
+      { subscriptions: [{ id: 42, signing_secret: "must-not-pass" }] },
+      ListOutboundWebhookSubscriptionsResponseSchema,
+      EMPTY_LIST_OUTBOUND_WEBHOOK_SUBSCRIPTIONS,
+      { endpoint: "GET /api/workspaces/:id/outbound-webhooks" },
+    );
+    expect(parsed).toEqual(EMPTY_LIST_OUTBOUND_WEBHOOK_SUBSCRIPTIONS);
+  });
+
+  it("fails closed when a create response omits the one-time secret", () => {
+    const parsed = parseWithFallback(
+      { subscription: { id: "sub-1" } },
+      CreateOutboundWebhookSubscriptionResponseSchema,
+      EMPTY_CREATE_OUTBOUND_WEBHOOK_SUBSCRIPTION,
+      { endpoint: "POST /api/workspaces/:id/outbound-webhooks" },
+    );
+    expect(parsed).toEqual(EMPTY_CREATE_OUTBOUND_WEBHOOK_SUBSCRIPTION);
+  });
+
+  it.each([
+    "PUT /api/workspaces/:id/outbound-webhooks/:subscriptionId",
+    "POST /api/workspaces/:id/outbound-webhooks/:subscriptionId/pause",
+    "POST /api/workspaces/:id/outbound-webhooks/:subscriptionId/resume",
+  ])("fails closed when %s returns a malformed subscription", (endpoint) => {
+    const parsed = parseWithFallback(
+      { ...subscription, id: 42 },
+      OutboundWebhookSubscriptionSchema,
+      EMPTY_CREATE_OUTBOUND_WEBHOOK_SUBSCRIPTION.subscription,
+      { endpoint },
+    );
+    expect(parsed).toEqual(EMPTY_CREATE_OUTBOUND_WEBHOOK_SUBSCRIPTION.subscription);
+    expect(parsed.status).toBe("paused");
+  });
+
+  it("fails closed when rotate omits the newly disclosed one-time secret", () => {
+    const parsed = parseWithFallback(
+      { subscription },
+      RotateOutboundWebhookSecretResponseSchema,
+      EMPTY_CREATE_OUTBOUND_WEBHOOK_SUBSCRIPTION,
+      { endpoint: "POST /api/workspaces/:id/outbound-webhooks/:subscriptionId/rotate-secret" },
+    );
+    expect(parsed).toEqual(EMPTY_CREATE_OUTBOUND_WEBHOOK_SUBSCRIPTION);
+    expect(parsed.signingSecret).toBe("");
+  });
+
+  it("does not treat a malformed test response as a queued delivery", () => {
+    const fallback = { deliveryId: "", eventId: "", state: "pending" as const };
+    const parsed = parseWithFallback(
+      { delivery_id: "delivery-1", state: "pending" },
+      TestOutboundWebhookSubscriptionResponseSchema,
+      fallback,
+      { endpoint: "POST /api/workspaces/:id/outbound-webhooks/:subscriptionId/test" },
+    );
+    expect(parsed).toEqual(fallback);
+    expect(parsed.deliveryId).toBe("");
+  });
+
+  it("parses redacted delivery history without exposing transport internals", () => {
+    const parsed = ListOutboundWebhookDeliveriesResponseSchema.parse({
+      deliveries: [{
+        id: "delivery-1", event_id: "event-1", subscription_id: "sub-1",
+        event_type: "issue.created", state: "failed", attempt_count: 2,
+        response_status: 503, response_excerpt: "temporarily unavailable",
+        failure_reason: "receiver returned HTTP 503", redelivery_of: null,
+        created_at: "2026-08-25T00:00:00Z", last_attempt_at: null, completed_at: null,
+        request_body: "must be ignored", destination_ciphertext: "must be ignored",
+      }],
+      total: 30, next_offset: 25,
+    });
+    expect(parsed.nextOffset).toBe(25);
+    expect(parsed.deliveries[0]).toMatchObject({ id: "delivery-1", responseStatus: 503 });
+    expect(parsed.deliveries[0]).not.toHaveProperty("requestBody");
+  });
+
+  it("fails closed when delivery detail is malformed", () => {
+    const parsed = parseWithFallback(
+      { id: "delivery-1", request_body: "private" },
+      OutboundWebhookDeliverySchema,
+      EMPTY_OUTBOUND_WEBHOOK_DELIVERY,
+      { endpoint: "GET delivery detail" },
+    );
+    expect(parsed).toEqual(EMPTY_OUTBOUND_WEBHOOK_DELIVERY);
+  });
+});
 
 const baseIssue = {
   id: "11111111-1111-1111-1111-111111111111",
@@ -1066,13 +1232,23 @@ describe("InboxItemListSchema", () => {
 
   it("parses a well-formed archived list and tolerates extra fields", () => {
     const parsed = parseWithFallback(
-      [row({ issue_status: "in_progress", details: { comment_id: "c-1" }, future_field: 1 })],
+      [row({
+        issue_status: "in_progress",
+        issue_priority: "high",
+        details: { comment_id: "c-1" },
+        future_field: 1,
+      })],
       InboxItemListSchema,
       EMPTY_INBOX_ITEMS,
       ENDPOINT,
     );
     expect(parsed).toHaveLength(1);
-    expect(parsed[0]).toMatchObject({ id: "inbox-1", archived: true });
+    expect(parsed[0]).toMatchObject({
+      id: "inbox-1",
+      archived: true,
+      issue_status: "in_progress",
+      issue_priority: "high",
+    });
   });
 
   it("keeps a notification type this client doesn't know yet", () => {
@@ -1094,6 +1270,17 @@ describe("InboxItemListSchema", () => {
     expect(
       parseWithFallback([withoutOptionals], InboxItemListSchema, EMPTY_INBOX_ITEMS, ENDPOINT),
     ).toHaveLength(1);
+  });
+
+  it("returns the empty fallback when an issue projection is wrong-typed", () => {
+    expect(
+      parseWithFallback(
+        [row({ issue_priority: 3 })],
+        InboxItemListSchema,
+        EMPTY_INBOX_ITEMS,
+        ENDPOINT,
+      ),
+    ).toBe(EMPTY_INBOX_ITEMS);
   });
 
   it("returns the empty fallback for a non-array body", () => {

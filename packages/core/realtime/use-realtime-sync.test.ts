@@ -9,6 +9,8 @@ import type { ApiClient } from "../api/client";
 import { chatKeys } from "../chat/queries";
 import { inboxKeys } from "../inbox/queries";
 import { issueKeys } from "../issues/queries";
+import { projectKeys } from "../projects/queries";
+import { outboundWebhookKeys } from "../outbound-webhooks/queries";
 import { notificationPreferenceKeys } from "../notification-preferences/queries";
 import { workspaceKeys } from "../workspace/queries";
 import type {
@@ -30,9 +32,23 @@ import {
   applyWorkspaceUpdatedToCache,
   handleInboxNew,
   invalidateChatMessageQueries,
+  invalidateProjectDependentQueries,
   refetchPendingChatAggregate,
   resolveInboxSourceSlug,
 } from "./use-realtime-sync";
+
+describe("invalidateProjectDependentQueries", () => {
+  it("invalidates project and webhook scope caches together", () => {
+    const qc = createQueryClient();
+    qc.setQueryData(projectKeys.list("ws-1"), { projects: [], total: 0 });
+    qc.setQueryData(outboundWebhookKeys.all("ws-1"), { subscriptions: [] });
+
+    invalidateProjectDependentQueries(qc, "ws-1");
+
+    expect(qc.getQueryState(projectKeys.list("ws-1"))?.isInvalidated).toBe(true);
+    expect(qc.getQueryState(outboundWebhookKeys.all("ws-1"))?.isInvalidated).toBe(true);
+  });
+});
 
 const sessionId = "session-1";
 const taskId = "task-1";

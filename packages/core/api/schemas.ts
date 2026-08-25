@@ -83,6 +83,13 @@ import type {
   User,
   WebhookDelivery,
   WorkspaceMcpServer,
+  OutboundWebhookSubscription,
+  ListOutboundWebhookSubscriptionsResponse,
+  CreateOutboundWebhookSubscriptionResponse,
+  RotateOutboundWebhookSecretResponse,
+  TestOutboundWebhookSubscriptionResponse,
+  OutboundWebhookDelivery,
+  ListOutboundWebhookDeliveriesResponse,
 } from "../types";
 import type { CloudRuntimeNode } from "../runtimes/cloud-runtime";
 import type { CreateFeedbackResponse } from "../feedback/types";
@@ -353,6 +360,158 @@ export const EMPTY_LIST_GITHUB_INSTALLATIONS_RESPONSE: ListGitHubInstallationsRe
   configured: false,
   repository_browse_configured: false,
   can_manage: false,
+};
+
+export const OutboundWebhookSubscriptionSchema = z
+  .object({
+    id: z.string(),
+    workspace_id: z.string(),
+    name: z.string(),
+    destination_hint: z.string(),
+    events: z.array(z.string()).default([]),
+    event_catalog_version: z.number().default(1),
+    scope_mode: z.enum(["workspace", "project"]).default("workspace"),
+    project_ids: z.array(z.string()).default([]),
+    status: z.enum(["active", "paused"]).default("active").catch("paused"),
+    pause_reason: z
+      .enum(["manual", "scope_empty", "failure_threshold"])
+      .nullable()
+      .catch(null),
+    signing_secret_hint: z.string().default(""),
+    secret_version: z.number().int().positive().default(1),
+    consecutive_terminal_failures: z.number().int().nonnegative().default(0),
+    created_at: z.string(),
+    updated_at: z.string(),
+  })
+  .loose()
+  .superRefine((value, ctx) => {
+    const safeEmptyProjectScope = value.scope_mode === "project" && value.project_ids.length === 0 && value.status === "paused" && value.pause_reason === "scope_empty";
+    if ((value.scope_mode === "workspace" && value.project_ids.length > 0) || (value.scope_mode === "project" && value.project_ids.length === 0 && !safeEmptyProjectScope)) {
+      ctx.addIssue({ code: "custom", message: "invalid outbound webhook scope shape" });
+    }
+  })
+  .transform(
+    (value): OutboundWebhookSubscription => ({
+      id: value.id,
+      workspaceId: value.workspace_id,
+      name: value.name,
+      destinationHint: value.destination_hint,
+      events: value.events,
+      eventCatalogVersion: value.event_catalog_version,
+      scopeMode: value.scope_mode,
+      projectIds: value.project_ids,
+      status: value.status,
+      pauseReason: value.pause_reason,
+      consecutiveTerminalFailures: value.consecutive_terminal_failures,
+      signingSecretHint: value.signing_secret_hint,
+      secretVersion: value.secret_version,
+      createdAt: value.created_at,
+      updatedAt: value.updated_at,
+    }),
+  );
+
+export const ListOutboundWebhookSubscriptionsResponseSchema = z.object({
+  subscriptions: z.array(OutboundWebhookSubscriptionSchema).default([]),
+  capability_available: z.boolean().default(true),
+}).loose().transform((value): ListOutboundWebhookSubscriptionsResponse => ({
+  subscriptions: value.subscriptions,
+  capabilityAvailable: value.capability_available,
+}));
+
+export const CreateOutboundWebhookSubscriptionResponseSchema = z
+  .object({
+    subscription: OutboundWebhookSubscriptionSchema,
+    signing_secret: z.string(),
+  })
+  .loose()
+  .transform(
+    (value): CreateOutboundWebhookSubscriptionResponse => ({
+      subscription: value.subscription,
+      signingSecret: value.signing_secret,
+    }),
+  );
+
+export const RotateOutboundWebhookSecretResponseSchema =
+  CreateOutboundWebhookSubscriptionResponseSchema.transform(
+    (value): RotateOutboundWebhookSecretResponse => value,
+  );
+
+export const TestOutboundWebhookSubscriptionResponseSchema = z
+  .object({
+    delivery_id: z.string(),
+    event_id: z.string(),
+    state: z.literal("pending"),
+  })
+  .loose()
+  .transform(
+    (value): TestOutboundWebhookSubscriptionResponse => ({
+      deliveryId: value.delivery_id,
+      eventId: value.event_id,
+      state: value.state,
+    }),
+  );
+
+export const EMPTY_OUTBOUND_WEBHOOK_SUBSCRIPTION: OutboundWebhookSubscription = {
+  id: "", workspaceId: "", name: "", destinationHint: "", events: [],
+  eventCatalogVersion: 1, scopeMode: "workspace", projectIds: [], status: "paused", pauseReason: null,
+  consecutiveTerminalFailures: 0, createdAt: "", updatedAt: "",
+  signingSecretHint: "", secretVersion: 1,
+};
+
+export const EMPTY_LIST_OUTBOUND_WEBHOOK_SUBSCRIPTIONS: ListOutboundWebhookSubscriptionsResponse = { subscriptions: [], capabilityAvailable: false };
+export const EMPTY_CREATE_OUTBOUND_WEBHOOK_SUBSCRIPTION: CreateOutboundWebhookSubscriptionResponse = {
+  subscription: EMPTY_OUTBOUND_WEBHOOK_SUBSCRIPTION,
+  signingSecret: "",
+};
+
+export const OutboundWebhookDeliverySchema = z.object({
+  id: z.string(),
+  event_id: z.string(),
+  subscription_id: z.string(),
+  event_type: z.string(),
+  state: z.enum(["pending", "succeeded", "failed"]).catch("failed"),
+  attempt_count: z.number().int().nonnegative().default(0),
+  response_status: z.number().int().nullable().catch(null),
+  response_excerpt: z.string().max(512).nullable().catch(null),
+  failure_reason: z.string().nullable().catch(null),
+  redelivery_of: z.string().nullable().catch(null),
+  created_at: z.string(),
+  last_attempt_at: z.string().nullable().catch(null),
+  completed_at: z.string().nullable().catch(null),
+}).loose().transform((value): OutboundWebhookDelivery => ({
+  id: value.id,
+  eventId: value.event_id,
+  subscriptionId: value.subscription_id,
+  eventType: value.event_type,
+  state: value.state,
+  attemptCount: value.attempt_count,
+  responseStatus: value.response_status,
+  responseExcerpt: value.response_excerpt,
+  failureReason: value.failure_reason,
+  redeliveryOf: value.redelivery_of,
+  createdAt: value.created_at,
+  lastAttemptAt: value.last_attempt_at,
+  completedAt: value.completed_at,
+}));
+
+export const ListOutboundWebhookDeliveriesResponseSchema = z.object({
+	deliveries: z.array(OutboundWebhookDeliverySchema),
+	total: z.number().int().nonnegative(),
+	next_offset: z.number().int().nonnegative().nullable(),
+}).loose().transform((value): ListOutboundWebhookDeliveriesResponse => ({
+  deliveries: value.deliveries,
+  total: value.total,
+  nextOffset: value.next_offset,
+}));
+
+export const EMPTY_OUTBOUND_WEBHOOK_DELIVERY: OutboundWebhookDelivery = {
+  id: "", eventId: "", subscriptionId: "", eventType: "", state: "failed",
+  attemptCount: 0, responseStatus: null, responseExcerpt: null, failureReason: null,
+  redeliveryOf: null, createdAt: "", lastAttemptAt: null, completedAt: null,
+};
+
+export const EMPTY_LIST_OUTBOUND_WEBHOOK_DELIVERIES: ListOutboundWebhookDeliveriesResponse = {
+  deliveries: [], total: 0, nextOffset: null,
 };
 
 export const GitHubConnectResponseSchema = z.object({
@@ -2197,14 +2356,15 @@ export const InboxUnreadSummarySchema = z.array(
 export const EMPTY_INBOX_UNREAD_SUMMARY: InboxWorkspaceUnread[] = [];
 
 // ---------------------------------------------------------------------------
-// Archived inbox items (`/api/inbox/archived` GET).
+// Inbox items (`/api/inbox` and `/api/inbox/archived` GET).
 // Lenient per the usual rules: `severity` / `type` / `recipient_type` stay
 // `z.string()` so a notification kind this client doesn't know yet still
 // parses and renders (the UI's type-label lookup already tolerates unknown
 // kinds). Nullable optional fields are declared optional as well, since older
 // rows can omit them entirely. On malformed JSON parseWithFallback returns the
-// empty list — the archived view then reads as empty rather than white-
-// screening the inbox.
+// empty list — the affected view then reads as empty rather than white-
+// screening the inbox. Both endpoints share this boundary because they return
+// the same row shape and both feed the status/priority filter UI.
 // ---------------------------------------------------------------------------
 
 export const InboxItemListSchema = z.array(
@@ -2219,6 +2379,8 @@ export const InboxItemListSchema = z.array(
       issue_id: z.string().nullish(),
       title: z.string(),
       body: z.string().nullish(),
+      issue_status: z.string().nullish(),
+      issue_priority: z.string().nullish(),
       read: z.boolean(),
       archived: z.boolean(),
       created_at: z.string(),

@@ -13,6 +13,7 @@ import {
   pruneIssueSurfaceViewStates,
 } from "../issues/stores/surface-view-store";
 import { useDeleteProject } from "./mutations";
+import { outboundWebhookKeys } from "../outbound-webhooks/queries";
 
 vi.mock("../hooks", () => ({
   useWorkspaceId: () => "ws-1",
@@ -57,5 +58,18 @@ describe("useDeleteProject", () => {
 
     expect(deleteProject).toHaveBeenCalledWith("p1");
     expect(store.getState().viewMode).toBe("board");
+  });
+
+  it("invalidates webhook scopes changed by project deletion", async () => {
+    qc.setQueryData(outboundWebhookKeys.all("ws-1"), { subscriptions: [] });
+    const { result } = renderHook(() => useDeleteProject(), {
+      wrapper: createWrapper(qc),
+    });
+
+    await act(async () => {
+      await result.current.mutateAsync("p1");
+    });
+
+    expect(qc.getQueryState(outboundWebhookKeys.all("ws-1"))?.isInvalidated).toBe(true);
   });
 });

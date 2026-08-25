@@ -3,9 +3,11 @@ package main
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/multica-ai/multica/server/internal/events"
 	"github.com/multica-ai/multica/server/internal/handler"
+	"github.com/multica-ai/multica/server/internal/push"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/protocol"
@@ -74,6 +76,86 @@ func newNotificationBus(t *testing.T, queries *db.Queries) *events.Bus {
 	registerSubscriberListeners(bus, testPool)
 	registerNotificationListeners(bus, queries)
 	return bus
+}
+
+type recordingPushTransport struct {
+	sends chan push.Payload
+}
+
+func (t *recordingPushTransport) Send(_ context.Context, _ string, payload push.Payload) (push.SendResult, error) {
+	t.sends <- payload
+	return push.SendResult{StatusCode: 200}, nil
+}
+
+// TestNotification_APNsFromPersistedInbox covers the actual shared seam: a
+// normal domain event creates an Inbox row, publishes inbox:new, and the APNs
+// dispatcher turns that persisted item into an outbound payload.
+func TestNotification_APNsFromPersistedInbox(t *testing.T) {
+	queries := db.New(testPool)
+	bus := newNotificationBus(t, queries)
+
+	assigneeEmail := "notif-apns-assignee@multica.ai"
+	assigneeID := createTestUser(t, assigneeEmail)
+	t.Cleanup(func() { cleanupTestUser(t, assigneeEmail) })
+
+	issueID := createTestIssue(t, testWorkspaceID, testUserID)
+	t.Cleanup(func() {
+		cleanupInboxForIssue(t, issueID)
+		cleanupTestIssue(t, issueID)
+	})
+
+	installationID := util.MustParseUUID("018f6f4f-2dd0-7f47-9f71-2af8d5a8a874")
+	if _, err := queries.UpsertRecipientDevice(context.Background(), db.UpsertRecipientDeviceParams{
+		InstallationID:  installationID,
+		UserID:          util.MustParseUUID(assigneeID),
+		Platform:        "ios",
+		BundleID:        "vip.example.multica",
+		PushEnvironment: "sandbox",
+		DeviceToken:     "recorded-apns-token",
+	}); err != nil {
+		t.Fatalf("UpsertRecipientDevice: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = testPool.Exec(context.Background(), `DELETE FROM recipient_device WHERE installation_id = $1`, installationID)
+	})
+
+	transport := &recordingPushTransport{sends: make(chan push.Payload, 1)}
+	push.NewDispatcher(queries, transport, push.Config{
+		Topic: "vip.example.multica", Environment: "sandbox",
+	}, nil).Register(bus)
+
+	assigneeType := "member"
+	bus.Publish(events.Event{
+		Type:        protocol.EventIssueCreated,
+		WorkspaceID: testWorkspaceID,
+		ActorType:   "member",
+		ActorID:     testUserID,
+		Payload: map[string]any{
+			"issue": handler.IssueResponse{
+				ID:           issueID,
+				WorkspaceID:  testWorkspaceID,
+				Title:        "APNs persisted Inbox test",
+				Status:       "todo",
+				Priority:     "medium",
+				CreatorType:  "member",
+				CreatorID:    testUserID,
+				AssigneeType: &assigneeType,
+				AssigneeID:   &assigneeID,
+			},
+		},
+	})
+
+	select {
+	case payload := <-transport.sends:
+		if payload.Multica.IssueID != issueID || payload.Multica.WorkspaceID != testWorkspaceID {
+			t.Fatalf("unexpected APNs destination: %+v", payload.Multica)
+		}
+		if payload.APS.Alert.Body != "Task assigned: APNs persisted Inbox test" {
+			t.Fatalf("unexpected APNs body: %q", payload.APS.Alert.Body)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for APNs payload")
+	}
 }
 
 // TestNotification_IssueCreated_AssigneeNotified verifies that when an issue is

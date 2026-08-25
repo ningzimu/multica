@@ -126,6 +126,56 @@ export const EMPTY_NOTIFICATION_PREFERENCES = {
   preferences: {},
 } as const;
 
+export const RecipientDeviceResponseSchema = z.object({
+  id: z.string(),
+  installation_id: z.string(),
+  user_id: z.string(),
+  platform: z.literal("ios"),
+  bundle_id: z.string(),
+  push_environment: z.enum(["sandbox", "production"]),
+  enabled: z.boolean(),
+  bound_at: z.string(),
+  revoked_at: z.string().nullable().default(null),
+  invalidated_at: z.string().nullable().default(null),
+  last_seen_at: z.string(),
+  created_at: z.string(),
+  updated_at: z.string(),
+}).loose().transform((device) => ({
+  id: device.id,
+  installationID: device.installation_id,
+  userID: device.user_id,
+  platform: device.platform,
+  bundleID: device.bundle_id,
+  pushEnvironment: device.push_environment,
+  enabled: device.enabled,
+  boundAt: device.bound_at,
+  revokedAt: device.revoked_at,
+  invalidatedAt: device.invalidated_at,
+  lastSeenAt: device.last_seen_at,
+  createdAt: device.created_at,
+  updatedAt: device.updated_at,
+}));
+
+export type RecipientDeviceResponse = z.infer<
+  typeof RecipientDeviceResponseSchema
+>;
+
+export const EMPTY_RECIPIENT_DEVICE: RecipientDeviceResponse = {
+  id: "",
+  installationID: "",
+  userID: "",
+  platform: "ios",
+  bundleID: "",
+  pushEnvironment: "sandbox",
+  enabled: false,
+  boundAt: "",
+  revokedAt: null,
+  invalidatedAt: null,
+  lastSeenAt: "",
+  createdAt: "",
+  updatedAt: "",
+};
+
 const LabelSchema = z.object({
   id: z.string(),
   workspace_id: z.string(),

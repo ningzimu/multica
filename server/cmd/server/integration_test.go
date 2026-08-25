@@ -21,10 +21,13 @@ import (
 	"github.com/multica-ai/multica/server/internal/auth"
 	"github.com/multica-ai/multica/server/internal/events"
 	"github.com/multica-ai/multica/server/internal/realtime"
+	"github.com/multica-ai/multica/server/internal/testutil"
 )
 
 var (
 	testServer      *httptest.Server
+	testRouter      http.Handler
+	testFixture     *testutil.Fixture
 	testPool        *pgxpool.Pool
 	testToken       string
 	testUserID      string
@@ -72,6 +75,8 @@ func TestMain(m *testing.M) {
 	bus := events.New()
 	registerListeners(bus, hub)
 	router := NewRouter(pool, hub, bus, analytics.NoopClient{}, nil)
+	testRouter = router
+	testFixture = testutil.New(pool, testWorkspaceID, testUserID)
 	testServer = httptest.NewServer(router)
 
 	// Generate a JWT token directly for the test user
@@ -195,6 +200,37 @@ func readJSON(t *testing.T, resp *http.Response, v any) {
 	}
 }
 
+type recipientDeviceJSON struct {
+	ID              string     `json:"id"`
+	InstallationID  string     `json:"installation_id"`
+	UserID          string     `json:"user_id"`
+	Platform        string     `json:"platform"`
+	BundleID        string     `json:"bundle_id"`
+	PushEnvironment string     `json:"push_environment"`
+	Enabled         bool       `json:"enabled"`
+	RevokedAt       *time.Time `json:"revoked_at"`
+	DeviceToken     *string    `json:"device_token"`
+}
+
+func recipientDeviceRequest(
+	t *testing.T,
+	token string,
+	method string,
+	installationID string,
+	body any,
+) *testutil.Response {
+	t.Helper()
+	req := testutil.JSONRequest(
+		method,
+		"/api/recipient-devices/"+installationID,
+		body,
+	)
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	return testutil.Call(t, testRouter.ServeHTTP, req)
+}
+
 func generateTestJWT(userID, email, name string) (string, error) {
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
 		"sub":   userID,
@@ -204,6 +240,154 @@ func generateTestJWT(userID, email, name string) (string, error) {
 		"iat":   time.Now().Unix(),
 	})
 	return token.SignedString(auth.JWTSecret())
+}
+
+func TestRecipientDeviceRegistrationLifecycleThroughRouter(t *testing.T) {
+	installationID := "018f6f4f-2dd0-7f47-9f71-2af8d5a8a821"
+	testFixture.Cleanup(t,
+		`DELETE FROM recipient_device WHERE installation_id = $1`, installationID)
+	registration := map[string]any{
+		"platform":         "ios",
+		"bundle_id":        "vip.example.multica",
+		"push_environment": "sandbox",
+		"device_token":     "token-first",
+	}
+
+	recipientDeviceRequest(
+		t,
+		"",
+		http.MethodPut,
+		installationID,
+		registration,
+	).Want(http.StatusUnauthorized)
+
+	registeredResponse := recipientDeviceRequest(
+		t,
+		testToken,
+		http.MethodPut,
+		installationID,
+		registration,
+	).Want(http.StatusOK)
+	var registered recipientDeviceJSON
+	registeredResponse.JSON(&registered)
+	if registered.ID == "" || registered.InstallationID != installationID ||
+		registered.UserID != testUserID || !registered.Enabled {
+		t.Fatalf("unexpected registered device: %+v", registered)
+	}
+	if registered.DeviceToken != nil {
+		t.Fatal("recipient device response exposed the native token")
+	}
+
+	registration["device_token"] = "token-rotated"
+	refreshedResponse := recipientDeviceRequest(
+		t,
+		testToken,
+		http.MethodPut,
+		installationID,
+		registration,
+	).Want(http.StatusOK)
+	var refreshed recipientDeviceJSON
+	refreshedResponse.JSON(&refreshed)
+	if refreshed.ID != registered.ID || !refreshed.Enabled {
+		t.Fatalf("refresh created a conflicting device: first=%+v refreshed=%+v", registered, refreshed)
+	}
+	var storedToken string
+	var installationRows int
+	testFixture.QueryRow(t, `
+		SELECT max(device_token), count(*)
+		FROM recipient_device
+		WHERE installation_id = $1
+	`, installationID).Scan(&storedToken, &installationRows)
+	if storedToken != "token-rotated" || installationRows != 1 {
+		t.Fatalf("refresh persistence token=%q rows=%d", storedToken, installationRows)
+	}
+
+	secondUserEmail := "recipient-device-second-" + installationID + "@example.com"
+	secondUserID := testFixture.User(
+		t,
+		"Recipient Device Second User",
+		secondUserEmail,
+	)
+	secondToken, err := generateTestJWT(
+		secondUserID,
+		secondUserEmail,
+		"Recipient Device Second User",
+	)
+	if err != nil {
+		t.Fatalf("generate second user token: %v", err)
+	}
+
+	registration["device_token"] = "token-second-account"
+	reboundResponse := recipientDeviceRequest(
+		t,
+		secondToken,
+		http.MethodPut,
+		installationID,
+		registration,
+	).Want(http.StatusOK)
+	var rebound recipientDeviceJSON
+	reboundResponse.JSON(&rebound)
+	if rebound.ID != registered.ID || rebound.UserID != secondUserID || !rebound.Enabled {
+		t.Fatalf("unexpected rebound device: first=%+v rebound=%+v", registered, rebound)
+	}
+
+	recipientDeviceRequest(
+		t,
+		testToken,
+		http.MethodDelete,
+		installationID,
+		nil,
+	).Want(http.StatusNotFound)
+
+	revokedResponse := recipientDeviceRequest(
+		t,
+		secondToken,
+		http.MethodDelete,
+		installationID,
+		nil,
+	).Want(http.StatusOK)
+	var revoked recipientDeviceJSON
+	revokedResponse.JSON(&revoked)
+	if revoked.ID != registered.ID || revoked.Enabled || revoked.RevokedAt == nil {
+		t.Fatalf("unexpected revoked device: %+v", revoked)
+	}
+}
+
+func TestRecipientDeviceReinstallDisplacesActiveTokenOwner(t *testing.T) {
+	firstInstallationID := "018f6f4f-2dd0-7f47-9f71-2af8d5a8a831"
+	secondInstallationID := "018f6f4f-2dd0-7f47-9f71-2af8d5a8a832"
+	for _, installationID := range []string{firstInstallationID, secondInstallationID} {
+		testFixture.Cleanup(t,
+			`DELETE FROM recipient_device WHERE installation_id = $1`, installationID)
+	}
+	registration := map[string]any{
+		"platform":         "ios",
+		"bundle_id":        "vip.example.multica",
+		"push_environment": "sandbox",
+		"device_token":     "token-survived-reinstall",
+	}
+
+	for _, installationID := range []string{firstInstallationID, secondInstallationID} {
+		recipientDeviceRequest(t, testToken, http.MethodPut, installationID, registration).
+			Want(http.StatusOK)
+	}
+
+	var activeInstallationID string
+	var activeCount int
+	testFixture.QueryRow(t, `
+		SELECT max(installation_id::text), count(*)
+		FROM recipient_device
+		WHERE device_token = $1
+		  AND bundle_id = $2
+		  AND push_environment = $3
+		  AND enabled
+	`, registration["device_token"], registration["bundle_id"], registration["push_environment"]).Scan(
+		&activeInstallationID,
+		&activeCount,
+	)
+	if activeCount != 1 || activeInstallationID != secondInstallationID {
+		t.Fatalf("active reinstalled device=%s count=%d", activeInstallationID, activeCount)
+	}
 }
 
 // ---- Health ----
@@ -779,6 +963,38 @@ func TestDeleteWorkspaceRequiresOwner(t *testing.T) {
 	}
 	if !exists {
 		t.Fatal("workspace was deleted despite non-owner request")
+	}
+}
+
+func TestOutboundWebhookDeliveryHistoryRoutesRequireAdministrator(t *testing.T) {
+	email := fmt.Sprintf("outbound-history-member-%d@multica.test", time.Now().UnixNano())
+	memberID := testFixture.User(t, "History Member", email)
+	testFixture.Member(t, testWorkspaceID, memberID, "member")
+	token, err := generateTestJWT(memberID, email, "History Member")
+	if err != nil {
+		t.Fatalf("generate member token: %v", err)
+	}
+
+	const subscriptionID = "d1474000-0000-4000-8000-000000000017"
+	const deliveryID = "d1474000-0000-4000-8000-000000000018"
+	for _, path := range []string{
+		"/api/workspaces/" + testWorkspaceID + "/outbound-webhooks/" + subscriptionID + "/deliveries",
+		"/api/workspaces/" + testWorkspaceID + "/outbound-webhooks/" + subscriptionID + "/deliveries/" + deliveryID,
+	} {
+		req, err := http.NewRequest(http.MethodGet, testServer.URL+path, nil)
+		if err != nil {
+			t.Fatalf("build history request: %v", err)
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("X-Workspace-ID", testWorkspaceID)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("history request failed: %v", err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("member history route %s status = %d, want 403", path, resp.StatusCode)
+		}
 	}
 }
 

@@ -101,6 +101,14 @@ services:
       MULTICA_SHUTDOWN_HOLD_DURATION: ${MULTICA_SHUTDOWN_HOLD_DURATION:-}
       MULTICA_RUNTIME_RECONNECT_GRACE: ${MULTICA_RUNTIME_RECONNECT_GRACE:-}
       MULTICA_TASK_QUEUED_TTL: ${MULTICA_TASK_QUEUED_TTL:-}
+      # Optional direct Apple Push Notification service integration for the
+      # self-hosted iOS app. The private-key path must exist inside the
+      # container; mount the .p8 file with a local Compose override.
+      MULTICA_APNS_TEAM_ID: ${MULTICA_APNS_TEAM_ID:-}
+      MULTICA_APNS_KEY_ID: ${MULTICA_APNS_KEY_ID:-}
+      MULTICA_APNS_TOPIC: ${MULTICA_APNS_TOPIC:-}
+      MULTICA_APNS_ENVIRONMENT: ${MULTICA_APNS_ENVIRONMENT:-production}
+      MULTICA_APNS_PRIVATE_KEY_PATH: ${MULTICA_APNS_PRIVATE_KEY_PATH:-}
       ALLOW_SIGNUP: ${ALLOW_SIGNUP:-true}
       ALLOWED_EMAILS: ${ALLOWED_EMAILS:-}
       ALLOWED_EMAIL_DOMAINS: ${ALLOWED_EMAIL_DOMAINS:-}
@@ -141,6 +149,10 @@ services:
       MULTICA_PLUGIN_SURFACE_ORIGIN: ${MULTICA_PLUGIN_SURFACE_ORIGIN:-}
       MULTICA_PLUGIN_API_URL: ${MULTICA_PLUGIN_API_URL:-}
       MULTICA_PLUGIN_DIR: ${MULTICA_PLUGIN_DIR:-}
+      # Optional API URL shown in self-host daemon setup commands. Set this
+      # when the daemon reaches the API through a different URL than the one
+      # used for public webhook URLs; otherwise MULTICA_PUBLIC_URL is used.
+      MULTICA_DAEMON_SERVER_URL: ${MULTICA_DAEMON_SERVER_URL:-}
       # Comma-separated CIDRs whose source IP is allowed to set
       # X-Forwarded-For / X-Real-IP for the webhook per-IP rate limiter.
       # Empty default = headers ignored, RemoteAddr used. Set e.g.
@@ -180,6 +192,15 @@ services:
       MULTICA_VCS_INTEGRATION_ENABLED: ${MULTICA_VCS_INTEGRATION_ENABLED:-true}
       # VCS integration at-rest encryption key for token-based providers
       MULTICA_VCS_SECRET_KEY: ${MULTICA_VCS_SECRET_KEY:-}
+      # Outbound Webhook destinations and signing secrets use their own key.
+      # Without it the feature fails closed and the rest of the server runs.
+      MULTICA_OUTBOUND_WEBHOOK_SECRET_KEY: ${MULTICA_OUTBOUND_WEBHOOK_SECRET_KEY:-}
+      MULTICA_OUTBOUND_WEBHOOK_ALLOWED_ORIGINS: ${MULTICA_OUTBOUND_WEBHOOK_ALLOWED_ORIGINS:-}
+      MULTICA_OUTBOUND_WEBHOOK_MAX_ATTEMPTS: ${MULTICA_OUTBOUND_WEBHOOK_MAX_ATTEMPTS:-8}
+      MULTICA_OUTBOUND_WEBHOOK_GLOBAL_CONCURRENCY: ${MULTICA_OUTBOUND_WEBHOOK_GLOBAL_CONCURRENCY:-4}
+      MULTICA_OUTBOUND_WEBHOOK_SUBSCRIPTION_CONCURRENCY: ${MULTICA_OUTBOUND_WEBHOOK_SUBSCRIPTION_CONCURRENCY:-1}
+      MULTICA_OUTBOUND_WEBHOOK_MAX_PENDING_PER_SUBSCRIPTION: ${MULTICA_OUTBOUND_WEBHOOK_MAX_PENDING_PER_SUBSCRIPTION:-10000}
+      MULTICA_OUTBOUND_WEBHOOK_FAILURE_THRESHOLD: ${MULTICA_OUTBOUND_WEBHOOK_FAILURE_THRESHOLD:-5}
       # WeCom smart-bot integration. MULTICA_WECOM_SECRET_KEY is the
       # opt-in: unset = integration disabled. It encrypts each installation's
       # smart-bot secret at rest. The server needs it to unseal a bot's

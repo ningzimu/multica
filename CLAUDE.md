@@ -257,3 +257,17 @@ Do not claim verification passed unless you ran it. If you skip checks because t
 
 - All queries filter by `workspace_id`; membership gates access; `X-Workspace-ID` selects the workspace.
 - Issue assignees are polymorphic: `assignee_type` plus `assignee_id` can reference a member or an agent.
+
+## Agent skills
+
+### Issue tracker
+
+Issues and specs are tracked in GitHub Issues for `ningzimu/multica`. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Use the five canonical triage labels. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+This repository uses a multi-context layout. Read `CONTEXT-MAP.md` and the relevant context documents before changing domain behavior. See `docs/agents/domain.md`.

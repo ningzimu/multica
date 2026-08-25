@@ -635,6 +635,16 @@ deleted_packages AS (
 )
 DELETE FROM plugin_installation WHERE id IN (SELECT id FROM installations);
 
+-- name: DeleteWorkspaceOutboundWebhooks :exec
+-- Deliveries carry workspace_id because relationships have no foreign keys;
+-- deleting by that ownership key also sweeps any pre-existing orphan.
+WITH deleted_deliveries AS (
+    DELETE FROM outbound_webhook_delivery
+    WHERE outbound_webhook_delivery.workspace_id = $1
+)
+DELETE FROM outbound_webhook_subscription
+WHERE outbound_webhook_subscription.workspace_id = $1;
+
 -- name: DeleteWorkspaceAgents :exec
 DELETE FROM agent WHERE agent.workspace_id = $1;
 

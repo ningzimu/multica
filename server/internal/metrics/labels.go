@@ -35,6 +35,7 @@ const (
 	labelGate         = "gate"
 	labelOutcome      = "outcome"
 	labelSurface      = "surface"
+	labelOperation    = "operation"
 )
 
 var businessMetricLabels = map[string][]string{
@@ -100,6 +101,8 @@ var businessMetricLabels = map[string][]string{
 	"multica_entitlement_version_regression_total":     {labelSource},
 	"multica_autopilot_quota_decision_total":           {labelAction, labelSource, labelResult},
 	"multica_issue_window_decision_total":              {labelAction, labelSurface, labelResult},
+	"multica_outbound_webhook_operation_total":         {labelOperation},
+	"multica_outbound_webhook_oldest_pending_seconds":  {},
 }
 
 var forbiddenMetricLabels = map[string]struct{}{
@@ -151,6 +154,7 @@ var (
 		"reasonix":      "reasonix",
 		"dim":           "dim",
 		"mcode":         "mcode",
+		"zeroclaw":      "zeroclaw",
 		"multica_agent": "multica_agent",
 		"openclaw":      "openclaw",
 		"opencode":      "opencode",

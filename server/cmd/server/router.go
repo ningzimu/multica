@@ -31,11 +31,13 @@ import (
 	composiointeg "github.com/multica-ai/multica/server/internal/integrations/composio"
 	"github.com/multica-ai/multica/server/internal/integrations/dingtalk"
 	"github.com/multica-ai/multica/server/internal/integrations/lark"
+	"github.com/multica-ai/multica/server/internal/integrations/outwebhook"
 	"github.com/multica-ai/multica/server/internal/integrations/slack"
 	"github.com/multica-ai/multica/server/internal/integrations/telegram"
 	"github.com/multica-ai/multica/server/internal/integrations/wecom"
 	obsmetrics "github.com/multica-ai/multica/server/internal/metrics"
 	"github.com/multica-ai/multica/server/internal/middleware"
+	"github.com/multica-ai/multica/server/internal/push"
 	"github.com/multica-ai/multica/server/internal/realtime"
 	"github.com/multica-ai/multica/server/internal/service"
 	"github.com/multica-ai/multica/server/internal/storage"
@@ -392,6 +394,36 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 		ServerVersion:            normalizeServerVersion(version),
 	}
 	h := handler.New(queries, pool, hub, bus, emailSvc, store, cfSigner, analyticsClient, signupConfig, daemonHub)
+	var outboundWebhookBox *secretbox.Box
+	if key, err := secretbox.LoadKey("MULTICA_OUTBOUND_WEBHOOK_SECRET_KEY"); err == nil {
+		outboundWebhookBox, err = secretbox.New(key)
+		if err != nil {
+			slog.Error("outbound webhooks disabled by invalid encryption configuration", "error", err)
+		}
+	} else if strings.TrimSpace(os.Getenv("MULTICA_OUTBOUND_WEBHOOK_SECRET_KEY")) != "" {
+		slog.Error("outbound webhooks disabled by invalid encryption configuration", "error", err)
+	}
+	outboundWebhookPolicy := outwebhook.DefaultDeliveryPolicy()
+	outboundWebhookPolicy.MaxAttempts = int32(envPositiveInt("MULTICA_OUTBOUND_WEBHOOK_MAX_ATTEMPTS", int(outboundWebhookPolicy.MaxAttempts)))
+	outboundWebhookPolicy.GlobalConcurrency = int64(envPositiveInt("MULTICA_OUTBOUND_WEBHOOK_GLOBAL_CONCURRENCY", int(outboundWebhookPolicy.GlobalConcurrency)))
+	outboundWebhookPolicy.SubscriptionConcurrency = int64(envPositiveInt("MULTICA_OUTBOUND_WEBHOOK_SUBSCRIPTION_CONCURRENCY", int(outboundWebhookPolicy.SubscriptionConcurrency)))
+	outboundWebhookPolicy.MaxPendingPerSubscription = int64(envPositiveInt("MULTICA_OUTBOUND_WEBHOOK_MAX_PENDING_PER_SUBSCRIPTION", int(outboundWebhookPolicy.MaxPendingPerSubscription)))
+	outboundWebhookPolicy.ConsecutiveFailureThreshold = int32(envPositiveInt("MULTICA_OUTBOUND_WEBHOOK_FAILURE_THRESHOLD", int(outboundWebhookPolicy.ConsecutiveFailureThreshold)))
+	h.OutboundWebhooks = outwebhook.New(queries, pool, outboundWebhookBox, splitAndTrim(os.Getenv("MULTICA_OUTBOUND_WEBHOOK_ALLOWED_ORIGINS")), outwebhook.WithDeliveryPolicy(outboundWebhookPolicy), outwebhook.WithObserver(opts.BusinessMetrics))
+	h.OutboundWebhooks.Register(bus)
+	if apnsConfig, enabled, err := push.ConfigFromEnv(); err != nil {
+		slog.Error("APNs system notifications disabled by invalid configuration", "error", err)
+	} else if enabled {
+		transport, err := push.NewHTTPTransport(apnsConfig, nil)
+		if err != nil {
+			slog.Error("APNs system notifications disabled", "error", err)
+		} else {
+			push.NewDispatcher(queries, transport, apnsConfig, slog.Default()).Register(bus)
+			slog.Info("APNs system notifications enabled", "topic", apnsConfig.Topic, "environment", apnsConfig.Environment)
+		}
+	} else {
+		slog.Info("APNs system notifications disabled (configuration not set)")
+	}
 	invitationRateLimits := handler.DefaultInvitationRateLimits()
 	invitationRateLimits.Actor.Limit = envNonNegativeInt("RATE_LIMIT_INVITATION_ACTOR_10M", invitationRateLimits.Actor.Limit)
 	invitationRateLimits.Workspace.Limit = envNonNegativeInt("RATE_LIMIT_INVITATION_WORKSPACE_24H", invitationRateLimits.Workspace.Limit)
@@ -1456,6 +1488,8 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 		r.Post("/api/upload-file", h.UploadFile)
 		r.Post("/api/feedback", h.CreateFeedback)
 		r.With(handler.RequireHumanActor).Post("/api/client-usage", h.UpsertClientUsage)
+		r.Put("/api/recipient-devices/{installationId}", h.RegisterRecipientDevice)
+		r.Delete("/api/recipient-devices/{installationId}", h.RevokeRecipientDevice)
 
 		// Note (MUL-4309): the generic OpenAI-compatible passthrough endpoints
 		// (POST /api/llm/v1/chat/completions[/stream]) were intentionally
@@ -1511,6 +1545,8 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					// see what is mounted in their workspace and which scopes
 					// it holds; install / configure / remove stay admin-only.
 					r.Get("/plugins", h.ListPlugins)
+					r.Get("/outbound-webhooks", h.ListOutboundWebhooks)
+					r.Get("/outbound-webhooks/{subscriptionId}", h.GetOutboundWebhook)
 					// One short-lived hosted surface launch. Member-visible
 					// because opening an issue is what asks for it; executable
 					// bytes stay off the authenticated app/API origin.
@@ -1568,6 +1604,17 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					r.Post("/plugins/{installationId}/enable", h.EnablePlugin)
 					r.Post("/plugins/{installationId}/disable", h.DisablePlugin)
 					r.Delete("/plugins/{installationId}", h.UninstallPlugin)
+					r.Post("/outbound-webhooks", h.CreateOutboundWebhook)
+					r.Put("/outbound-webhooks/{subscriptionId}", h.UpdateOutboundWebhook)
+					r.Post("/outbound-webhooks/{subscriptionId}/pause", h.PauseOutboundWebhook)
+					r.Post("/outbound-webhooks/{subscriptionId}/resume", h.ResumeOutboundWebhook)
+					r.Post("/outbound-webhooks/{subscriptionId}/test", h.TestOutboundWebhook)
+					r.Post("/outbound-webhooks/{subscriptionId}/rotate-secret", h.RotateOutboundWebhookSecret)
+					r.Get("/outbound-webhooks/{subscriptionId}/deliveries", h.ListOutboundWebhookDeliveries)
+					r.Get("/outbound-webhooks/{subscriptionId}/deliveries/{deliveryId}", h.GetOutboundWebhookDelivery)
+					r.Post("/outbound-webhooks/{subscriptionId}/deliveries/{deliveryId}/redeliver", h.RedeliverOutboundWebhookDelivery)
+					r.Patch("/outbound-webhooks/{subscriptionId}/scope", h.UpdateOutboundWebhookScope)
+					r.Delete("/outbound-webhooks/{subscriptionId}", h.DeleteOutboundWebhook)
 				})
 				// Owner-only access
 				r.With(middleware.RequireWorkspaceRoleFromURL(queries, "id", "owner")).Delete("/", h.DeleteWorkspace)

@@ -172,6 +172,35 @@ rewrite configuration. Its backend fallback therefore accepts
 `BACKEND_PORT` → `API_PORT` → `SERVER_PORT` → `8080`, while an explicit
 `REMOTE_API_URL` or `NEXT_PUBLIC_API_URL` still takes priority.
 
+### iOS system notifications (APNs)
+
+The backend can send Inbox activity directly through Apple Push Notification
+service. Delivery remains disabled unless the complete configuration below is
+present at backend startup.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MULTICA_APNS_TEAM_ID` | empty | Apple Developer Team ID associated with the APNs signing key. |
+| `MULTICA_APNS_KEY_ID` | empty | Key ID of the APNs `.p8` signing key. |
+| `MULTICA_APNS_TOPIC` | empty | Exact bundle identifier of the installed iOS app. It must match the App ID that has Push Notifications enabled. |
+| `MULTICA_APNS_ENVIRONMENT` | `production` | `production` for TestFlight/App Store or Release builds; `sandbox` for development-signed builds. |
+| `MULTICA_APNS_PRIVATE_KEY_PATH` | empty | Read-only path to the APNs `.p8` key inside the backend process/container. |
+
+Do not put the `.p8` contents in `.env`, commit it, or bake it into an image. For
+Docker Compose, keep the key on the host and add a local, uncommitted override:
+
+```yaml
+services:
+  backend:
+    volumes:
+      - /absolute/host/path/AuthKey_KEYID.p8:/run/secrets/multica-apns.p8:ro
+```
+
+Then set `MULTICA_APNS_PRIVATE_KEY_PATH=/run/secrets/multica-apns.p8` in `.env`
+and restart the backend. A partial or invalid configuration is logged and push
+delivery stays disabled; the rest of the server continues to start. Device
+tokens and signing material are never written to application logs.
+
 ### WeCom frame tracing
 
 | Variable | Default | Description |

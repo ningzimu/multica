@@ -15,6 +15,7 @@ import { COMPOSIO_MCP_APPS_FLAG } from "@multica/core/feature-flags";
 import { useT } from "../../i18n";
 import { SettingsSection, SettingsTab } from "./settings-layout";
 import { IntegrationChannelIcon } from "./integration-channel-icon";
+import { OutboundWebhooksTab } from "./outbound-webhooks-tab";
 
 // Integrations is the umbrella tab for third-party platform connections.
 // GitHub has its own top-level tab (see github-tab.tsx); everything else
@@ -41,6 +42,12 @@ export function IntegrationsTab() {
 
   return (
     <SettingsTab title={t(($) => $.page.tabs.integrations)}>
+      <SettingsSection
+        title={t(($) => $.outbound_webhooks.section_title)}
+        description={t(($) => $.outbound_webhooks.section_description)}
+      >
+        <OutboundWebhooksTab />
+      </SettingsSection>
       <SettingsSection
         title={
           <span className="flex items-center gap-2">

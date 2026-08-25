@@ -62,8 +62,11 @@ func (s *IssueService) noteRuntimeUnusable(ctx context.Context, issue db.Issue, 
 				"type":        comment.Type,
 				"revision":    comment.Revision,
 			},
-			"issue_title":    issue.Title,
-			"issue_revision": created.IssueRevision,
+			"issue_title":      created.IssueTitle,
+			"issue_status":     created.IssueStatus,
+			"issue_priority":   created.IssuePriority,
+			"issue_project_id": util.UUIDToPtr(created.IssueProjectID),
+			"issue_revision":   created.IssueRevision,
 		},
 	})
 }

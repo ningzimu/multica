@@ -7,7 +7,9 @@
  * stay in sync with web — they describe the same server-side semantics,
  * and divergent labels would violate behavioral parity (apps/mobile/CLAUDE.md).
  */
-import { ActivityIndicator, ScrollView, View } from "react-native";
+import { useCallback, useState } from "react";
+import { ActivityIndicator, AppState, ScrollView, View } from "react-native";
+import { useFocusEffect } from "@react-navigation/native";
 import { useQuery } from "@tanstack/react-query";
 import type {
   NotificationGroupKey,
@@ -16,9 +18,12 @@ import type {
 import { Text } from "@/components/ui/text";
 import { Switch } from "@/components/ui/switch";
 import { Separator } from "@/components/ui/separator";
+import { Button } from "@/components/ui/button";
 import { useWorkspaceStore } from "@/data/workspace-store";
 import { notificationPreferenceOptions } from "@/data/queries/notification-preferences";
 import { useUpdateNotificationPreferences } from "@/data/mutations/notification-preferences";
+import { notificationRegistration } from "@/data/native-notification-registration";
+import type { NotificationPermissionStatus } from "@/data/notification-registration";
 
 const INBOX_GROUPS: Array<{
   key: Exclude<NotificationGroupKey, "system_notifications">;
@@ -63,6 +68,45 @@ export default function NotificationsSettingsScreen() {
     notificationPreferenceOptions(wsId),
   );
   const mutation = useUpdateNotificationPreferences();
+  const [permission, setPermission] =
+    useState<NotificationPermissionStatus | null>(null);
+
+  useFocusEffect(
+    useCallback(() => {
+      let active = true;
+      const refreshPermission = () => {
+        void notificationRegistration
+          .getPermissionStatus()
+          .then(async (status) => {
+            if (status === "granted") {
+              await notificationRegistration.onAuthenticated();
+            }
+            if (active) setPermission(status);
+          })
+          .catch(() => {
+            if (active) setPermission(null);
+          });
+      };
+      refreshPermission();
+      const subscription = AppState.addEventListener("change", (state) => {
+        if (state === "active") refreshPermission();
+      });
+      return () => {
+        active = false;
+        subscription.remove();
+      };
+    }, []),
+  );
+
+  const requestPermission = async () => {
+    const result =
+      await notificationRegistration.requestPermissionFromSettings();
+    setPermission(
+      result === "registered"
+        ? "granted"
+        : await notificationRegistration.getPermissionStatus(),
+    );
+  };
 
   const preferences: NotificationPreferences = data?.preferences ?? {};
 
@@ -102,6 +146,38 @@ export default function NotificationsSettingsScreen() {
       className="flex-1 bg-background"
       contentContainerClassName="px-4 py-4 gap-6"
     >
+      {permission === "denied" ? (
+        <Section
+          title="iOS permission"
+          description="System notifications are disabled for Multica in iOS Settings."
+        >
+          <View className="p-4 gap-3">
+            <Text className="text-sm text-muted-foreground">
+              Inbox notifications still appear when you open the app.
+            </Text>
+            <Button onPress={() => void notificationRegistration.openSettings()}>
+              <Text>Open iOS Settings</Text>
+            </Button>
+          </View>
+        </Section>
+      ) : null}
+
+      {permission === "undetermined" ? (
+        <Section
+          title="iOS permission"
+          description="Enable iOS notifications when you are ready."
+        >
+          <View className="p-4 gap-3">
+            <Text className="text-sm text-muted-foreground">
+              Inbox notifications still appear when you open the app.
+            </Text>
+            <Button onPress={() => void requestPermission()}>
+              <Text>Enable notifications</Text>
+            </Button>
+          </View>
+        </Section>
+      ) : null}
+
       <Section
         title="Inbox notifications"
         description="Which events show up in your inbox."
@@ -133,7 +209,7 @@ export default function NotificationsSettingsScreen() {
 
       <Section
         title="System"
-        description="Multica-wide announcements and important account events."
+        description="Whether this workspace may also send iOS system notifications."
       >
         <View className="flex-row items-center px-4 py-3 gap-3">
           <View className="flex-1">
@@ -141,7 +217,7 @@ export default function NotificationsSettingsScreen() {
               System notifications
             </Text>
             <Text className="text-xs text-muted-foreground mt-0.5">
-              Account changes, security alerts, product updates.
+              New activity can appear outside the app when iOS permission is enabled.
             </Text>
           </View>
           <Switch

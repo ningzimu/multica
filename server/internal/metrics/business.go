@@ -50,6 +50,8 @@ type BusinessMetrics struct {
 	entitlementVersionRegression      *prometheus.CounterVec
 	autopilotQuotaDecision            *prometheus.CounterVec
 	issueWindowDecision               *prometheus.CounterVec
+	outboundWebhookOperation          *prometheus.CounterVec
+	outboundWebhookOldestPending      prometheus.Gauge
 
 	activeMu    sync.Mutex
 	activeTasks map[string]activeTaskLabels
@@ -237,6 +239,14 @@ func NewBusinessMetrics() *BusinessMetrics {
 			Namespace: "multica", Subsystem: "issue_window", Name: "decision_total",
 			Help: "Total recently-created issue window outcomes by request surface.",
 		}, metricLabels("multica_issue_window_decision_total")),
+		outboundWebhookOperation: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "multica", Subsystem: "outbound_webhook", Name: "operation_total",
+			Help: "Total outbound webhook operations by bounded operation kind.",
+		}, metricLabels("multica_outbound_webhook_operation_total")),
+		outboundWebhookOldestPending: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: "multica", Subsystem: "outbound_webhook", Name: "oldest_pending_seconds",
+			Help: "Age in seconds of the oldest pending outbound webhook delivery.",
+		}),
 		activeTasks: map[string]activeTaskLabels{},
 		events:      newBusinessEventMetrics(),
 	}
@@ -277,6 +287,8 @@ func (m *BusinessMetrics) Collectors() []prometheus.Collector {
 		m.entitlementVersionRegression,
 		m.autopilotQuotaDecision,
 		m.issueWindowDecision,
+		m.outboundWebhookOperation,
+		m.outboundWebhookOldestPending,
 	}, m.events.collectors()...)
 }
 
@@ -284,6 +296,33 @@ func (m *BusinessMetrics) RecordEntitlementConfigError() {
 	if m != nil {
 		m.entitlementConfigError.Inc()
 	}
+}
+
+var outboundWebhookOperations = map[string]struct{}{
+	"canonicalization_failed": {}, "matching_failed": {}, "insertion_failed": {},
+	"delivery_succeeded": {}, "delivery_failed": {}, "delivery_retry_scheduled": {},
+	"lease_recovered": {}, "subscription_paused": {}, "egress_rejected": {},
+	"cleanup_succeeded": {}, "cleanup_failed": {}, "redelivery_created": {},
+}
+
+func (m *BusinessMetrics) RecordOutboundWebhookOperation(operation string) {
+	if m == nil {
+		return
+	}
+	if _, ok := outboundWebhookOperations[operation]; !ok {
+		operation = "other"
+	}
+	m.outboundWebhookOperation.WithLabelValues(operation).Inc()
+}
+
+func (m *BusinessMetrics) SetOutboundWebhookOldestPending(seconds float64) {
+	if m == nil {
+		return
+	}
+	if seconds < 0 {
+		seconds = 0
+	}
+	m.outboundWebhookOldestPending.Set(seconds)
 }
 
 func (m *BusinessMetrics) RecordEntitlementCache(outcome string) {

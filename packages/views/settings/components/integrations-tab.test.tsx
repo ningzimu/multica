@@ -61,6 +61,10 @@ vi.mock("./telegram-tab", () => ({
   TelegramTab: () => <div data-testid="telegram-tab" />,
 }));
 
+vi.mock("./outbound-webhooks-tab", () => ({
+  OutboundWebhooksTab: () => <div data-testid="outbound-webhooks-tab" />,
+}));
+
 import { IntegrationsTab } from "./integrations-tab";
 
 afterEach(cleanup);

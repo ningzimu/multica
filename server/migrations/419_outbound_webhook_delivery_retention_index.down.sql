@@ -1,0 +1,1 @@
+DROP INDEX CONCURRENTLY IF EXISTS outbound_webhook_delivery_retention_idx;

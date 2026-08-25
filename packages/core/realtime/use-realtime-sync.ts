@@ -11,6 +11,7 @@ import { defaultStorage } from "../platform/storage";
 import { getCurrentWsId, getCurrentSlug } from "../platform/workspace-storage";
 import { issueKeys } from "../issues/queries";
 import { projectKeys } from "../projects/queries";
+import { outboundWebhookKeys } from "../outbound-webhooks/queries";
 import { pinKeys } from "../pins/queries";
 import { autopilotKeys } from "../autopilots/queries";
 import { runtimeKeys } from "../runtimes/queries";
@@ -648,7 +649,7 @@ function invalidateWorkspaceScopedQueries(qc: QueryClient): void {
     qc.invalidateQueries({ queryKey: workspaceKeys.squads(wsId) });
     qc.invalidateQueries({ queryKey: workspaceKeys.skills(wsId) });
     qc.invalidateQueries({ queryKey: workspaceKeys.invitations(wsId) });
-    qc.invalidateQueries({ queryKey: projectKeys.all(wsId) });
+    invalidateProjectDependentQueries(qc, wsId);
     qc.invalidateQueries({ queryKey: runtimeKeys.all(wsId) });
     qc.invalidateQueries({ queryKey: autopilotKeys.all(wsId) });
     qc.invalidateQueries({ queryKey: agentTaskSnapshotKeys.all(wsId) });
@@ -692,6 +693,11 @@ function invalidateWorkspaceScopedQueries(qc: QueryClient): void {
   // a mounted composer recovers the prompt without a remount.
   qc.invalidateQueries({ queryKey: chatKeys.draftRestoresAll() });
   qc.invalidateQueries({ queryKey: workspaceKeys.list() });
+}
+
+export function invalidateProjectDependentQueries(qc: QueryClient, wsId: string): void {
+  qc.invalidateQueries({ queryKey: projectKeys.all(wsId) });
+  qc.invalidateQueries({ queryKey: outboundWebhookKeys.all(wsId) });
 }
 
 function invalidateSquadMemberStatusQueries(qc: QueryClient, wsId: string): void {
@@ -790,7 +796,7 @@ export function useRealtimeSync(
       },
       project: () => {
         const wsId = getCurrentWsId();
-        if (wsId) qc.invalidateQueries({ queryKey: projectKeys.all(wsId) });
+        if (wsId) invalidateProjectDependentQueries(qc, wsId);
       },
       squad: () => {
         const wsId = getCurrentWsId();

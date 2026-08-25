@@ -120,7 +120,7 @@ describe("useRealtimeSync — ws instance change", () => {
     // prefixes + the workspace working-agents projection + 5 per-chat
     // prefixes + 1 workspaceKeys.list() + 1 cross-workspace inbox unread
     // summary = 31 calls)
-    expect(invalidateSpy).toHaveBeenCalledTimes(31);
+    expect(invalidateSpy).toHaveBeenCalledTimes(32);
   });
 
   it("does not re-invalidate when rerendered with the same ws instance", () => {

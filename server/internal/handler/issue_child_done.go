@@ -334,10 +334,12 @@ func (h *Handler) postChildDoneComment(ctx context.Context, parent, completed db
 
 	h.publish(protocol.EventCommentCreated, uuidToString(parent.WorkspaceID), "system", "", map[string]any{
 		"comment":             commentToResponse(comment, nil, nil),
-		"issue_title":         parent.Title,
+		"issue_title":         created.IssueTitle,
 		"issue_assignee_type": textToPtr(parent.AssigneeType),
 		"issue_assignee_id":   uuidToPtr(parent.AssigneeID),
-		"issue_status":        parent.Status,
+		"issue_status":        created.IssueStatus,
+		"issue_priority":      created.IssuePriority,
+		"issue_project_id":    uuidToPtr(created.IssueProjectID),
 		"issue_revision":      created.IssueRevision,
 	})
 

@@ -726,6 +726,12 @@ func main() {
 	// final batch of queued heartbeat bumps.
 	sweepCancel()
 	heartbeatScheduler.Stop()
+	if h.OutboundWebhooks != nil {
+		h.OutboundWebhooks.Close()
+		if !h.OutboundWebhooks.WaitWithTimeout(5 * time.Second) {
+			slog.Warn("outbound webhook dispatcher did not exit within shutdown timeout")
+		}
+	}
 	if h.WebhookDeliveryWorker != nil && !h.WebhookDeliveryWorker.WaitWithTimeout(5*time.Second) {
 		slog.Warn("webhook delivery worker did not exit within shutdown timeout")
 	}

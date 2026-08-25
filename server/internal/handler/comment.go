@@ -1914,10 +1914,12 @@ func (h *Handler) CreateComment(w http.ResponseWriter, r *http.Request) {
 	slog.Info("comment created", append(logger.RequestAttrs(r), "comment_id", uuidToString(comment.ID), "issue_id", issueID)...)
 	h.publish(protocol.EventCommentCreated, uuidToString(issue.WorkspaceID), authorType, authorID, map[string]any{
 		"comment":             resp,
-		"issue_title":         issue.Title,
+		"issue_title":         created.IssueTitle,
 		"issue_assignee_type": textToPtr(issue.AssigneeType),
 		"issue_assignee_id":   uuidToPtr(issue.AssigneeID),
-		"issue_status":        issue.Status,
+		"issue_status":        created.IssueStatus,
+		"issue_priority":      created.IssuePriority,
+		"issue_project_id":    uuidToPtr(created.IssueProjectID),
 		"issue_revision":      created.IssueRevision,
 	})
 
@@ -3357,6 +3359,7 @@ func (h *Handler) UpdateComment(w http.ResponseWriter, r *http.Request) {
 	}
 	var comment db.Comment
 	var issueRevision int64
+	var updated db.UpdateCommentRow
 	transactionalEdit := replaceAttachments || (oldContent != req.Content && strictContentEdit)
 	if transactionalEdit {
 		// Strict body edits, attachment-set edits, and cancellation of tasks built
@@ -3371,7 +3374,6 @@ func (h *Handler) UpdateComment(w http.ResponseWriter, r *http.Request) {
 		}
 		defer tx.Rollback(r.Context())
 		qtx := h.Queries.WithTx(tx)
-		var updated db.UpdateCommentRow
 		updated, err = qtx.UpdateComment(r.Context(), updateParams)
 		if err == nil {
 			comment = updated.Comment()
@@ -3401,7 +3403,6 @@ func (h *Handler) UpdateComment(w http.ResponseWriter, r *http.Request) {
 			h.TaskService.BroadcastCancelledTasks(r.Context(), uuidToString(existing.WorkspaceID), cancelled)
 		}
 	} else {
-		var updated db.UpdateCommentRow
 		updated, err = h.Queries.UpdateComment(r.Context(), updateParams)
 		if err == nil {
 			comment = updated.Comment()
@@ -3462,7 +3463,14 @@ func (h *Handler) UpdateComment(w http.ResponseWriter, r *http.Request) {
 	resp := commentToResponse(comment, grouped[cid], groupedAtt[cid])
 	resp.IssueRevision = issueRevision
 	slog.Info("comment updated", append(logger.RequestAttrs(r), "comment_id", commentId)...)
-	eventPayload := map[string]any{"comment": resp}
+	eventPayload := map[string]any{
+		"comment":          resp,
+		"body_changed":     oldContent != comment.Content,
+		"issue_title":      updated.IssueTitle,
+		"issue_status":     updated.IssueStatus,
+		"issue_priority":   updated.IssuePriority,
+		"issue_project_id": uuidToPtr(updated.IssueProjectID),
+	}
 	if issueRevision > 0 {
 		eventPayload["issue_revision"] = issueRevision
 	}
@@ -3564,8 +3572,16 @@ func (h *Handler) DeleteComment(w http.ResponseWriter, r *http.Request) {
 	h.deleteS3Objects(r.Context(), attachmentURLs)
 	slog.Info("comment deleted", append(logger.RequestAttrs(r), "comment_id", commentId, "issue_id", uuidToString(comment.IssueID))...)
 	eventPayload := map[string]any{
-		"comment_id": uuidToString(comment.ID),
-		"issue_id":   uuidToString(comment.IssueID),
+		"comment_id":       uuidToString(comment.ID),
+		"issue_id":         uuidToString(comment.IssueID),
+		"parent_id":        uuidToPtr(comment.ParentID),
+		"author_type":      comment.AuthorType,
+		"author_id":        uuidToString(comment.AuthorID),
+		"comment_type":     comment.Type,
+		"issue_title":      deleted.IssueTitle,
+		"issue_status":     deleted.IssueStatus,
+		"issue_priority":   deleted.IssuePriority,
+		"issue_project_id": uuidToPtr(deleted.IssueProjectID),
 	}
 	if deleted.IssueRevision > 0 {
 		eventPayload["issue_revision"] = deleted.IssueRevision
