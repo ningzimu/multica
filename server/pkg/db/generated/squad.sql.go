@@ -656,7 +656,7 @@ func (q *Queries) RemoveSquadMember(ctx context.Context, arg RemoveSquadMemberPa
 const transferSquadAssignees = `-- name: TransferSquadAssignees :many
 UPDATE issue SET assignee_type = 'agent', assignee_id = $2, revision = revision + 1, updated_at = now()
 WHERE assignee_type = 'squad' AND assignee_id = $1
-RETURNING id, workspace_id, title, description, status, priority, assignee_type, assignee_id, creator_type, creator_id, parent_issue_id, acceptance_criteria, context_refs, position, due_date, created_at, updated_at, number, project_id, origin_type, origin_id, first_executed_at, start_date, metadata, stage, properties, revision, last_activity_at
+RETURNING id, workspace_id, title, description, status, priority, assignee_type, assignee_id, creator_type, creator_id, parent_issue_id, acceptance_criteria, context_refs, position, due_date, created_at, updated_at, number, project_id, origin_type, origin_id, first_executed_at, start_date, metadata, stage, properties, revision, last_activity_at, triage_state, duplicate_of_issue_id
 `
 
 type TransferSquadAssigneesParams struct {
@@ -703,6 +703,8 @@ func (q *Queries) TransferSquadAssignees(ctx context.Context, arg TransferSquadA
 			&i.Properties,
 			&i.Revision,
 			&i.LastActivityAt,
+			&i.TriageState,
+			&i.DuplicateOfIssueID,
 		); err != nil {
 			return nil, err
 		}

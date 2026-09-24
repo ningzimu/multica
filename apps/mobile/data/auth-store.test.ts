@@ -46,6 +46,7 @@ vi.mock("./native-notification-registration", () => ({
 }));
 
 import { useAuthStore } from "./auth-store";
+import { currentSessionEpoch } from "./session-epoch";
 
 const user = {
   id: "018f6f4f-2dd0-7f47-9f71-2af8d5a8a841",
@@ -96,7 +97,11 @@ describe("mobile auth notification registration", () => {
 
   it("revokes notifications before clearing the authenticated token", async () => {
     const order: string[] = [];
+    const epoch = currentSessionEpoch();
     mocks.onLogout.mockImplementation(async () => {
+      // A pending device revocation must not let a concurrent renewal
+      // resurrect the session that logout is ending.
+      expect(currentSessionEpoch()).toBeGreaterThan(epoch);
       order.push("revoke");
     });
     mocks.clearToken.mockImplementation(async () => {

@@ -4,7 +4,9 @@ import (
 	"context"
 	"log/slog"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/multica-ai/multica/server/internal/service"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/protocol"
 )
@@ -106,6 +108,9 @@ func (h *Handler) revokeAndRemoveMember(ctx context.Context, workspaceID, userID
 			AgentIds:   archivedAgentIDs,
 		})
 		if err != nil {
+			return empty, err
+		}
+		if err = service.SettleTerminalTaskState(ctx, qtx, result.CancelledTasks...); err != nil {
 			return empty, err
 		}
 
@@ -210,6 +215,11 @@ func (h *Handler) revokeAndRemoveMember(ctx context.Context, workspaceID, userID
 	// never followed by a failed member-delete (which would leave the user
 	// still a member with a dead runtime), and a failed revoke never leaves
 	// the user out of the workspace with a still-online runtime.
+	if h.seatCapacityEnabled() {
+		if err := enqueueMemberCapacityRelease(ctx, qtx, uuid.UUID(workspaceID.Bytes), uuid.UUID(memberID.Bytes)); err != nil {
+			return empty, err
+		}
+	}
 	if err := qtx.DeleteMember(ctx, memberID); err != nil {
 		return empty, err
 	}

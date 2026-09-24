@@ -296,6 +296,13 @@ INSERT INTO channel_media_pending_object (
 )
 VALUES ($1, $2, gen_random_uuid(), 's3://workspace-delete/pending-object')
 `, pendingObjectKey, wsID)
+	const sourceContextObjectKey = "workspace-delete-source-context-object"
+	dbfx.Exec(t, `
+INSERT INTO issue_source_context_object_intent (
+	storage_key, workspace_id, source_context_id, attachment_id, object_url
+)
+VALUES ($1, $2, gen_random_uuid(), gen_random_uuid(), 's3://workspace-delete/source-context-object')
+`, sourceContextObjectKey, wsID)
 
 	t.Cleanup(func() {
 		_, _ = testPool.Exec(context.Background(), `DELETE FROM task_usage_hourly_dirty WHERE workspace_id = $1`, wsID)
@@ -303,16 +310,23 @@ VALUES ($1, $2, gen_random_uuid(), 's3://workspace-delete/pending-object')
 		_, _ = testPool.Exec(context.Background(), `DELETE FROM runtime_profile WHERE id = $1`, runtimeProfileID)
 		_, _ = testPool.Exec(context.Background(), `DELETE FROM autopilot_rule_version WHERE id = $1`, ruleVersionID)
 		_, _ = testPool.Exec(context.Background(), `DELETE FROM channel_media_pending_object WHERE storage_key = $1`, pendingObjectKey)
+		_, _ = testPool.Exec(context.Background(), `DELETE FROM issue_source_context_object_intent WHERE storage_key = $1`, sourceContextObjectKey)
 	})
 
 	req := newRequest("DELETE", "/api/workspaces/"+wsID, nil)
 	req = withURLParam(req, "id", wsID)
-	testutil.Call(t, testHandler.DeleteWorkspace, req).Want(http.StatusNoContent)
+	notifier := &recordingRuntimeGoneNotifier{}
+	h := *testHandler
+	h.DaemonRuntimeGone = notifier
+	testutil.Call(t, h.DeleteWorkspace, req).Want(http.StatusNoContent)
 
 	var exists bool
 	dbfx.QueryRow(t, `SELECT EXISTS (SELECT 1 FROM workspace WHERE id = $1)`, wsID).Scan(&exists)
 	if exists {
 		t.Fatal("workspace still exists after owner DELETE")
+	}
+	if len(notifier.runtimeIDs) != 1 || notifier.runtimeIDs[0] != runtimeID {
+		t.Fatalf("runtime-gone notifications = %v, want [%s]", notifier.runtimeIDs, runtimeID)
 	}
 
 	var pendingCount int
@@ -354,6 +368,16 @@ WHERE storage_key = $1
 `, pendingObjectKey).Scan(&pendingObjectState)
 	if pendingObjectState != "deleting" {
 		t.Fatalf("pending channel media object state = %q, want deleting", pendingObjectState)
+	}
+
+	var sourceContextIntentState string
+	dbfx.QueryRow(t, `
+SELECT state
+FROM issue_source_context_object_intent
+WHERE storage_key = $1
+`, sourceContextObjectKey).Scan(&sourceContextIntentState)
+	if sourceContextIntentState != "pending" {
+		t.Fatalf("source context object intent state = %q, want pending durable retry ledger", sourceContextIntentState)
 	}
 }
 
@@ -659,6 +683,66 @@ VALUES ($1, $2, 'owner')
 	w2.JSON(&resp2)
 	if resp2.AvatarURL == nil || *resp2.AvatarURL != avatarURL {
 		t.Fatalf("avatar_url should be preserved by partial update, got %v", resp2.AvatarURL)
+	}
+}
+
+// recordingWorkspaceRefreshNotifier captures the daemon wakeups a workspace
+// write fans out to its members.
+type recordingWorkspaceRefreshNotifier struct {
+	userIDs []string
+}
+
+func (n *recordingWorkspaceRefreshNotifier) NotifyWorkspacesChanged(userID string) {
+	n.userIDs = append(n.userIDs, userID)
+}
+
+// Daemons cache workspace settings and read the GitHub master switch and the
+// Co-authored-by toggle from them. A settings edit that does not wake them
+// leaves the old verdict live until the workspace's next repo checkout, which
+// is how a disabled Co-authored-by trailer kept landing in commits (MUL-6921).
+func TestUpdateWorkspace_NotifiesDaemonsOnSettingsChange(t *testing.T) {
+	ctx := context.Background()
+
+	const slug = "handler-tests-settings-notify"
+	_, _ = testPool.Exec(ctx, `DELETE FROM workspace WHERE slug = $1`, slug)
+
+	wsID := dbfx.Insert(t, "workspace", testutil.Cols{
+		"name":        "Handler Test Settings Notify",
+		"slug":        slug,
+		"description": "UpdateWorkspace settings notification test",
+	})
+
+	dbfx.Exec(t, `
+INSERT INTO member (workspace_id, user_id, role)
+VALUES ($1, $2, 'owner')
+`, wsID, testUserID)
+
+	notifier := &recordingWorkspaceRefreshNotifier{}
+	previous := testHandler.DaemonWorkspaceRefresh
+	testHandler.DaemonWorkspaceRefresh = notifier
+	t.Cleanup(func() { testHandler.DaemonWorkspaceRefresh = previous })
+
+	req := newRequest("PATCH", "/api/workspaces/"+wsID, map[string]any{
+		"settings": map[string]any{"co_authored_by_enabled": false},
+	})
+	req = withURLParam(req, "id", wsID)
+	testutil.Call(t, testHandler.UpdateWorkspace, req).Want(http.StatusOK)
+
+	if len(notifier.userIDs) != 1 || notifier.userIDs[0] != testUserID {
+		t.Fatalf("settings update notified %v, want exactly the workspace member %s", notifier.userIDs, testUserID)
+	}
+
+	// An edit that touches neither the name nor the settings has nothing for
+	// daemons to re-read.
+	notifier.userIDs = nil
+	req2 := newRequest("PATCH", "/api/workspaces/"+wsID, map[string]any{
+		"description": "new description",
+	})
+	req2 = withURLParam(req2, "id", wsID)
+	testutil.Call(t, testHandler.UpdateWorkspace, req2).Want(http.StatusOK)
+
+	if len(notifier.userIDs) != 0 {
+		t.Fatalf("description-only update notified %v, want no daemon wakeup", notifier.userIDs)
 	}
 }
 

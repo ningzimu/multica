@@ -1130,6 +1130,15 @@ func subscriptionMatchesProjectScope(subscription db.OutboundWebhookSubscription
 }
 
 func (s *Service) captureComment(event events.Event, eventType string) {
+	payload, _ := event.Payload.(map[string]any)
+	if pruned, _ := payload["tombstone_pruned"].(bool); pruned {
+		return
+	}
+	// Realtime keeps a deleted parent as an updated tombstone for its replies.
+	// External receivers still observe the single semantic deletion.
+	if deleted, _ := payload["comment_deleted"].(bool); deleted {
+		eventType = EventCommentDeleted
+	}
 	s.captureProductEvents(event, []productEvent{{eventType: eventType}})
 }
 

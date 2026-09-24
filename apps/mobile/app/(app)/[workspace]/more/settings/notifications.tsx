@@ -25,20 +25,19 @@ import { useUpdateNotificationPreferences } from "@/data/mutations/notification-
 import { notificationRegistration } from "@/data/native-notification-registration";
 import type { NotificationPermissionStatus } from "@/data/notification-registration";
 
-const INBOX_GROUPS: Array<{
+const INBOX_GROUPS: {
   key: Exclude<NotificationGroupKey, "system_notifications">;
   label: string;
-  description: string;
-}> = [
+  description?: string;
+}[] = [
   {
     key: "assignments",
     label: "Assignments",
-    description: "When you're assigned an issue or removed as assignee.",
+    description: "Assigned or unassigned.",
   },
   {
     key: "status_changes",
     label: "Status changes",
-    description: "When an issue's status changes.",
   },
   {
     key: "comments",
@@ -58,7 +57,7 @@ const INBOX_GROUPS: Array<{
   {
     key: "agent_activity",
     label: "Agent activity",
-    description: "When an agent picks up, runs, or completes a task.",
+    description: "When an agent run fails.",
   },
 ];
 
@@ -180,7 +179,6 @@ export default function NotificationsSettingsScreen() {
 
       <Section
         title="Inbox notifications"
-        description="Which events show up in your inbox."
       >
         {INBOX_GROUPS.map((group, idx) => {
           const enabled = preferences[group.key] !== "muted";
@@ -192,9 +190,11 @@ export default function NotificationsSettingsScreen() {
                   <Text className="text-base font-medium text-foreground">
                     {group.label}
                   </Text>
-                  <Text className="text-xs text-muted-foreground mt-0.5">
-                    {group.description}
-                  </Text>
+                  {group.description ? (
+                    <Text className="text-xs text-muted-foreground mt-0.5">
+                      {group.description}
+                    </Text>
+                  ) : null}
                 </View>
                 <Switch
                   checked={enabled}
@@ -209,7 +209,6 @@ export default function NotificationsSettingsScreen() {
 
       <Section
         title="System"
-        description="Whether this workspace may also send iOS system notifications."
       >
         <View className="flex-row items-center px-4 py-3 gap-3">
           <View className="flex-1">

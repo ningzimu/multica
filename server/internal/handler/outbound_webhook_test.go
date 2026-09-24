@@ -1203,6 +1203,19 @@ func TestCommentLifecyclePersistsAndDeliversSelectedWorkspaceWebhooks(t *testing
 		t.Fatalf("attachment-only update changed persisted delivery count to %d, want 1", count)
 	}
 
+	// Deleting a parent with a live reply is a realtime update, but an
+	// external receiver must still get exactly one body-free deletion.
+	testutil.Call(t, h.DeleteComment,
+		withURLParam(newRequest(http.MethodDelete, "/api/comments/"+root.ID, nil), "commentId", root.ID)).Want(http.StatusNoContent)
+	tombstoneEnvelope := receive("comment.deleted")
+	tombstoneJSON, _ := json.Marshal(tombstoneEnvelope)
+	if strings.Contains(string(tombstoneJSON), "界") || strings.Contains(string(tombstoneJSON), "excerpt") {
+		t.Fatalf("tombstoned body leaked: %s", tombstoneJSON)
+	}
+	if got := tombstoneEnvelope["data"].(map[string]any)["comment"].(map[string]any)["id"]; got != root.ID {
+		t.Fatalf("tombstoned comment id = %v, want %s", got, root.ID)
+	}
+
 	testutil.Call(t, h.DeleteComment,
 		withURLParam(newRequest(http.MethodDelete, "/api/comments/"+reply.ID, nil), "commentId", reply.ID)).Want(http.StatusNoContent)
 	deletedEnvelope := receive("comment.deleted")
@@ -1213,6 +1226,13 @@ func TestCommentLifecyclePersistsAndDeliversSelectedWorkspaceWebhooks(t *testing
 	deletedComment := deletedEnvelope["data"].(map[string]any)["comment"].(map[string]any)
 	if deletedComment["id"] != reply.ID || deletedComment["parent_id"] != root.ID || deletedComment["deleted_at"] == "" {
 		t.Fatalf("deletion identity/context missing: %#v", deletedComment)
+	}
+
+	if count := dbfx.Count(t, `SELECT count(*) FROM outbound_webhook_delivery WHERE subscription_id = $1 AND event_type = 'comment.deleted'`, subscription.Subscription.ID); count != 2 {
+		t.Fatalf("tombstone pruning emitted a duplicate deletion: got %d deliveries, want 2", count)
+	}
+	if count := dbfx.Count(t, `SELECT count(*) FROM outbound_webhook_delivery WHERE subscription_id = $1 AND event_type = 'comment.updated'`, subscription.Subscription.ID); count != 1 {
+		t.Fatalf("tombstone deletion emitted a body update: got %d deliveries, want 1", count)
 	}
 
 	for _, variant := range []struct {

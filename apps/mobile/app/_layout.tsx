@@ -1,6 +1,7 @@
 import "../global.css";
 
 import { useEffect, useRef } from "react";
+import { AppState, type AppStateStatus } from "react-native";
 import { Stack, router } from "expo-router";
 import { StatusBar } from "expo-status-bar";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
@@ -10,9 +11,11 @@ import { QueryClientProvider, useQueryClient } from "@tanstack/react-query";
 import { ThemeProvider } from "@react-navigation/native";
 import { PortalHost } from "@rn-primitives/portal";
 import { api } from "@/data/api";
+import { maybeRenewSession } from "@/data/session-renewal";
 import { queryClient } from "@/data/query-client";
 import { useAuthStore } from "@/data/auth-store";
 import { useWorkspaceStore } from "@/data/workspace-store";
+import { SessionActivityBoundary } from "@/components/auth/session-activity-boundary";
 import { LightboxProvider, prewarmHighlighter } from "@/lib/markdown";
 import { NAV_THEME } from "@/lib/theme";
 import { useColorScheme } from "@/lib/use-color-scheme";
@@ -53,7 +56,10 @@ function AuthInitializer({ children }: { children: React.ReactNode }) {
         })();
       },
     });
-    initialize();
+    // Launch check for the sliding session (MUL-7436). Runs after the token
+    // is restored and the identity probe has settled, so it never races the
+    // first getMe(); a no-op when there is no session to extend.
+    void initialize().then(() => maybeRenewSession());
   }, [initialize, qc]);
 
   // Wait until persisted auth has been restored before consuming a cold-start
@@ -63,6 +69,17 @@ function AuthInitializer({ children }: { children: React.ReactNode }) {
     if (isAuthLoading) return;
     return installNativeNotificationEventBridge();
   }, [isAuthLoading]);
+  // Foreground transitions are one of the two "someone is using this" signals;
+  // SessionActivityBoundary below supplies the other, so an app that stays
+  // foregrounded for longer than the check interval still renews. Deliberately
+  // not a timer: a backgrounded or untouched app must not keep the session of
+  // someone who stopped using it alive.
+  useEffect(() => {
+    const sub = AppState.addEventListener("change", (status: AppStateStatus) => {
+      if (status === "active") maybeRenewSession();
+    });
+    return () => sub.remove();
+  }, []);
 
   return <>{children}</>;
 }
@@ -76,6 +93,7 @@ export default function RootLayout() {
           <QueryClientProvider client={queryClient}>
             <ThemeProvider value={NAV_THEME[colorScheme]}>
               <AuthInitializer>
+                <SessionActivityBoundary>
                 <LightboxProvider>
                   <StatusBar style={isDarkColorScheme ? "light" : "dark"} />
                   <Stack screenOptions={{ headerShown: false }}>
@@ -85,6 +103,7 @@ export default function RootLayout() {
                   </Stack>
                   <PortalHost />
                 </LightboxProvider>
+                </SessionActivityBoundary>
               </AuthInitializer>
             </ThemeProvider>
           </QueryClientProvider>
