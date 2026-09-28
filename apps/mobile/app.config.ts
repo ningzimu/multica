@@ -79,6 +79,8 @@ export default ({ config }: ConfigContext): ExpoConfig => {
       "expo-router",
       "expo-secure-store",
       "expo-notifications",
+      "expo-image",
+      "expo-localization",
       "@react-native-community/datetimepicker",
       "react-native-enriched-markdown",
       [
@@ -99,6 +101,8 @@ export default ({ config }: ConfigContext): ExpoConfig => {
         {
           ios: {
             buildReactNativeFromSource: true,
+            // iOS 27 requires scene-based startup for apps built with SDK 27.
+            enableSceneSupport: true,
           },
         },
       ],

@@ -53,7 +53,7 @@ fail() {
 : >"$CALLS_FILE"
 "$SCRIPT_DIR/ios-run.sh"
 
-expected_prebuild='exec expo prebuild -p ios --no-install'
+expected_prebuild='exec expo prebuild -p ios --no-install --no-clean'
 [ "$(sed -n '1p' "$CALLS_FILE")" = "$expected_prebuild" ] ||
   fail "first call should be the prebuild, got: $(sed -n '1p' "$CALLS_FILE")"
 [ "$(sed -n '2p' "$CALLS_FILE")" = 'exec expo run:ios' ] ||

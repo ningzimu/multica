@@ -8,7 +8,7 @@
  */
 import { useCallback, useState } from "react";
 import { ActivityIndicator, AppState, ScrollView, View } from "react-native";
-import { useFocusEffect } from "@react-navigation/native";
+import { useFocusEffect } from "expo-router/react-navigation";
 import { useQuery } from "@tanstack/react-query";
 import type {
   NotificationGroupKey,
